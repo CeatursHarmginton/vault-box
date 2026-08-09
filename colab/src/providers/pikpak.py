@@ -217,5 +217,10 @@ class PikPakProvider(BaseProvider):
             if done.is_error:
                 raise ProviderFailure("UPLOAD_FAILED", done.text[:500])
         task_id = ((create.get("file") or {}).get("params") or {}).get("task_id") or (create.get("task") or {}).get("id")
-        task = await s.req("GET", f"{API}/drive/v1/tasks/{task_id}") if task_id else {}
+        task = {}
+        if task_id:
+            try:
+                task = await s.req("GET", f"{API}/drive/v1/tasks/{task_id}")
+            except ProviderFailure as exc:
+                task = {"id": task_id, "status": "unknown", "error": exc.message}
         return {"file": create.get("file"), "task": task, "upload": {"size": size, "parts": len(parts)}}
