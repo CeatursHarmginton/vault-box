@@ -154,7 +154,15 @@ class PikPakProvider(BaseProvider):
 
     async def list_files(self, credentials: dict[str, Any], path_or_id: str) -> dict[str, Any]:
         s = PikPakSession(credentials)
-        data = await s.req("GET", f"{API}/drive/v1/files", params={"parent_id": path_or_id or None, "thumbnail_size": "SIZE_SMALL", "limit": "1000", "filters": json.dumps({"trashed": {"eq": False}, "phase": {"eq": "PHASE_TYPE_COMPLETE"}})})
+        params = {"parent_id": path_or_id or None, "thumbnail_size": "SIZE_SMALL", "limit": "1000", "filters": json.dumps({"trashed": {"eq": False}, "phase": {"eq": "PHASE_TYPE_COMPLETE"}})}
+        try:
+            data = await s.req("GET", f"{API}/drive/v1/files", params=params)
+        except ProviderFailure:
+            s.captcha = await s.captcha_init("GET:/drive/v1/files")
+            try:
+                data = await s.req("GET", f"{API}/drive/v1/files", params=params)
+            finally:
+                s.captcha = ""
         return {"items": [{"id": f.get("id"), "name": f.get("name"), "type": "folder" if f.get("kind") == "drive#folder" else "file", "size": f.get("size")} for f in data.get("files") or []]}
 
     async def download_file(self, credentials: dict[str, Any], file_ref: dict[str, Any], local_path: Path, progress: JobState) -> Path:
@@ -163,8 +171,10 @@ class PikPakProvider(BaseProvider):
         if not fid:
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "PikPak file id missing")
         s.captcha = await s.captcha_init(f"GET:/drive/v1/files/{fid}")
-        info = await s.req("GET", f"{API}/drive/v1/files/{fid}")
-        s.captcha = ""
+        try:
+            info = await s.req("GET", f"{API}/drive/v1/files/{fid}")
+        finally:
+            s.captcha = ""
         url = info.get("web_content_link") or ((info.get("medias") or [{}])[0].get("link") or {}).get("url")
         if not url:
             raise ProviderFailure("DOWNLOAD_FAILED", "PikPak did not return download url")
