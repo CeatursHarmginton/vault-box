@@ -23,9 +23,13 @@ USER = "https://user.mypikpak.com"
 CLIENT_ID = "YNxT9w7GMdWvEOKa"
 CLIENT_VERSION = "1.47.1"
 PACKAGE = "com.pikcloud.pikpak"
+WEB_CLIENT_ID = "YUMx5nI8ZU8Ap8pm"
+WEB_CLIENT_VERSION = "2.0.0"
+WEB_PACKAGE = "mypikpak.com"
 MIN_PART = 5 * 1024 * 1024
 PART = 8 * 1024 * 1024
 SALTS = ["Gez0T9ijiI9WCeTsKSg3SMlx", "zQdbalsolyb1R/", "ftOjr52zt51JD68C3s", "yeOBMH0JkbQdEFNNwQ0RI9T3wU/v", "BRJrQZiTQ65WtMvwO", "je8fqxKPdQVJiy1DM6Bc9Nb1", "niV", "9hFCW2R1", "sHKHpe2i96", "p7c5E6AcXQ/IJUuAEC9W6", "", "aRv9hjc9P+Pbn+u3krN6", "BzStcgE8qVdqjEH16l4", "SqgeZvL5j9zoHP95xWHt", "zVof5yaJkPe3VFpadPof"]
+WEB_SALTS = ["C9qPpZLN8ucRTaTiUMWYS9cQvWOE", "+r6CQVxjzJV6LCV", "F", "pFJRC", "9WXYIDGrwTCz2OiVlgZa90qpECPD6olt", "/750aCr4lm/Sly/c", "RB+DT/gZCrbV", "", "CyLsf7hdkIRxRm215hl", "7xHvLi2tOYP0Y92b", "ZGTXXxu8E/MIWaEDB+Sm/", "1UI3", "E7fP5Pfijd+7K+t6Tg/NhuLq0eEUVChpJSkrKxpO", "ihtqpG6FMt65+Xk+tWUH2", "NhXXU9rg4XXdzo7u5o"]
 
 def _token(c: dict[str, Any]) -> tuple[str, str]:
     if c.get("encoded_token"):
@@ -36,6 +40,15 @@ def _token(c: dict[str, Any]) -> tuple[str, str]:
 def _captcha_sign(device_id: str, ts: str) -> str:
     sign = CLIENT_ID + CLIENT_VERSION + PACKAGE + device_id + ts
     for salt in SALTS:
+        sign = hashlib.md5((sign + salt).encode()).hexdigest()
+    return f"1.{sign}"
+
+def _web_device_id(device_id: str) -> str:
+    return str(device_id or "").split(".")[-1][:32]
+
+def _web_captcha_sign(device_id: str, ts: str) -> str:
+    sign = WEB_CLIENT_ID + WEB_CLIENT_VERSION + WEB_PACKAGE + _web_device_id(device_id) + ts
+    for salt in WEB_SALTS:
         sign = hashlib.md5((sign + salt).encode()).hexdigest()
     return f"1.{sign}"
 
@@ -108,13 +121,24 @@ class PikPakSession:
         return data
 
     async def captcha_init(self, action: str) -> str:
-        ts = str(int(time.time() * 1000))
-        data = await self.req("POST", f"{USER}/v1/shield/captcha/init", json={
-            "client_id": CLIENT_ID,
-            "action": action,
-            "device_id": self.device_id,
-            "meta": {"captcha_sign": _captcha_sign(self.device_id, ts), "client_version": CLIENT_VERSION, "package_name": PACKAGE, "user_id": self.user_id, "timestamp": ts},
-        })
+        variants = [(CLIENT_ID, CLIENT_VERSION, PACKAGE, self.device_id, _captcha_sign)]
+        if str(self.device_id).startswith("wdi"):
+            variants.insert(0, (WEB_CLIENT_ID, WEB_CLIENT_VERSION, WEB_PACKAGE, _web_device_id(self.device_id), _web_captcha_sign))
+        last: Exception | None = None
+        for client_id, version, package, device_id, signer in variants:
+            ts = str(int(time.time() * 1000))
+            try:
+                data = await self.req("POST", f"{USER}/v1/shield/captcha/init", json={
+                    "client_id": client_id,
+                    "action": action,
+                    "device_id": device_id,
+                    "meta": {"captcha_sign": signer(self.device_id, ts), "client_version": version, "package_name": package, "user_id": self.user_id, "timestamp": ts},
+                })
+                break
+            except Exception as exc:
+                last = exc
+        else:
+            raise last or ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "PikPak captcha init failed")
         token = str(data.get("captcha_token") or "")
         if not token:
             raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "PikPak captcha verification required")
