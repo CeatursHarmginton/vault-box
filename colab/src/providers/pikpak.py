@@ -217,6 +217,10 @@ class PikPakProvider(BaseProvider):
                     s.captcha = await s.captcha_init(action)
                 create = await s.req("POST", f"{API}/drive/v1/files", json=payload)
                 break
+            except ProviderFailure as exc:
+                if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
+                    return {"file": {"name": name, "parent_id": parent_id}, "task": {"status": "skipped_duplicate"}, "upload": {"size": size, "parts": 0}}
+                last = exc
             except Exception as exc:
                 last = exc
             finally:
