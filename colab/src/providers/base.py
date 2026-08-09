@@ -47,13 +47,20 @@ class BaseProvider(ABC):
 
     async def upload_folder(self, credentials: dict[str, Any], local_dir: Path, target_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:
         uploaded = []
+        skipped = 0
         root_target = target_ref
         for path in sorted(local_dir.rglob("*")):
             progress.check_cancelled()
             if path.is_file():
                 rel = path.relative_to(local_dir).as_posix()
-                uploaded.append(await self.upload_file(credentials, path, {**root_target, "relative_path": rel}, progress))
-        return {"ok": True, "uploaded": len(uploaded), "items": uploaded}
+                try:
+                    uploaded.append(await self.upload_file(credentials, path, {**root_target, "relative_path": rel}, progress))
+                except ProviderFailure as exc:
+                    if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
+                        skipped += 1
+                        continue
+                    raise
+        return {"ok": True, "uploaded": len(uploaded), "skipped": skipped, "items": uploaded}
 
 async def stream_download(url: str, dest: Path, progress: JobState, *, headers: dict[str, str] | None = None, phase: str = "download") -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
