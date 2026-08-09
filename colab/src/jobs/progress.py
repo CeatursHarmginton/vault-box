@@ -31,6 +31,9 @@ class JobState:
     cancel: bool = False
     _tick_at: float = field(default_factory=time.time)
     _tick_bytes: int = 0
+    _phase: str = ""
+    _phase_done: int = 0
+    _phase_total: int = 0
 
     def log(self, message: str) -> None:
         self.logs.append(message)
@@ -47,10 +50,15 @@ class JobState:
         self.updated_at = time.time()
 
     def add_bytes(self, n: int, total: int = 0, phase: str = "download") -> None:
+        if phase != self._phase or (total and total != self._phase_total):
+            self._phase = phase
+            self._phase_done = 0
+            self._phase_total = total
         self.bytes_done += n
+        self._phase_done += n
         if total:
             self.bytes_total = total
-            setattr(self.progress, phase, min(100, self.bytes_done / total * 100))
+            setattr(self.progress, phase, min(100, self._phase_done / total * 100))
         now = time.time()
         elapsed = now - self._tick_at
         if elapsed >= 1:
@@ -70,8 +78,9 @@ class JobState:
             "step": self.step,
             "progress": self.progress.__dict__,
             "currentFile": self.current_file,
-            "bytesDone": self.bytes_done,
-            "bytesTotal": self.bytes_total,
+            "bytesDone": self._phase_done,
+            "bytesTotal": self._phase_total or self.bytes_total,
+            "bytesCumulative": self.bytes_done,
             "speed": self.speed,
             "logs": self.logs[-50:],
             "error": self.error,

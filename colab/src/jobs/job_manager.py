@@ -16,7 +16,7 @@ class JobManager:
 
     async def _run(self, job: JobState) -> None:
         async with self.sem:
-            await run_transfer(job)
+            await asyncio.to_thread(lambda: asyncio.run(run_transfer(job)))
 
     def start(self, payload: dict[str, Any]) -> JobState:
         job = JobState(job_id=str(payload.get("jobId") or uuid.uuid4()), payload=payload)
