@@ -149,7 +149,21 @@ class PikPakProvider(BaseProvider):
         return await stream_download(str(url), dest, progress)
 
     async def _create_folder(self, s: PikPakSession, parent_id: str, name: str) -> str:
-        data = await s.req("POST", f"{API}/drive/v1/files", json={"kind": "drive#folder", "name": name, "parent_id": parent_id or ""})
+        payload = {"kind": "drive#folder", "name": name, "parent_id": parent_id or ""}
+        last: Exception | None = None
+        data: dict[str, Any] = {}
+        for action in ("", f"POST:{API}/drive/v1/files", "POST:/drive/v1/files"):
+            try:
+                if action:
+                    s.captcha = await s.captcha_init(action)
+                data = await s.req("POST", f"{API}/drive/v1/files", json=payload)
+                break
+            except Exception as exc:
+                last = exc
+            finally:
+                s.captcha = ""
+        if not data:
+            raise last or ProviderFailure("UPLOAD_FAILED", "PikPak create folder failed")
         return str((data.get("file") or data).get("id") or "")
 
     async def _ensure_relative_parent(self, s: PikPakSession, parent_id: str, relative_path: str) -> str:
