@@ -143,6 +143,21 @@ class TeraBoxProvider(BaseProvider):
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "TeraBox path missing")
         return [path]
 
+    async def _create_folder(self, s: TeraBoxSession, path: str) -> None:
+        try:
+            await s.request_json("POST", f"{s.base}/api/create", context=f"create folder {path}", params=s.params(a="commit"), data={"path": path, "isdir": "1", "block_list": "[]"}, headers={**s.headers(), "Content-Type": "application/x-www-form-urlencoded"})
+        except ProviderFailure as exc:
+            text = f"{exc.message} {exc.details}".lower()
+            if not any(token in text for token in ("repeat", "exist", "already", "-8")):
+                raise
+
+    async def _ensure_relative_parent(self, s: TeraBoxSession, parent: str, relative_path: str) -> str:
+        current = parent.rstrip("/") or "/"
+        for part in [p for p in Path(relative_path).parent.as_posix().split("/") if p and p != "."]:
+            current = f"{current}/{part}" if current != "/" else f"/{part}"
+            await self._create_folder(s, current)
+        return current
+
     async def download_file(self, credentials: dict[str, Any], file_ref: dict[str, Any], local_path: Path, progress: JobState) -> Path:
         s = TeraBoxSession(credentials)
         await s.ready()
@@ -157,8 +172,9 @@ class TeraBoxProvider(BaseProvider):
     async def upload_file(self, credentials: dict[str, Any], local_path: Path, target_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:
         s = TeraBoxSession(credentials)
         await s.ready()
-        parent = str(target_ref.get("id") or target_ref.get("path") or "/").rstrip("/") or "/"
-        name = Path(target_ref.get("relative_path") or local_path.name).name
+        rel = str(target_ref.get("relative_path") or local_path.name)
+        parent = await self._ensure_relative_parent(s, str(target_ref.get("id") or target_ref.get("path") or "/"), rel)
+        name = Path(rel).name
         remote_path = f"{parent}/{name}" if parent != "/" else f"/{name}"
         size = local_path.stat().st_size
         hashes = _hashes(local_path)

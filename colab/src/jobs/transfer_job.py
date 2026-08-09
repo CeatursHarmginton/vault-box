@@ -24,15 +24,18 @@ async def run_transfer(job: JobState) -> None:
         job.log(f"Job start: {source.get('provider')} -> {target.get('provider')}")
 
         downloaded: list[Path] = []
+        has_folder_source = False
         for item in source.get("items") or []:
             job.check_cancelled()
             item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
             if item_type == "folder":
+                has_folder_source = True
                 downloaded.extend(await src.download_folder(source.get("credentials") or {}, item, dirs["input"] / str(item.get("name") or item.get("id") or "folder"), job))
             else:
                 downloaded.append(await src.download_file(source.get("credentials") or {}, item, dirs["input"], job))
         if not downloaded:
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "No source files downloaded")
+        job.log(f"Downloaded files: {len(downloaded)}")
 
         out_root = dirs["input"]
         outputs = downloaded
@@ -41,11 +44,12 @@ async def run_transfer(job: JobState) -> None:
             out_root = dirs["output"] if any(p.is_relative_to(dirs["output"]) for p in outputs) else dirs["input"]
 
         job.set(step="uploading")
-        if len(outputs) == 1 and outputs[0].is_file() and not options.get("preserveFolderStructure"):
+        preserve_tree = bool(options.get("preserveFolderStructure") or has_folder_source)
+        if len(outputs) == 1 and outputs[0].is_file() and not preserve_tree:
             result = await dst.upload_file(target.get("credentials") or {}, outputs[0], target.get("folder") or {}, job)
         else:
             upload_root = out_root
-            if out_root == dirs["input"] and len(outputs) == 1:
+            if out_root == dirs["input"] and len(outputs) == 1 and not preserve_tree:
                 result = await dst.upload_file(target.get("credentials") or {}, outputs[0], target.get("folder") or {}, job)
             else:
                 result = await dst.upload_folder(target.get("credentials") or {}, upload_root, target.get("folder") or {}, job)

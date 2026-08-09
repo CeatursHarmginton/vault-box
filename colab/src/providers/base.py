@@ -31,8 +31,10 @@ class BaseProvider(ABC):
 
     async def download_folder(self, credentials: dict[str, Any], folder_ref: dict[str, Any], local_dir: Path, progress: JobState) -> list[Path]:
         listing = await self.list_files(credentials, str(folder_ref.get("id") or folder_ref.get("path") or "/"))
+        items = listing.get("items") or listing.get("files") or []
+        progress.log(f"{self.name} list folder {folder_ref.get('name') or folder_ref.get('path') or folder_ref.get('id')}: {len(items)} item(s)")
         saved: list[Path] = []
-        for item in listing.get("items") or listing.get("files") or []:
+        for item in items:
             progress.check_cancelled()
             if item.get("type") == "folder" or item.get("is_folder") or item.get("isdir"):
                 sub = local_dir / _safe_name(item.get("name") or item.get("server_filename") or "folder")
@@ -60,6 +62,7 @@ class BaseProvider(ABC):
                         skipped += 1
                         continue
                     raise
+        progress.log(f"{self.name} upload folder {local_dir.name}: {len(uploaded)} uploaded, {skipped} skipped")
         return {"ok": True, "uploaded": len(uploaded), "skipped": skipped, "items": uploaded}
 
 async def stream_download(url: str, dest: Path, progress: JobState, *, headers: dict[str, str] | None = None, phase: str = "download") -> Path:
