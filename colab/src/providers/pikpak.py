@@ -155,7 +155,10 @@ class PikPakProvider(BaseProvider):
     async def _ensure_relative_parent(self, s: PikPakSession, parent_id: str, relative_path: str) -> str:
         current = parent_id or ""
         for part in [p for p in Path(relative_path).parent.as_posix().split("/") if p and p != "."]:
-            listing = await self.list_files(s.credentials, current)
+            try:
+                listing = await self.list_files(s.credentials, current)
+            except ProviderFailure:
+                listing = {"items": []}
             match = next((i for i in listing.get("items") or [] if i.get("type") == "folder" and i.get("name") == part), None)
             current = str(match.get("id")) if match else await self._create_folder(s, current, part)
         return current
