@@ -72,11 +72,13 @@ class JobState:
             raise JobCancelled("JOB_CANCELLED")
 
     def view(self) -> dict[str, Any]:
+        phases = ["download", "extract", "upload"] if (self.payload.get("options") or {}).get("extract") else ["download", "upload"]
         return {
             "jobId": self.job_id,
             "status": self.status,
             "step": self.step,
             "progress": self.progress.__dict__,
+            "phases": phases,
             "currentFile": self.current_file,
             "bytesDone": self._phase_done,
             "bytesTotal": self._phase_total or self.bytes_total,
