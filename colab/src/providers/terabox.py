@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .base import BaseProvider, ProviderFailure, stream_download
+from .base import BaseProvider, ProviderFailure, safe_name, stream_download
 from ..jobs.progress import JobState
 
 DEFAULT_HOST = "https://www.terabox.com"
@@ -175,7 +175,7 @@ class TeraBoxProvider(BaseProvider):
         path = (await self._resolve_file_paths(credentials, file_ref))[0]
         meta = await self._dlink(s, path)
         name = file_ref.get("name") or meta.get("server_filename") or PurePosixPath(path).name
-        dest = local_path if local_path.suffix else local_path / name
+        dest = local_path if local_path.suffix else local_path / safe_name(name)
         progress.set(step="downloading", current_file=dest.name)
         cookie = "; ".join(f"{k}={v}" for k, v in s.cookies.items())
         return await stream_download(str(meta["dlink"]), dest, progress, headers={"User-Agent": UA, "Cookie": cookie})

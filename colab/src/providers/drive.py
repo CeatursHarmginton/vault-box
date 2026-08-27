@@ -9,7 +9,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from .base import BaseProvider, ProviderFailure, stream_download
+from .base import BaseProvider, ProviderFailure, safe_name, stream_download
 from ..jobs.progress import JobState
 
 DRIVE_API = "https://www.googleapis.com/drive/v3"
@@ -61,7 +61,7 @@ class DriveProvider(BaseProvider):
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Drive file id missing")
         meta = (await self._request(credentials, "GET", f"{DRIVE_API}/files/{fid}", params={"fields": FIELDS, "supportsAllDrives": "true"})).json()
         name = file_ref.get("name") or meta.get("name") or fid
-        local_path = local_path if local_path.suffix else local_path / name
+        local_path = local_path if local_path.suffix else local_path / safe_name(name)
         if str(meta.get("mimeType") or "").startswith("application/vnd.google-apps."):
             export_mime, ext = ("application/pdf", ".pdf")
             url = f"{DRIVE_API}/files/{fid}/export?{urlencode({'mimeType': export_mime})}"

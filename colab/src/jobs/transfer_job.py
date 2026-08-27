@@ -6,7 +6,7 @@ from typing import Any
 
 from ..extract.extractor import extract_archives
 from ..providers import PROVIDERS
-from ..providers.base import ProviderFailure
+from ..providers.base import ProviderFailure, safe_name
 from ..security import redact
 from ..utils.temp_storage import cleanup_job, job_dirs
 from .progress import JobCancelled, JobState
@@ -30,11 +30,21 @@ async def run_transfer(job: JobState) -> None:
             item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
             if item_type == "folder":
                 has_folder_source = True
-                downloaded.extend(await src.download_folder(source.get("credentials") or {}, item, dirs["input"] / str(item.get("name") or item.get("id") or "folder"), job))
+                # safe_name strips separators so a provider path like "/Shiroi" cannot
+                # escape the job input dir (Path("/in") / "/Shiroi" == Path("/Shiroi")).
+                folder_dir = dirs["input"] / safe_name(item.get("name") or item.get("id") or "folder")
+                folder_dir.mkdir(parents=True, exist_ok=True)
+                downloaded.extend(await src.download_folder(source.get("credentials") or {}, item, folder_dir, job))
             else:
                 downloaded.append(await src.download_file(source.get("credentials") or {}, item, dirs["input"], job))
         if not downloaded:
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "No source files downloaded")
+        stray = [p for p in downloaded if not p.is_relative_to(dirs["input"])]
+        if stray:
+            raise ProviderFailure("DOWNLOAD_FAILED", "Downloaded files landed outside the job directory", {"paths": [str(p) for p in stray[:5]]})
+        missing = [p for p in downloaded if not p.is_file()]
+        if missing:
+            raise ProviderFailure("DOWNLOAD_FAILED", "Downloaded files missing on disk", {"paths": [str(p) for p in missing[:5]]})
         job.log(f"Downloaded files: {len(downloaded)}")
 
         out_root = dirs["input"]
@@ -52,6 +62,8 @@ async def run_transfer(job: JobState) -> None:
             if out_root == dirs["input"] and len(outputs) == 1 and not preserve_tree:
                 result = await dst.upload_file(target.get("credentials") or {}, outputs[0], target.get("folder") or {}, job)
             else:
+                if not any(p.is_file() for p in upload_root.rglob("*")):
+                    raise ProviderFailure("UPLOAD_FAILED", "No files staged for upload", {"root": str(upload_root)})
                 result = await dst.upload_folder(target.get("credentials") or {}, upload_root, target.get("folder") or {}, job)
         job.log(f"Done: {redact(result)}")
         job.set(status="completed", step="completed")

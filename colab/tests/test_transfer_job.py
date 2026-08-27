@@ -7,9 +7,9 @@ from unittest import TestCase
 from src.jobs.progress import JobState
 from src.jobs.transfer_job import run_transfer
 from src.providers import PROVIDERS
-from src.providers import pikpak as pikpak_mod
 from src.providers.base import ProviderFailure
 from src.providers.pikpak import PikPakProvider
+from src.providers import pikpak as pikpak_mod
 from src.providers.terabox import TeraBoxProvider, TeraBoxSession
 
 
@@ -159,3 +159,66 @@ class TransferJobTests(TestCase):
             asyncio.run(PikPakProvider()._wait_upload_task(Session(), "task1", JobState("pikpak-task-error", {}), timeout=1, poll=0))
 
         self.assertEqual(ctx.exception.code, "UPLOAD_FAILED")
+
+
+class PathCapturingFolderSource:
+    def __init__(self):
+        self.dirs = []
+
+    async def download_folder(self, credentials, folder_ref, local_dir: Path, progress: JobState):
+        self.dirs.append(local_dir)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        path = local_dir / "clip.mp4"
+        path.write_text("ok")
+        return [path]
+
+
+class TransferJobPathSafetyTests(TestCase):
+    def test_absolute_folder_name_stays_inside_job_input(self):
+        from src.utils.temp_storage import job_dirs
+
+        src = PathCapturingFolderSource()
+        dst = UploadRecorder()
+        old = dict(PROVIDERS)
+        PROVIDERS.update({"fake-source": src, "fake-dst": dst})
+        try:
+            job = JobState("abs-folder-name", {
+                "source": {"provider": "fake-source", "items": [{"type": "folder", "name": "/Shiroi", "id": "/Shiroi"}]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": False},
+            })
+            dirs = job_dirs("abs-folder-name")
+            asyncio.run(run_transfer(job))
+            self.assertEqual(job.status, "completed", job.error)
+            self.assertEqual(src.dirs[0], dirs["input"] / "Shiroi")
+            self.assertTrue(src.dirs[0].is_relative_to(dirs["input"]))
+            self.assertEqual(dst.calls[0], ("folder", dirs["input"]))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("abs-folder-name")
+
+    def test_empty_upload_root_fails_instead_of_reporting_success(self):
+        class EmptySource:
+            async def download_folder(self, credentials, folder_ref, local_dir: Path, progress: JobState):
+                local_dir.mkdir(parents=True, exist_ok=True)
+                ghost = local_dir / "gone.mp4"
+                return [ghost]
+
+        dst = UploadRecorder()
+        old = dict(PROVIDERS)
+        PROVIDERS.update({"fake-source": EmptySource(), "fake-dst": dst})
+        try:
+            job = JobState("empty-upload-root", {
+                "source": {"provider": "fake-source", "items": [{"type": "folder", "name": "root"}]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": True},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+
+        self.assertEqual(job.status, "failed")
+        self.assertEqual(job.error["code"], "DOWNLOAD_FAILED")
+        self.assertEqual(dst.calls, [])

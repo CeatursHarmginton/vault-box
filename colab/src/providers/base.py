@@ -90,9 +90,12 @@ async def stream_download(url: str, dest: Path, progress: JobState, *, headers: 
     part.replace(dest)
     return dest
 
-def _safe_name(name: str) -> str:
-    clean = "".join(c for c in str(name or "file") if c not in '<>:"/\\|?*').strip()
+def safe_name(name: str) -> str:
+    clean = "".join(c for c in str(name or "file") if c not in '<>:"/\\|?*').strip().strip(".")
     return clean or "file"
+
+_safe_name = safe_name
+
 
 def copy_tree_files(src: Path, dst: Path) -> list[Path]:
     dst.mkdir(parents=True, exist_ok=True)

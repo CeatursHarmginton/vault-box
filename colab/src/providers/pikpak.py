@@ -15,7 +15,7 @@ from urllib.parse import quote, urlencode
 
 import httpx
 
-from .base import BaseProvider, ProviderFailure, stream_download
+from .base import BaseProvider, ProviderFailure, safe_name, stream_download
 from ..jobs.progress import JobState
 
 API = "https://api-drive.mypikpak.com"
@@ -184,7 +184,7 @@ class PikPakProvider(BaseProvider):
         url = info.get("web_content_link") or ((info.get("medias") or [{}])[0].get("link") or {}).get("url")
         if not url:
             raise ProviderFailure("DOWNLOAD_FAILED", "PikPak did not return download url")
-        dest = local_path if local_path.suffix else local_path / (file_ref.get("name") or info.get("name") or fid)
+        dest = local_path if local_path.suffix else local_path / safe_name(file_ref.get("name") or info.get("name") or fid)
         progress.set(step="downloading", current_file=dest.name)
         return await stream_download(str(url), dest, progress)
 
