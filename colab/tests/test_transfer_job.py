@@ -7,6 +7,9 @@ from unittest import TestCase
 from src.jobs.progress import JobState
 from src.jobs.transfer_job import run_transfer
 from src.providers import PROVIDERS
+from src.providers import pikpak as pikpak_mod
+from src.providers.base import ProviderFailure
+from src.providers.pikpak import PikPakProvider
 from src.providers.terabox import TeraBoxProvider, TeraBoxSession
 
 
@@ -97,3 +100,62 @@ class TransferJobTests(TestCase):
 
         self.assertEqual(provider.concurrency[:2], [6, 4])
         self.assertEqual(job.progress.upload, 100)
+
+    def test_pikpak_upload_waits_for_task_when_oss_params_missing(self):
+        class Session:
+            calls = 0
+
+            async def req(self, method, url, **kwargs):
+                self.calls += 1
+                return {"id": "task1", "phase": "PHASE_TYPE_COMPLETE"}
+
+        job = JobState("pikpak-task", {})
+        out = asyncio.run(PikPakProvider()._wait_upload_task(Session(), "task1", job, timeout=1, poll=0))
+
+        self.assertEqual(out["phase"], "PHASE_TYPE_COMPLETE")
+        self.assertEqual(job.progress.upload, 100)
+        self.assertTrue(any("PikPak upload task task1" in line for line in job.logs))
+
+    def test_pikpak_upload_no_oss_params_waits_before_success(self):
+        class Session:
+            def __init__(self, credentials):
+                self.credentials = credentials
+                self.requests = []
+                seen.append(self)
+
+            async def req(self, method, url, **kwargs):
+                self.requests.append((method, url))
+                if method == "POST":
+                    return {"file": {"params": {"task_id": "task1"}}, "task": {"id": "task1"}}
+                return {"id": "task1", "phase": "PHASE_TYPE_COMPLETE"}
+
+        class Provider(PikPakProvider):
+            async def _ensure_relative_parent(self, s, parent_id, relative_path):
+                return ""
+
+        seen = []
+        old = pikpak_mod.PikPakSession
+        pikpak_mod.PikPakSession = Session
+        try:
+            with __import__("tempfile").TemporaryDirectory() as tmp:
+                path = Path(tmp) / "a.txt"
+                path.write_text("ok")
+                job = JobState("pikpak-upload", {})
+                out = asyncio.run(Provider().upload_file({"access_token": "t"}, path, {}, job))
+        finally:
+            pikpak_mod.PikPakSession = old
+
+        self.assertEqual(out["task"]["phase"], "PHASE_TYPE_COMPLETE")
+        self.assertEqual(job.status, "pending")
+        self.assertEqual(job.progress.upload, 100)
+        self.assertEqual([req[0] for req in seen[0].requests], ["POST", "GET"])
+
+    def test_pikpak_upload_task_error_fails(self):
+        class Session:
+            async def req(self, method, url, **kwargs):
+                return {"id": "task1", "phase": "PHASE_TYPE_ERROR"}
+
+        with self.assertRaises(ProviderFailure) as ctx:
+            asyncio.run(PikPakProvider()._wait_upload_task(Session(), "task1", JobState("pikpak-task-error", {}), timeout=1, poll=0))
+
+        self.assertEqual(ctx.exception.code, "UPLOAD_FAILED")

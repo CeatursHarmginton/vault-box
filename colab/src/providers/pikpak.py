@@ -31,6 +31,12 @@ PART = 8 * 1024 * 1024
 SALTS = ["Gez0T9ijiI9WCeTsKSg3SMlx", "zQdbalsolyb1R/", "ftOjr52zt51JD68C3s", "yeOBMH0JkbQdEFNNwQ0RI9T3wU/v", "BRJrQZiTQ65WtMvwO", "je8fqxKPdQVJiy1DM6Bc9Nb1", "niV", "9hFCW2R1", "sHKHpe2i96", "p7c5E6AcXQ/IJUuAEC9W6", "", "aRv9hjc9P+Pbn+u3krN6", "BzStcgE8qVdqjEH16l4", "SqgeZvL5j9zoHP95xWHt", "zVof5yaJkPe3VFpadPof"]
 WEB_SALTS = ["C9qPpZLN8ucRTaTiUMWYS9cQvWOE", "+r6CQVxjzJV6LCV", "F", "pFJRC", "9WXYIDGrwTCz2OiVlgZa90qpECPD6olt", "/750aCr4lm/Sly/c", "RB+DT/gZCrbV", "", "CyLsf7hdkIRxRm215hl", "7xHvLi2tOYP0Y92b", "ZGTXXxu8E/MIWaEDB+Sm/", "1UI3", "E7fP5Pfijd+7K+t6Tg/NhuLq0eEUVChpJSkrKxpO", "ihtqpG6FMt65+Xk+tWUH2", "NhXXU9rg4XXdzo7u5o"]
 
+def _task_id(data: dict[str, Any]) -> str:
+    return str(((data.get("file") or {}).get("params") or {}).get("task_id") or (data.get("task") or {}).get("id") or "")
+
+def _file_id(data: dict[str, Any]) -> str:
+    return str((data.get("file") or data).get("id") or "")
+
 def _token(c: dict[str, Any]) -> tuple[str, str]:
     if c.get("encoded_token"):
         data = json.loads(base64.b64decode(str(c["encoded_token"])).decode())
@@ -211,6 +217,60 @@ class PikPakProvider(BaseProvider):
             current = str(match.get("id")) if match else await self._create_folder(s, current, part)
         return current
 
+    async def _wait_upload_task(self, s: PikPakSession, task_id: str, progress: JobState, timeout: float = 120.0, poll: float = 2.0) -> dict[str, Any]:
+        if not task_id:
+            return {}
+        deadline = time.time() + timeout
+        last: dict[str, Any] = {}
+        while time.time() < deadline:
+            progress.check_cancelled()
+            try:
+                task = await s.req("GET", f"{API}/drive/v1/tasks/{task_id}")
+            except ProviderFailure:
+                s.captcha = await s.captcha_init(f"GET:/drive/v1/tasks/{task_id}")
+                try:
+                    task = await s.req("GET", f"{API}/drive/v1/tasks/{task_id}")
+                finally:
+                    s.captcha = ""
+            last = task
+            phase = str(task.get("phase") or task.get("status") or "")
+            progress.log(f"PikPak upload task {task_id}: {phase or 'unknown'}")
+            if phase == "PHASE_TYPE_COMPLETE":
+                progress.progress.upload = 100
+                progress.updated_at = time.time()
+                return task
+            if phase == "PHASE_TYPE_ERROR":
+                raise ProviderFailure("UPLOAD_FAILED", "PikPak upload task failed", {"task": task})
+            await asyncio.sleep(poll)
+        raise ProviderFailure("UPLOAD_FAILED", "PikPak upload task timed out", {"task": last, "task_id": task_id})
+
+    async def _wait_file_complete(self, s: PikPakSession, file_id: str, progress: JobState, timeout: float = 120.0, poll: float = 2.0) -> dict[str, Any]:
+        if not file_id:
+            raise ProviderFailure("UPLOAD_FAILED", "PikPak upload response missing task id and file id")
+        deadline = time.time() + timeout
+        last: dict[str, Any] = {}
+        while time.time() < deadline:
+            progress.check_cancelled()
+            try:
+                info = await s.req("GET", f"{API}/drive/v1/files/{file_id}")
+            except ProviderFailure:
+                s.captcha = await s.captcha_init(f"GET:/drive/v1/files/{file_id}")
+                try:
+                    info = await s.req("GET", f"{API}/drive/v1/files/{file_id}")
+                finally:
+                    s.captcha = ""
+            last = info
+            phase = str(info.get("phase") or "")
+            progress.log(f"PikPak upload file {file_id}: {phase or 'unknown'}")
+            if phase == "PHASE_TYPE_COMPLETE":
+                progress.progress.upload = 100
+                progress.updated_at = time.time()
+                return info
+            if phase == "PHASE_TYPE_ERROR":
+                raise ProviderFailure("UPLOAD_FAILED", "PikPak upload file failed", {"file": info})
+            await asyncio.sleep(poll)
+        raise ProviderFailure("UPLOAD_FAILED", "PikPak upload file did not become visible", {"file": last, "file_id": file_id})
+
     async def upload_file(self, credentials: dict[str, Any], local_path: Path, target_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:
         s = PikPakSession(credentials)
         name = Path(target_ref.get("relative_path") or local_path.name).name
@@ -238,8 +298,10 @@ class PikPakProvider(BaseProvider):
         if not create:
             raise last or ProviderFailure("UPLOAD_FAILED", "PikPak create upload failed")
         params = ((create.get("resumable") or {}).get("params") or {})
+        task_id = _task_id(create)
         if not params:
-            return create
+            ready = await self._wait_upload_task(s, task_id, progress) if task_id else await self._wait_file_complete(s, _file_id(create), progress)
+            return {"file": create.get("file") or ready, "task": ready if task_id else create.get("task"), "upload": {"size": size, "parts": 0}}
         base = f"https://{params.get('endpoint')}/{quote(str(params.get('key') or ''), safe='/')}"
         async with httpx.AsyncClient(timeout=None, follow_redirects=True) as http:
             q = {"uploads": ""}
@@ -271,11 +333,5 @@ class PikPakProvider(BaseProvider):
             done = await http.post(f"{base}?{urlencode(q3)}", content=body, headers=_oss_headers(params, "POST", "application/xml", q3, md5))
             if done.is_error:
                 raise ProviderFailure("UPLOAD_FAILED", done.text[:500])
-        task_id = ((create.get("file") or {}).get("params") or {}).get("task_id") or (create.get("task") or {}).get("id")
-        task = {}
-        if task_id:
-            try:
-                task = await s.req("GET", f"{API}/drive/v1/tasks/{task_id}")
-            except ProviderFailure as exc:
-                task = {"id": task_id, "status": "unknown", "error": exc.message}
+        task = await self._wait_upload_task(s, task_id, progress)
         return {"file": create.get("file"), "task": task, "upload": {"size": size, "parts": len(parts)}}
