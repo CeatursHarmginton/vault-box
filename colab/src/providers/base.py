@@ -61,6 +61,8 @@ class BaseProvider(ABC):
         progress.files_to_upload = len(paths)
         progress.files_uploaded = 0
         progress.files_skipped = 0
+        if len(paths) > 1:
+            progress.log(f"[UPLOAD] Xử lý song song: {min(len(paths), max(1, FOLDER_UPLOAD_CONCURRENCY))} worker(s)")
 
         async def upload(path: Path) -> dict[str, Any] | None:
             progress.check_cancelled()
