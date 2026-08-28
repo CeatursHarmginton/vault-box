@@ -263,6 +263,31 @@ class TransferJobTests(TestCase):
         self.assertEqual(provider.concurrency[:2], [32, 16])
         self.assertEqual(job.progress.upload, 100)
 
+    def test_terabox_reuses_existing_results_folder(self):
+        class Session:
+            base = "https://www.terabox.com"
+
+            def params(self, **extra):
+                return extra
+
+            def headers(self):
+                return {}
+
+            async def request_json(self, method, url, *, context, **kwargs):
+                self.calls.append((method, context, kwargs.get("data") or {}))
+                if context == "list /photos":
+                    return {"list": [{"isdir": 1, "server_filename": "results", "path": "/photos/results"}]}
+                if context == "list /photos/results":
+                    return {"list": []}
+                return {}
+
+        s = Session()
+        s.calls = []
+        parent = asyncio.run(TeraBoxProvider()._ensure_relative_parent(s, "/photos", "results/a.jpg"))
+
+        self.assertEqual(parent, "/photos/results")
+        self.assertFalse(any(call[1].startswith("create folder /photos/results") for call in s.calls))
+
     def test_pikpak_upload_waits_for_task_when_oss_params_missing(self):
         class Session:
             calls = 0

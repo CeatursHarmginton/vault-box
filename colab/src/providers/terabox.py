@@ -163,11 +163,21 @@ class TeraBoxProvider(BaseProvider):
             if not any(token in text for token in ("repeat", "exist", "already", "-8")):
                 raise
 
+    async def _find_child_folder(self, s: TeraBoxSession, parent: str, name: str) -> str:
+        data = await s.request_json("GET", f"{s.base}/api/list", context=f"list {parent}", params=s.params(order="time", desc=1, dir=parent or "/", num=1000, page=1, showempty=0), headers=s.headers())
+        for item in data.get("list") or []:
+            if item.get("isdir") and item.get("server_filename") == name and item.get("path"):
+                return str(item["path"])
+        return ""
+
     async def _ensure_relative_parent(self, s: TeraBoxSession, parent: str, relative_path: str) -> str:
         current = parent.rstrip("/") or "/"
         for part in [p for p in Path(relative_path).parent.as_posix().split("/") if p and p != "."]:
-            current = f"{current}/{part}" if current != "/" else f"/{part}"
-            await self._create_folder(s, current)
+            next_path = await self._find_child_folder(s, current, part)
+            if not next_path:
+                next_path = f"{current}/{part}" if current != "/" else f"/{part}"
+                await self._create_folder(s, next_path)
+            current = next_path
         return current
 
     async def download_file(self, credentials: dict[str, Any], file_ref: dict[str, Any], local_path: Path, progress: JobState) -> Path:

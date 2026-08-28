@@ -96,3 +96,20 @@ class ImageOptimizerTests(TestCase):
 
         self.assertEqual([r["name"] for r in results], ["0.jpg", "1.jpg", "2.jpg", "3.jpg"])
         self.assertGreater(len(seen), 1)
+
+    def test_png_is_written_as_real_jpeg(self) -> None:
+        src = self.src_dir / "photo.png"
+        Image.new("RGBA", (20, 20), color=(255, 0, 0, 128)).save(src, "PNG")
+
+        results = optimize_directory(self.src_dir, self.dest_dir, {
+            "min_target_mb": 0.0,
+            "max_target_mb": 99.0,
+            "quality": 85,
+            "optimize_workers": 1,
+        }, MockJobState())
+
+        out = self.dest_dir / "photo.jpg"
+        self.assertEqual(results[0]["name"], "photo.jpg")
+        self.assertTrue(out.exists())
+        with Image.open(out) as img:
+            self.assertEqual(img.format, "JPEG")

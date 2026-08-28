@@ -86,6 +86,13 @@ def compress_image(src_path: Path, dest_path: Path, q: int, scale: float = 1.0) 
             
     return False
 
+def copy_or_convert_image(src_path: Path, dest_path: Path, q: int) -> None:
+    if src_path.suffix.lower() in (".jpg", ".jpeg") and dest_path.suffix.lower() in (".jpg", ".jpeg"):
+        shutil.copy2(src_path, dest_path)
+        return
+    if not compress_image(src_path, dest_path, q):
+        raise RuntimeError(f"Failed to convert image to JPEG: {src_path}")
+
 def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any], adaptive_quality: int) -> tuple[Path, int, str]:
     """
     Optimizes a single image file based on size target.
@@ -108,7 +115,7 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
     
     # 1. Skip if already within range
     if min_target <= size <= max_target:
-        shutil.copy2(src_path, dest_path)
+        copy_or_convert_image(src_path, dest_path, quality)
         return dest_path, quality, "Giữ nguyên"
         
     # 2. Upscale if too small (Real-ESRGAN placeholder or keep as-is)
@@ -121,12 +128,12 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
                     cmd = ["realesrgan-ncnn-vulkan", "-i", str(src_path), "-o", str(output_file), "-s", str(outscale)]
                     res = subprocess.run(cmd, capture_output=True)
                     if res.returncode == 0 and output_file.exists():
-                        shutil.copy2(output_file, dest_path)
+                        copy_or_convert_image(output_file, dest_path, quality)
                         return dest_path, quality, "Thành công (Upscaled)"
                 except Exception as e:
                     logger.warning(f"Real-ESRGAN failed: {e}")
             
-        shutil.copy2(src_path, dest_path)
+        copy_or_convert_image(src_path, dest_path, quality)
         return dest_path, quality, "Giữ nguyên (Upscale tắt hoặc lỗi)"
 
     # 3. Compress if larger than max_target
@@ -167,7 +174,7 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
             final_q = best_q
             status = "Thành công (Compressed)"
         else:
-            shutil.copy2(src_path, dest_path)
+            copy_or_convert_image(src_path, dest_path, quality)
             status = "Giữ nguyên (Lỗi nén)"
     finally:
         temp_path.unlink(missing_ok=True)
@@ -225,7 +232,7 @@ def optimize_directory(
             orig_size = p.stat().st_size
             out_path, final_q, status = optimize_image_file(p, output_dir / relative_path.parent, options, start_quality)
             return index, {
-                "name": str(relative_path),
+                "name": str(out_path.relative_to(output_dir)),
                 "original_size": orig_size,
                 "optimized_size": out_path.stat().st_size,
                 "status": status,
@@ -281,7 +288,7 @@ def optimize_directory(
                     adaptive_quality = new_start
                     
             results.append({
-                "name": str(relative_path),
+                "name": str(out_path.relative_to(output_dir)),
                 "original_size": orig_size,
                 "optimized_size": new_size,
                 "status": status,
