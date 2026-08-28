@@ -97,6 +97,7 @@ async def stream_download(url: str, dest: Path, progress: JobState, *, headers: 
     last_exc: Exception | None = None
     for attempt in range(5):
         done = part.stat().st_size if part.exists() else 0
+        attempt_start = done
         req_headers = dict(headers or {})
         if done:
             req_headers["Range"] = f"bytes={done}-"
@@ -127,7 +128,8 @@ async def stream_download(url: str, dest: Path, progress: JobState, *, headers: 
             if attempt == 4:
                 raise
             progress.log(f"[RETRY] Download interrupted, resuming: {dest.name}")
-            await asyncio.sleep(min(2 ** attempt, 8))
+            if not part.exists() or part.stat().st_size <= attempt_start:
+                await asyncio.sleep(min(2 ** attempt, 8))
     if expected and part.stat().st_size < expected and last_exc:
         raise last_exc
     part.replace(dest)

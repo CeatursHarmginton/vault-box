@@ -498,9 +498,11 @@ class TransferJobTests(TestCase):
                 return Stream(calls)
 
         async def no_sleep(delay):
+            sleeps.append(delay)
             return None
 
         calls = []
+        sleeps = []
         old_client = base_mod.httpx.AsyncClient
         old_sleep = base_mod.asyncio.sleep
         base_mod.httpx.AsyncClient = Client
@@ -515,6 +517,7 @@ class TransferJobTests(TestCase):
             base_mod.asyncio.sleep = old_sleep
 
         self.assertEqual(calls[1]["Range"], "bytes=3-")
+        self.assertEqual(sleeps, [])
 
     def test_folder_downloads_are_concurrent_and_bounded(self):
         class Provider(base_mod.BaseProvider):
