@@ -93,25 +93,43 @@ class BaseProvider(ABC):
 async def stream_download(url: str, dest: Path, progress: JobState, *, headers: dict[str, str] | None = None, phase: str = "download") -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".part")
-    done = part.stat().st_size if part.exists() else 0
-    req_headers = dict(headers or {})
-    if done:
-        req_headers["Range"] = f"bytes={done}-"
-    async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
-        async with client.stream("GET", url, headers=req_headers) as resp:
-            if resp.status_code in (401, 403):
-                raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Provider rejected download credentials")
-            resp.raise_for_status()
-            total = done + int(resp.headers.get("content-length") or 0)
-            mode = "ab" if done and resp.status_code == 206 else "wb"
-            if mode == "wb":
-                done = 0
-            with part.open(mode + "") as fh:
-                async for chunk in resp.aiter_bytes(CHUNK_SIZE):
-                    progress.check_cancelled()
-                    fh.write(chunk)
-                    done += len(chunk)
-                    progress.add_bytes(len(chunk), total, phase, str(dest))
+    expected = 0
+    last_exc: Exception | None = None
+    for attempt in range(5):
+        done = part.stat().st_size if part.exists() else 0
+        req_headers = dict(headers or {})
+        if done:
+            req_headers["Range"] = f"bytes={done}-"
+        try:
+            async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+                async with client.stream("GET", url, headers=req_headers) as resp:
+                    if resp.status_code in (401, 403):
+                        raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Provider rejected download credentials")
+                    resp.raise_for_status()
+                    if done and resp.status_code != 206:
+                        part.unlink(missing_ok=True)
+                        done = 0
+                    total = done + int(resp.headers.get("content-length") or 0)
+                    expected = total or expected
+                    with part.open("ab" if done else "wb") as fh:
+                        async for chunk in resp.aiter_bytes(CHUNK_SIZE):
+                            progress.check_cancelled()
+                            fh.write(chunk)
+                            done += len(chunk)
+                            progress.add_bytes(len(chunk), total, phase, str(dest))
+            if not expected or part.stat().st_size >= expected:
+                break
+            raise RuntimeError(f"Download incomplete: got {part.stat().st_size} bytes, expected {expected}")
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt == 4:
+                raise
+            progress.log(f"[RETRY] Download interrupted, resuming: {dest.name}")
+            await asyncio.sleep(min(2 ** attempt, 8))
+    if expected and part.stat().st_size < expected and last_exc:
+        raise last_exc
     part.replace(dest)
     progress.files_downloaded += 1
     progress.log(f"[{progress.files_downloaded}/{progress.files_to_download}] Downloaded: {dest.name}")

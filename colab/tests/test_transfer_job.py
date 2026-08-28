@@ -403,6 +403,61 @@ class TransferJobTests(TestCase):
         self.assertEqual(job.progress.download, 100)
         self.assertGreater(job.speed, 0)
 
+    def test_stream_download_resumes_after_incomplete_body(self):
+        class Stream:
+            def __init__(self, calls):
+                self.calls = calls
+                self.status_code = 206 if len(calls) == 2 else 200
+                self.headers = {"content-length": "3" if self.status_code == 206 else "6"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_bytes(self, size):
+                if self.status_code == 200:
+                    yield b"abc"
+                    raise base_mod.httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+                yield b"def"
+
+        class Client:
+            def __init__(self, *args, **kwargs):
+                return None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def stream(self, method, url, headers):
+                calls.append(headers)
+                return Stream(calls)
+
+        async def no_sleep(delay):
+            return None
+
+        calls = []
+        old_client = base_mod.httpx.AsyncClient
+        old_sleep = base_mod.asyncio.sleep
+        base_mod.httpx.AsyncClient = Client
+        base_mod.asyncio.sleep = no_sleep
+        try:
+            with __import__("tempfile").TemporaryDirectory() as tmp:
+                dest = Path(tmp) / "file.bin"
+                asyncio.run(base_mod.stream_download("https://example.test/file", dest, JobState("resume", {})))
+                self.assertEqual(dest.read_bytes(), b"abcdef")
+        finally:
+            base_mod.httpx.AsyncClient = old_client
+            base_mod.asyncio.sleep = old_sleep
+
+        self.assertEqual(calls[1]["Range"], "bytes=3-")
+
     def test_folder_downloads_are_concurrent_and_bounded(self):
         class Provider(base_mod.BaseProvider):
             name = "parallel"
