@@ -16,6 +16,11 @@ from src.providers.pikpak import PikPakProvider
 from src.providers import pikpak as pikpak_mod
 from src.providers.terabox import TeraBoxProvider, TeraBoxSession
 
+def test_colab_download_concurrency_default_is_cdn_friendly():
+    from src.config import FOLDER_DOWNLOAD_CONCURRENCY
+
+    assert FOLDER_DOWNLOAD_CONCURRENCY == 12
+
 
 class OneFileFolderSource:
     async def download_folder(self, credentials, folder_ref, local_dir: Path, progress: JobState):
