@@ -34,6 +34,7 @@ class JobState:
     _phase: str = ""
     _phase_done: int = 0
     _phase_total: int = 0
+    _phase_total_keys: set[tuple[str, str]] = field(default_factory=set)
 
     def log(self, message: str) -> None:
         self.logs.append(message)
@@ -49,16 +50,25 @@ class JobState:
             self.current_file = current_file
         self.updated_at = time.time()
 
-    def add_bytes(self, n: int, total: int = 0, phase: str = "download") -> None:
-        if phase != self._phase or (total and total != self._phase_total):
+    def add_bytes(self, n: int, total: int = 0, phase: str = "download", total_key: str | None = None) -> None:
+        if phase != self._phase:
             self._phase = phase
+            self._phase_done = 0
+            self._phase_total = 0
+            self._phase_total_keys.clear()
+        if total_key and total:
+            key = (phase, total_key)
+            if key not in self._phase_total_keys:
+                self._phase_total += total
+                self._phase_total_keys.add(key)
+        elif total and total != self._phase_total:
             self._phase_done = 0
             self._phase_total = total
         self.bytes_done += n
         self._phase_done += n
-        if total:
-            self.bytes_total = total
-            setattr(self.progress, phase, min(100, self._phase_done / total * 100))
+        if self._phase_total:
+            self.bytes_total = self._phase_total
+            setattr(self.progress, phase, min(100, self._phase_done / self._phase_total * 100))
         now = time.time()
         elapsed = now - self._tick_at
         if elapsed >= 1:

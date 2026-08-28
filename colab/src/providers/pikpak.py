@@ -16,6 +16,7 @@ from urllib.parse import quote, urlencode
 import httpx
 
 from .base import BaseProvider, ProviderFailure, safe_name, stream_download
+from ..config import PIKPAK_UPLOAD_CONCURRENCY
 from ..jobs.progress import JobState
 
 API = "https://api-drive.mypikpak.com"
@@ -222,6 +223,7 @@ class PikPakProvider(BaseProvider):
             return {}
         deadline = time.time() + timeout
         last: dict[str, Any] = {}
+        last_phase = None
         while time.time() < deadline:
             progress.check_cancelled()
             try:
@@ -234,7 +236,9 @@ class PikPakProvider(BaseProvider):
                     s.captcha = ""
             last = task
             phase = str(task.get("phase") or task.get("status") or "")
-            progress.log(f"PikPak upload task {task_id}: {phase or 'unknown'}")
+            if phase != last_phase:
+                progress.log(f"PikPak upload task {task_id}: {phase or 'unknown'}")
+                last_phase = phase
             if phase == "PHASE_TYPE_COMPLETE":
                 progress.progress.upload = 100
                 progress.updated_at = time.time()
@@ -249,6 +253,7 @@ class PikPakProvider(BaseProvider):
             raise ProviderFailure("UPLOAD_FAILED", "PikPak upload response missing task id and file id")
         deadline = time.time() + timeout
         last: dict[str, Any] = {}
+        last_phase = None
         while time.time() < deadline:
             progress.check_cancelled()
             try:
@@ -261,7 +266,9 @@ class PikPakProvider(BaseProvider):
                     s.captcha = ""
             last = info
             phase = str(info.get("phase") or "")
-            progress.log(f"PikPak upload file {file_id}: {phase or 'unknown'}")
+            if phase != last_phase:
+                progress.log(f"PikPak upload file {file_id}: {phase or 'unknown'}")
+                last_phase = phase
             if phase == "PHASE_TYPE_COMPLETE":
                 progress.progress.upload = 100
                 progress.updated_at = time.time()
@@ -313,7 +320,7 @@ class PikPakProvider(BaseProvider):
                 raise ProviderFailure("UPLOAD_FAILED", "OSS uploadId missing")
             ranges = [(i + 1, off, min(PART, size - off)) for i, off in enumerate(range(0, max(size, 1), PART))]
             parts: list[tuple[int, str]] = []
-            sem = asyncio.Semaphore(4)
+            sem = asyncio.Semaphore(max(1, PIKPAK_UPLOAD_CONCURRENCY))
             async def put_part(part_no: int, off: int, n: int) -> tuple[int, str]:
                 async with sem:
                     progress.check_cancelled()
@@ -324,7 +331,7 @@ class PikPakProvider(BaseProvider):
                     resp = await http.put(f"{base}?{urlencode(q2)}", content=data, headers=_oss_headers(params, "PUT", mime, q2))
                     if resp.is_error:
                         raise ProviderFailure("UPLOAD_FAILED", resp.text[:500])
-                    progress.add_bytes(len(data), size, "upload")
+                    progress.add_bytes(len(data), size, "upload", str(local_path))
                     return part_no, resp.headers.get("etag", "").strip('"')
             parts = sorted(await asyncio.gather(*(put_part(*r) for r in ranges)))
             body = ('<?xml version="1.0" encoding="UTF-8"?>\n<CompleteMultipartUpload>\n' + "".join(f"<Part><PartNumber>{n}</PartNumber><ETag>\"{e}\"</ETag></Part>\n" for n, e in parts) + "</CompleteMultipartUpload>").encode()

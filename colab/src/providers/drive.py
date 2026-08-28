@@ -96,12 +96,12 @@ class DriveProvider(BaseProvider):
                 async with httpx.AsyncClient(timeout=None) as client:
                     resp = await client.put(session, headers=self._headers(credentials, {"Content-Length": str(len(data)), "Content-Range": f"bytes {offset}-{end}/{size}"}), content=data)
                 if resp.status_code in (200, 201):
-                    progress.add_bytes(len(data), size, "upload")
+                    progress.add_bytes(len(data), size, "upload", str(local_path))
                     return resp.json()
                 if resp.status_code != 308:
                     raise ProviderFailure("UPLOAD_FAILED", resp.text[:500], {"status": resp.status_code})
                 rng = resp.headers.get("Range", "")
                 next_offset = int(rng.rsplit("-", 1)[1]) + 1 if "-" in rng else end + 1
-                progress.add_bytes(max(0, next_offset - offset), size, "upload")
+                progress.add_bytes(max(0, next_offset - offset), size, "upload", str(local_path))
                 offset = next_offset
         raise ProviderFailure("UPLOAD_FAILED", "Drive upload ended early")

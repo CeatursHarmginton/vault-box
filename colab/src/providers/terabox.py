@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 import httpx
 
 from .base import BaseProvider, ProviderFailure, safe_name, stream_download
+from ..config import TERABOX_UPLOAD_CONCURRENCY
 from ..jobs.progress import JobState
 
 DEFAULT_HOST = "https://www.terabox.com"
@@ -20,7 +21,7 @@ VALIDATION_HOSTS = ("https://www.terabox.com", "https://www.1024terabox.com", "h
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 CONST = {"app_id": "250528", "web": "1", "channel": "dubox", "clienttype": "0"}
 PART = 4 * 1024 * 1024
-UPLOAD_CONCURRENCY = 6
+UPLOAD_CONCURRENCY = TERABOX_UPLOAD_CONCURRENCY
 JS_PAT = (r"fn%28%22([0-9A-Fa-f]+)%22%29", r'"jsToken"\s*:\s*"([0-9A-Fa-f]+)"', r"jsToken['\"]?\s*[:=]\s*['\"]([0-9A-Fa-f]+)['\"]")
 BD_PAT = (r'"bdstoken"\s*:\s*"([0-9a-f]{32})"', r"bdstoken['\"]?\s*[:=]\s*['\"]([0-9a-f]{32})['\"]")
 TOKEN_EXPIRED = {"4000020", "4000023", "450016"}
@@ -286,7 +287,7 @@ class TeraBoxProvider(BaseProvider):
                         try:
                             await self._upload_part(client, s, host, local_path, remote_path, upload_id, idx, part_size, mime)
                             async with lock:
-                                progress.add_bytes(part_size, size, "upload")
+                                progress.add_bytes(part_size, size, "upload", remote_path)
                             return
                         except ProviderFailure as exc:
                             last = exc
@@ -312,8 +313,9 @@ class TeraBoxProvider(BaseProvider):
         mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
         last = ""
         uploaded = False
+        fallbacks = tuple(dict.fromkeys((UPLOAD_CONCURRENCY, 16, 8, 4, 2, 1)))
         for host in await self._locate_upload_hosts(s):
-            for concurrency in (UPLOAD_CONCURRENCY, 4, 2, 1):
+            for concurrency in fallbacks:
                 try:
                     await self._upload_parts(s, host, local_path, remote_path, str(upload_id), size, mime, progress, concurrency)
                     uploaded = True

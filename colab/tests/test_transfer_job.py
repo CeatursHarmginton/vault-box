@@ -7,6 +7,7 @@ from unittest import TestCase
 from src.jobs.progress import JobState
 from src.jobs.transfer_job import run_transfer
 from src.providers import PROVIDERS
+from src.providers import base as base_mod
 from src.providers.base import ProviderFailure
 from src.providers.pikpak import PikPakProvider
 from src.providers import pikpak as pikpak_mod
@@ -53,9 +54,122 @@ class TransferJobTests(TestCase):
         self.assertEqual(job.status, "completed")
         self.assertEqual(dst.calls[0][0], "folder")
 
+    def test_folder_source_uses_path_basename(self):
+        from src.utils.temp_storage import job_dirs
+
+        src = PathCapturingFolderSource()
+        dst = UploadRecorder()
+        old = dict(PROVIDERS)
+        PROVIDERS.update({"fake-source": src, "fake-dst": dst})
+        try:
+            job = JobState("terabox-folder-path", {
+                "source": {"provider": "fake-source", "items": [{"type": "folder", "name": "/ZIP HOME/九言 zip/Coser@九言 - 2026年02月月票2 卡芙卡自拍", "id": "/ZIP HOME/九言 zip/Coser@九言 - 2026年02月月票2 卡芙卡自拍"}]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": False},
+            })
+            dirs = job_dirs("terabox-folder-path")
+            asyncio.run(run_transfer(job))
+            self.assertEqual(job.status, "completed", job.error)
+            self.assertEqual(src.dirs[0], dirs["input"] / "Coser@九言 - 2026年02月月票2 卡芙卡自拍")
+            self.assertEqual(dst.calls[0], ("folder", dirs["input"]))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("terabox-folder-path")
+
     def test_progress_phases_skip_extract_when_disabled(self):
         job = JobState("no-extract", {"options": {"extract": False}})
         self.assertEqual(job.view()["phases"], ["download", "upload"])
+
+    def test_progress_totals_are_cumulative_for_folder_files(self):
+        job = JobState("folder-progress", {})
+        job._tick_at -= 2
+        job.add_bytes(5, 5, "download", "a.bin")
+        job._tick_at -= 2
+        job.add_bytes(7, 7, "download", "b.bin")
+
+        view = job.view()
+        self.assertEqual(view["bytesDone"], 12)
+        self.assertEqual(view["bytesTotal"], 12)
+        self.assertEqual(job.progress.download, 100)
+        self.assertGreater(job.speed, 0)
+
+    def test_folder_downloads_are_concurrent_and_bounded(self):
+        class Provider(base_mod.BaseProvider):
+            name = "parallel"
+
+            def __init__(self):
+                self.active = 0
+                self.max_active = 0
+
+            async def validate_credentials(self, credentials):
+                return {"ok": True}
+
+            async def list_files(self, credentials, path_or_id):
+                return {"items": [{"id": str(i), "name": f"{i}.txt", "type": "file"} for i in range(4)]}
+
+            async def download_file(self, credentials, file_ref, local_path, progress):
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                await asyncio.sleep(0.01)
+                self.active -= 1
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                local_path.write_text(str(file_ref["id"]))
+                return local_path
+
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                return {"ok": True}
+
+        old = base_mod.FOLDER_DOWNLOAD_CONCURRENCY
+        base_mod.FOLDER_DOWNLOAD_CONCURRENCY = 2
+        try:
+            with __import__("tempfile").TemporaryDirectory() as tmp:
+                provider = Provider()
+                saved = asyncio.run(provider.download_folder({}, {"id": "/"}, Path(tmp), JobState("download-parallel", {})))
+        finally:
+            base_mod.FOLDER_DOWNLOAD_CONCURRENCY = old
+
+        self.assertEqual(provider.max_active, 2)
+        self.assertEqual([p.name for p in saved], ["0.txt", "1.txt", "2.txt", "3.txt"])
+
+    def test_folder_uploads_are_concurrent_and_bounded(self):
+        class Provider(base_mod.BaseProvider):
+            name = "parallel"
+
+            def __init__(self):
+                self.active = 0
+                self.max_active = 0
+
+            async def validate_credentials(self, credentials):
+                return {"ok": True}
+
+            async def download_file(self, credentials, file_ref, local_path, progress):
+                return local_path
+
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                await asyncio.sleep(0.01)
+                self.active -= 1
+                if local_path.name == "2.txt":
+                    raise ProviderFailure("UPLOAD_FAILED", "duplicated")
+                return {"name": local_path.name}
+
+        old = base_mod.FOLDER_UPLOAD_CONCURRENCY
+        base_mod.FOLDER_UPLOAD_CONCURRENCY = 2
+        try:
+            with __import__("tempfile").TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for i in range(4):
+                    (root / f"{i}.txt").write_text(str(i))
+                provider = Provider()
+                out = asyncio.run(provider.upload_folder({}, root, {}, JobState("upload-parallel", {})))
+        finally:
+            base_mod.FOLDER_UPLOAD_CONCURRENCY = old
+
+        self.assertEqual(provider.max_active, 2)
+        self.assertEqual(out["uploaded"], 3)
+        self.assertEqual(out["skipped"], 1)
 
     def test_terabox_upload_falls_back_to_lower_concurrency(self):
         class Provider(TeraBoxProvider):
@@ -73,7 +187,7 @@ class TransferJobTests(TestCase):
 
             async def _upload_parts(self, s, host, local_path, remote_path, upload_id, size, mime, progress, concurrency):
                 self.concurrency.append(concurrency)
-                if concurrency == 6:
+                if concurrency == 32:
                     raise Exception("too many")
                 progress.add_bytes(size, size, "upload")
 
@@ -98,7 +212,7 @@ class TransferJobTests(TestCase):
             TeraBoxSession.ready = old_ready
             TeraBoxSession.request_json = old_request_json
 
-        self.assertEqual(provider.concurrency[:2], [6, 4])
+        self.assertEqual(provider.concurrency[:2], [32, 16])
         self.assertEqual(job.progress.upload, 100)
 
     def test_pikpak_upload_waits_for_task_when_oss_params_missing(self):

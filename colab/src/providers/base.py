@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -7,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from ..config import CHUNK_SIZE
+from ..config import CHUNK_SIZE, FOLDER_DOWNLOAD_CONCURRENCY, FOLDER_UPLOAD_CONCURRENCY
 from ..jobs.progress import JobState
 
 class ProviderFailure(RuntimeError):
@@ -29,39 +30,45 @@ class BaseProvider(ABC):
     @abstractmethod
     async def download_file(self, credentials: dict[str, Any], file_ref: dict[str, Any], local_path: Path, progress: JobState) -> Path: ...
 
-    async def download_folder(self, credentials: dict[str, Any], folder_ref: dict[str, Any], local_dir: Path, progress: JobState) -> list[Path]:
+    async def download_folder(self, credentials: dict[str, Any], folder_ref: dict[str, Any], local_dir: Path, progress: JobState, _sem: asyncio.Semaphore | None = None) -> list[Path]:
         listing = await self.list_files(credentials, str(folder_ref.get("id") or folder_ref.get("path") or "/"))
         items = listing.get("items") or listing.get("files") or []
         progress.log(f"{self.name} list folder {folder_ref.get('name') or folder_ref.get('path') or folder_ref.get('id')}: {len(items)} item(s)")
-        saved: list[Path] = []
-        for item in items:
+        sem = _sem or asyncio.Semaphore(max(1, FOLDER_DOWNLOAD_CONCURRENCY))
+
+        async def save(item: dict[str, Any]) -> list[Path]:
             progress.check_cancelled()
             if item.get("type") == "folder" or item.get("is_folder") or item.get("isdir"):
                 sub = local_dir / _safe_name(item.get("name") or item.get("server_filename") or "folder")
                 sub.mkdir(parents=True, exist_ok=True)
-                saved.extend(await self.download_folder(credentials, item, sub, progress))
-            else:
-                saved.append(await self.download_file(credentials, item, local_dir / _safe_name(item.get("name") or item.get("server_filename") or item.get("id") or "file"), progress))
-        return saved
+                return await self.download_folder(credentials, item, sub, progress, sem)
+            async with sem:
+                return [await self.download_file(credentials, item, local_dir / _safe_name(item.get("name") or item.get("server_filename") or item.get("id") or "file"), progress)]
+
+        return [path for batch in await asyncio.gather(*(save(item) for item in items)) for path in batch]
 
     @abstractmethod
     async def upload_file(self, credentials: dict[str, Any], local_path: Path, target_ref: dict[str, Any], progress: JobState) -> dict[str, Any]: ...
 
     async def upload_folder(self, credentials: dict[str, Any], local_dir: Path, target_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:
-        uploaded = []
-        skipped = 0
+        paths = [path for path in sorted(local_dir.rglob("*")) if path.is_file()]
+        sem = asyncio.Semaphore(max(1, FOLDER_UPLOAD_CONCURRENCY))
         root_target = target_ref
-        for path in sorted(local_dir.rglob("*")):
+
+        async def upload(path: Path) -> dict[str, Any] | None:
             progress.check_cancelled()
-            if path.is_file():
+            async with sem:
                 rel = path.relative_to(local_dir).as_posix()
                 try:
-                    uploaded.append(await self.upload_file(credentials, path, {**root_target, "relative_path": rel}, progress))
+                    return await self.upload_file(credentials, path, {**root_target, "relative_path": rel}, progress)
                 except ProviderFailure as exc:
                     if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
-                        skipped += 1
-                        continue
+                        return None
                     raise
+
+        results = await asyncio.gather(*(upload(path) for path in paths))
+        uploaded = [item for item in results if item is not None]
+        skipped = len(results) - len(uploaded)
         progress.log(f"{self.name} upload folder {local_dir.name}: {len(uploaded)} uploaded, {skipped} skipped")
         return {"ok": True, "uploaded": len(uploaded), "skipped": skipped, "items": uploaded}
 
@@ -86,7 +93,7 @@ async def stream_download(url: str, dest: Path, progress: JobState, *, headers: 
                     progress.check_cancelled()
                     fh.write(chunk)
                     done += len(chunk)
-                    progress.add_bytes(len(chunk), total, phase)
+                    progress.add_bytes(len(chunk), total, phase, str(dest))
     part.replace(dest)
     return dest
 

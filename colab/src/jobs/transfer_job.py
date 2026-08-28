@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..extract.extractor import extract_archives
@@ -30,9 +30,8 @@ async def run_transfer(job: JobState) -> None:
             item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
             if item_type == "folder":
                 has_folder_source = True
-                # safe_name strips separators so a provider path like "/Shiroi" cannot
-                # escape the job input dir (Path("/in") / "/Shiroi" == Path("/Shiroi")).
-                folder_dir = dirs["input"] / safe_name(item.get("name") or item.get("id") or "folder")
+                raw_name = str(item.get("name") or item.get("path") or item.get("id") or "folder").replace("\\", "/")
+                folder_dir = dirs["input"] / safe_name(PurePosixPath(raw_name).name or raw_name)
                 folder_dir.mkdir(parents=True, exist_ok=True)
                 downloaded.extend(await src.download_folder(source.get("credentials") or {}, item, folder_dir, job))
             else:
