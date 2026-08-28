@@ -122,4 +122,6 @@ class JobState:
             "filesToUpload": self.files_to_upload,
             "optimizedFiles": self.optimized_files,
             "confirmAction": self.confirm_action,
+            "targetProvider": (self.payload.get("target") or {}).get("provider"),
+            "targetAccountId": (self.payload.get("target") or {}).get("accountId") or (self.payload.get("target") or {}).get("account_id"),
         }

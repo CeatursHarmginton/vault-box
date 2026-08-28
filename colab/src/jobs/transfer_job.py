@@ -131,17 +131,7 @@ async def run_transfer(job: JobState) -> None:
         preserve_tree = bool(options.get("preserveFolderStructure") or has_folder_source)
         if len(outputs) == 1 and outputs[0].is_file() and not preserve_tree:
             job.files_to_upload = 1
-            try:
-                result = await dst.upload_file(target.get("credentials") or {}, outputs[0], _upload_target(target.get("folder") or {}, outputs[0].name, options), job)
-                job.files_uploaded = 1
-                job.log(f"[1/1] Uploaded: {outputs[0].name}")
-            except ProviderFailure as exc:
-                if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
-                    job.files_skipped = 1
-                    job.log(f"[1/1] Skipped (duplicate): {outputs[0].name}")
-                    result = {"ok": True, "uploaded": 0, "skipped": 1, "items": []}
-                else:
-                    raise
+            result = await _upload_one_with_retry(job, target, options, dst, outputs[0])
         else:
             upload_root = out_root
             if options.get("optimize_image") and has_folder_source:
@@ -150,17 +140,7 @@ async def run_transfer(job: JobState) -> None:
                     upload_root = folder_root
             if out_root == dirs["input"] and len(outputs) == 1 and not preserve_tree:
                 job.files_to_upload = 1
-                try:
-                    result = await dst.upload_file(target.get("credentials") or {}, outputs[0], _upload_target(target.get("folder") or {}, outputs[0].name, options), job)
-                    job.files_uploaded = 1
-                    job.log(f"[1/1] Uploaded: {outputs[0].name}")
-                except ProviderFailure as exc:
-                    if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
-                        job.files_skipped = 1
-                        job.log(f"[1/1] Skipped (duplicate): {outputs[0].name}")
-                        result = {"ok": True, "uploaded": 0, "skipped": 1, "items": []}
-                    else:
-                        raise
+                result = await _upload_one_with_retry(job, target, options, dst, outputs[0])
             else:
                 if not any(p.is_file() for p in upload_root.rglob("*")):
                     raise ProviderFailure("UPLOAD_FAILED", "No files staged for upload", {"root": str(upload_root)})
@@ -244,7 +224,7 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
                     upload_root = folder_root
             job.set(status="running", step="uploading")
             before_total, before_uploaded, before_skipped = job.files_to_upload, job.files_uploaded, job.files_skipped
-            await _upload_outputs(job, target, options, dst, upload_root, item)
+            await _upload_outputs_with_retry(job, target, options, dst, upload_root, item)
             job.files_to_upload += before_total
             job.files_uploaded += before_uploaded
             job.files_skipped += before_skipped
@@ -278,6 +258,52 @@ async def _upload_outputs(job: JobState, target: dict[str, Any], options: dict[s
         job.log(f"[{job.files_uploaded}/{job.files_to_upload}] Uploaded: {files[0].name}")
         return
     await dst.upload_folder(target.get("credentials") or {}, upload_root, _upload_target(folder, "", options), job)
+
+async def _upload_one_with_retry(job: JobState, target: dict[str, Any], options: dict[str, Any], dst: Any, path: Path) -> dict[str, Any]:
+    while True:
+        try:
+            result = await dst.upload_file(target.get("credentials") or {}, path, _upload_target(target.get("folder") or {}, path.name, options), job)
+            job.files_uploaded = 1
+            job.error = None
+            job.log(f"[1/1] Uploaded: {path.name}")
+            return result
+        except ProviderFailure as exc:
+            if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
+                job.files_skipped = 1
+                job.log(f"[1/1] Skipped (duplicate): {path.name}")
+                return {"ok": True, "uploaded": 0, "skipped": 1, "items": []}
+            if exc.code != "UPLOAD_FAILED":
+                raise
+            await _wait_for_retry_account(job, target, exc)
+
+async def _upload_outputs_with_retry(job: JobState, target: dict[str, Any], options: dict[str, Any], dst: Any, upload_root: Path, item: dict[str, Any]) -> None:
+    while True:
+        try:
+            await _upload_outputs(job, target, options, dst, upload_root, item)
+            job.error = None
+            return
+        except ProviderFailure as exc:
+            if exc.code != "UPLOAD_FAILED":
+                raise
+            await _wait_for_retry_account(job, target, exc)
+            continue
+
+async def _wait_for_retry_account(job: JobState, target: dict[str, Any], exc: ProviderFailure) -> None:
+    job.error = {"code": exc.code, "message": exc.message, "details": exc.details}
+    job.log(f"Upload failed: {exc.message}. Waiting for another target account...")
+    job.confirm_action = None
+    job.confirm_event.clear()
+    job.set(status="waiting_target_account", step="uploading")
+    while not job.confirm_event.wait(timeout=1.0):
+        job.check_cancelled()
+    if job.confirm_action == "cancel":
+        raise JobCancelled()
+    if job.confirm_action != "retry_upload":
+        raise exc
+    new_target = dict(job.payload.get("target") or {})
+    target.clear()
+    target.update(new_target)
+    job.set(status="running", step="uploading")
 
 def _wait_for_confirmation(job: JobState, count: int) -> str:
     job.set(status="waiting_confirmation", step="optimized")

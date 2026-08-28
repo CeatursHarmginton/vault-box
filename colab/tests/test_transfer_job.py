@@ -308,6 +308,61 @@ class TransferJobTests(TestCase):
         self.assertEqual([r["relative_path"] for r in dst.target_refs], ["results/A (optimized)", "results/B (optimized)"])
         self.assertEqual(len([line for line in job.logs if "Waiting for confirmation" in line]), 1)
 
+    def test_optimized_upload_failure_waits_for_retry_account(self):
+        class Source:
+            async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
+                path = local_dir / "a.jpg"
+                path.write_bytes(b"x")
+                return path
+
+        class Dst(UploadRecorder):
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                if credentials.get("account") != "b":
+                    raise ProviderFailure("UPLOAD_FAILED", "insufficient storage")
+                return await super().upload_file(credentials, local_path, target_ref, progress)
+
+        dst = Dst()
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            out = output_dir / "a.jpg"
+            out.write_bytes(b"x")
+            return [{"name": "a.jpg", "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95}]
+        PROVIDERS.update({"fake-source": Source(), "fake-dst": dst})
+        image_optimizer.optimize_directory = fake_optimize
+        try:
+            job = JobState("opt-upload-retry", {
+                "source": {"provider": "fake-source", "items": [{"type": "file", "name": "a.jpg"}]},
+                "target": {"provider": "fake-dst", "folder": {}, "credentials": {"account": "a"}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True},
+            })
+            def confirm():
+                for _ in range(1000):
+                    if job.status == "waiting_confirmation":
+                        job.confirm_action = "upload_new"
+                        job.confirm_event.set()
+                        break
+                    time.sleep(0.01)
+                for _ in range(1000):
+                    if job.status == "waiting_target_account":
+                        job.payload["target"]["credentials"] = {"account": "b"}
+                        job.confirm_action = "retry_upload"
+                        job.confirm_event.set()
+                        return
+                    time.sleep(0.01)
+            thread = threading.Thread(target=confirm)
+            thread.start()
+            asyncio.run(run_transfer(job))
+            thread.join(timeout=1)
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-upload-retry")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(len(dst.calls), 1)
+
     def test_folder_source_uses_path_basename(self):
         from src.utils.temp_storage import job_dirs
 

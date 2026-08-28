@@ -76,8 +76,13 @@ async def transfer_confirm(job_id: str, payload: dict[str, Any]) -> dict[str, An
     if not job:
         raise HTTPException(status_code=404, detail={"code": "JOB_NOT_FOUND", "message": "Job not found"})
     action = payload.get("action")
-    if action not in {"replace", "upload_new", "cancel"}:
+    if action not in {"replace", "upload_new", "retry_upload", "cancel"}:
         raise HTTPException(status_code=400, detail={"code": "INVALID_ACTION", "message": "Invalid action"})
+    if action == "retry_upload":
+        target = payload.get("target") or {}
+        if target.get("credentials"):
+            job.payload.setdefault("target", {}).update(target)
+            job.log(f"Retry upload with target account: {target.get('accountId') or target.get('account_id') or '-'}")
     job.confirm_action = action
     job.confirm_event.set()
     return {"ok": True, "jobId": job_id, "action": action}
