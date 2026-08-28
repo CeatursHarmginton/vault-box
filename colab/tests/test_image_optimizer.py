@@ -93,12 +93,43 @@ class ImageOptimizerTests(TestCase):
             return out, adaptive_quality, "ok"
         image_optimizer.optimize_image_file = fake_optimize
         try:
-            results = optimize_directory(self.src_dir, self.dest_dir, {"optimize_workers": 4}, MockJobState())
+            results = optimize_directory(self.src_dir, self.dest_dir, {"optimize_workers": 4, "auto_size": False}, MockJobState())
         finally:
             image_optimizer.optimize_image_file = old
 
         self.assertEqual([r["name"] for r in results], ["0.jpg", "1.jpg", "2.jpg", "3.jpg"])
         self.assertGreater(len(seen), 1)
+
+    def test_auto_size_worker_override_still_resets_quality_per_folder(self) -> None:
+        for rel in ("a/1.jpg", "a/2.jpg", "b/1.jpg"):
+            path = self.src_dir / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x" * 20)
+
+        seen: list[tuple[str, int]] = []
+        threads: set[int] = set()
+        old = image_optimizer.optimize_image_file
+        def fake_optimize(src_path, dest_dir, options, adaptive_quality):
+            threads.add(threading.get_ident())
+            seen.append((src_path.relative_to(self.src_dir).as_posix(), adaptive_quality))
+            time.sleep(0.02)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            out = dest_dir / src_path.name
+            out.write_bytes(b"x" * 9)
+            return out, 80 if src_path.name == "1.jpg" else adaptive_quality, "ok"
+        image_optimizer.optimize_image_file = fake_optimize
+        try:
+            optimize_directory(self.src_dir, self.dest_dir, {
+                "optimize_workers": 4,
+                "auto_size": True,
+                "start_quality": 95,
+                "max_target_mb": 0.00001,
+            }, MockJobState())
+        finally:
+            image_optimizer.optimize_image_file = old
+
+        self.assertEqual(sorted(seen), [("a/1.jpg", 95), ("a/2.jpg", 85), ("b/1.jpg", 95)])
+        self.assertGreater(len(threads), 1)
 
     def test_png_is_written_as_real_jpeg(self) -> None:
         src = self.src_dir / "photo.png"

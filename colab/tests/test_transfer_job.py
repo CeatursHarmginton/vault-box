@@ -250,6 +250,64 @@ class TransferJobTests(TestCase):
         self.assertEqual(job.status, "completed", job.error)
         self.assertEqual(src.downloaded, ["a.jpg"])
 
+    def test_optimize_queue_processes_folders_one_at_a_time(self):
+        events = []
+
+        class Source:
+            async def download_folder(self, credentials, folder_ref, local_dir: Path, progress: JobState):
+                events.append(f"download:{folder_ref['name']}")
+                path = local_dir / "a.jpg"
+                path.write_bytes(b"x")
+                return [path]
+
+        class Dst(UploadRecorder):
+            async def upload_folder(self, credentials, local_dir, target_ref, progress):
+                events.append(f"upload:{local_dir.name}")
+                return await super().upload_folder(credentials, local_dir, target_ref, progress)
+
+        dst = Dst()
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            name = next(p.name for p in input_dir.iterdir() if p.is_dir())
+            events.append(f"opt:{name}")
+            out = output_dir / name / "a.jpg"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"x")
+            return [{"name": f"{name}/a.jpg", "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95}]
+        PROVIDERS.update({"fake-source": Source(), "fake-dst": dst})
+        image_optimizer.optimize_directory = fake_optimize
+        try:
+            job = JobState("opt-queue-batches", {
+                "source": {"provider": "fake-source", "items": [
+                    {"type": "folder", "name": "A", "id": "/A"},
+                    {"type": "folder", "name": "B", "id": "/B"},
+                ]},
+                "target": {"provider": "fake-dst", "folder": {"id": "/", "path": "/"}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True},
+            })
+            def confirm():
+                for _ in range(1000):
+                    if job.status == "waiting_confirmation":
+                        job.confirm_action = "upload_new"
+                        job.confirm_event.set()
+                        return
+                    time.sleep(0.01)
+            thread = threading.Thread(target=confirm)
+            thread.start()
+            asyncio.run(run_transfer(job))
+            thread.join(timeout=1)
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-queue-batches")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(events, ["download:A", "opt:A", "upload:A", "download:B", "opt:B", "upload:B"])
+        self.assertEqual([r["relative_path"] for r in dst.target_refs], ["results/A (optimized)", "results/B (optimized)"])
+        self.assertEqual(len([line for line in job.logs if "Waiting for confirmation" in line]), 1)
+
     def test_folder_source_uses_path_basename(self):
         from src.utils.temp_storage import job_dirs
 

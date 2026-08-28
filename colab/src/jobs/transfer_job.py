@@ -33,6 +33,12 @@ async def run_transfer(job: JobState) -> None:
         job.log(f"Job start: {source.get('provider')} -> {target.get('provider')}")
         job.log(f"Accounts: source={source.get('accountId') or source.get('account_id') or '-'} target={target.get('accountId') or target.get('account_id') or '-'}")
 
+        if options.get("optimize_image") and len(source.get("items") or []) > 1:
+            await _run_optimized_batches(job, dirs, source, target, options, src, dst)
+            job.log(f"Done: Downloaded {job.files_downloaded}/{job.files_to_download} file(s), Uploaded {job.files_uploaded}/{job.files_to_upload} file(s) (skipped {job.files_skipped} file(s))")
+            job.set(status="completed", step="completed")
+            return
+
         # Count individual files in the source list beforehand to prevent incorrect [index/index] counts
         file_items = [item for item in (source.get("items") or []) if not (item.get("type") == "folder" or item.get("is_folder"))]
         if options.get("optimize_image"):
@@ -185,6 +191,126 @@ def _upload_target(folder: dict[str, Any], relative_path: str, options: dict[str
     if not prefix:
         return {**folder, **({"relative_path": relative_path} if relative_path else {})}
     return {**folder, "relative_path": f"{prefix}/{relative_path}".rstrip("/")}
+
+async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: dict[str, Any], target: dict[str, Any], options: dict[str, Any], src: Any, dst: Any) -> None:
+    from ..utils.image_optimizer import optimize_directory
+
+    action: str | None = None
+    for index, item in enumerate(source.get("items") or []):
+        job.check_cancelled()
+        item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
+        if item_type != "folder" and _is_video_item(item):
+            job.files_skipped += 1
+            job.log(f"[SKIP] Video ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
+            continue
+
+        batch_input = dirs["input"] / f"batch-{index}"
+        batch_output = dirs["output"] / f"batch-{index}" / "optimized"
+        batch_input.mkdir(parents=True, exist_ok=True)
+        batch_output.mkdir(parents=True, exist_ok=True)
+        try:
+            job.set(status="running", step="downloading")
+            downloaded = await _download_batch_item(job, source, src, item, batch_input)
+            if not downloaded:
+                job.log(f"No image files found for optimization: {_item_name(item)}")
+                continue
+            _validate_downloads(downloaded, batch_input)
+            job.log(f"Downloaded files: {len(downloaded)}")
+
+            job.set(step="optimizing")
+            job.log(f"Starting image optimization: {_item_name(item)}")
+            batch_results = await asyncio.to_thread(
+                optimize_directory, batch_input, batch_output, options, job,
+                cancel_check=job.check_cancelled,
+            )
+            job.optimized_files.extend(batch_results)
+            batch_files = [p for p in batch_output.rglob("*") if p.is_file()]
+            if not batch_results and not batch_files:
+                job.log(f"No image files found for optimization: {_item_name(item)}")
+                continue
+
+            if batch_results and action is None:
+                action = _wait_for_confirmation(job, len(batch_results))
+            action = action or ("replace" if options.get("replace") else "upload_new")
+            options["replace"] = action == "replace"
+            options.pop("upload_prefix", None)
+            if action == "upload_new":
+                options["upload_prefix"] = "results" if item_type != "folder" else f"results/{_item_name(item)} (optimized)"
+
+            upload_root = batch_output
+            if item_type == "folder":
+                folder_root = _only_child_dir(batch_output)
+                if folder_root:
+                    upload_root = folder_root
+            job.set(status="running", step="uploading")
+            before_total, before_uploaded, before_skipped = job.files_to_upload, job.files_uploaded, job.files_skipped
+            await _upload_outputs(job, target, options, dst, upload_root, item)
+            job.files_to_upload += before_total
+            job.files_uploaded += before_uploaded
+            job.files_skipped += before_skipped
+        finally:
+            shutil.rmtree(batch_input, ignore_errors=True)
+            shutil.rmtree(batch_output.parent, ignore_errors=True)
+
+    if not job.optimized_files and job.files_skipped:
+        job.log("No image files found for optimization.")
+
+async def _download_batch_item(job: JobState, source: dict[str, Any], src: Any, item: dict[str, Any], batch_input: Path) -> list[Path]:
+    item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
+    if item_type == "folder":
+        raw_name = str(item.get("name") or item.get("path") or item.get("id") or "folder").replace("\\", "/")
+        folder_dir = batch_input / safe_name(PurePosixPath(raw_name).name or raw_name)
+        folder_dir.mkdir(parents=True, exist_ok=True)
+        return await src.download_folder(source.get("credentials") or {}, item, folder_dir, job)
+    job.files_to_download += 1
+    return [await src.download_file(source.get("credentials") or {}, item, batch_input, job)]
+
+async def _upload_outputs(job: JobState, target: dict[str, Any], options: dict[str, Any], dst: Any, upload_root: Path, item: dict[str, Any]) -> None:
+    files = [p for p in upload_root.rglob("*") if p.is_file()]
+    if not files:
+        raise ProviderFailure("UPLOAD_FAILED", "No files staged for upload", {"root": str(upload_root)})
+    folder = _item_target_folder(target.get("folder") or {}, item)
+    item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
+    if len(files) == 1 and item_type != "folder":
+        job.files_to_upload += 1
+        await dst.upload_file(target.get("credentials") or {}, files[0], _upload_target(folder, files[0].name, options), job)
+        job.files_uploaded += 1
+        job.log(f"[{job.files_uploaded}/{job.files_to_upload}] Uploaded: {files[0].name}")
+        return
+    await dst.upload_folder(target.get("credentials") or {}, upload_root, _upload_target(folder, "", options), job)
+
+def _wait_for_confirmation(job: JobState, count: int) -> str:
+    job.set(status="waiting_confirmation", step="optimized")
+    job.log(f"Optimization finished: processed {count} images. Waiting for confirmation...")
+    while not job.confirm_event.wait(timeout=1.0):
+        job.check_cancelled()
+    job.log(f"User confirmation received: action={job.confirm_action}")
+    if job.confirm_action == "cancel":
+        raise JobCancelled()
+    return job.confirm_action or "upload_new"
+
+def _validate_downloads(downloaded: list[Path], root: Path) -> None:
+    stray = [p for p in downloaded if not p.is_relative_to(root)]
+    if stray:
+        raise ProviderFailure("DOWNLOAD_FAILED", "Downloaded files landed outside the job directory", {"paths": [str(p) for p in stray[:5]]})
+    missing = [p for p in downloaded if not p.is_file()]
+    if missing:
+        raise ProviderFailure("DOWNLOAD_FAILED", "Downloaded files missing on disk", {"paths": [str(p) for p in missing[:5]]})
+
+def _item_target_folder(folder: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
+    raw = str(item.get("path") or item.get("id") or "")
+    if item_type == "folder" and raw:
+        return {**folder, "id": raw, "path": raw}
+    if raw:
+        parent = str(PurePosixPath(raw).parent)
+        if parent and parent != ".":
+            return {**folder, "id": parent, "path": parent}
+    return folder
+
+def _item_name(item: dict[str, Any]) -> str:
+    raw_name = str(item.get("name") or item.get("path") or item.get("id") or "item").replace("\\", "/")
+    return safe_name(PurePosixPath(raw_name).name or raw_name)
 
 def _is_video_item(item: dict[str, Any]) -> bool:
     return Path(str(item.get("name") or item.get("path") or item.get("id") or "")).suffix.lower() in VIDEO_EXTENSIONS

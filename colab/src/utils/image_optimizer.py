@@ -8,6 +8,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import groupby
 from pathlib import Path
+from threading import Lock
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -221,7 +222,7 @@ def optimize_directory(
     total_images = len(images)
     processed = 0
     workers = _optimize_workers(options, total_images) if total_images else 1
-    if workers > 1:
+    if workers > 1 and not options.get("auto_size", True):
         job_state.log(f"[TỐI ƯU] Xử lý song song: {workers} worker(s)")
 
         def run_one(index: int, p: Path) -> tuple[int, dict[str, Any]]:
@@ -257,45 +258,54 @@ def optimize_directory(
             shutil.copy2(p, target_path)
 
         return results
-    
-    # Process images grouped by folder
-    for folder_key, folder_images in folder_groups:
-        # Reset adaptive quality per folder (exactly like fiximg_vips.ps1 line 699)
+
+    counter_lock = Lock()
+
+    def process_group(folder_key: str, folder_images: list[Path]) -> list[dict[str, Any]]:
+        nonlocal processed
         adaptive_quality = start_quality
         job_state.log(f"[THƯ MỤC] Đang xử lý: {folder_key} (Quality bắt đầu={adaptive_quality})")
-        
+        group_results: list[dict[str, Any]] = []
         for p in folder_images:
-            # Check for cancellation
             if cancel_check:
                 cancel_check()
-            
-            processed += 1
+            with counter_lock:
+                processed += 1
+                current = processed
             relative_path = p.relative_to(input_dir)
             job_state.set(current_file=str(relative_path))
-            job_state.log(f"Đang tối ưu ảnh ({processed}/{total_images}): {p.name}")
-            
-            # Calculate target destination directory maintaining hierarchy
-            target_dest_dir = output_dir / relative_path.parent
-            
+            job_state.log(f"Đang tối ưu ảnh ({current}/{total_images}): {p.name}")
             orig_size = p.stat().st_size
-            out_path, final_q, status = optimize_image_file(p, target_dest_dir, options, adaptive_quality)
+            out_path, final_q, status = optimize_image_file(p, output_dir / relative_path.parent, options, adaptive_quality)
             new_size = out_path.stat().st_size
-            
-            # Update adaptive quality if needed (within this folder group)
             if options.get("auto_size", True) and (start_quality - final_q) >= 10 and new_size >= 0.8 * max_target:
                 new_start = min(start_quality, max(10, final_q + 5))
                 if new_start < adaptive_quality:
                     job_state.log(f"[TỐI ƯU] Auto quality start giảm từ {adaptive_quality} xuống {new_start} dựa trên ảnh trước.")
                     adaptive_quality = new_start
-                    
-            results.append({
+            group_results.append({
                 "name": str(out_path.relative_to(output_dir)),
                 "original_size": orig_size,
                 "optimized_size": new_size,
                 "status": status,
                 "quality": final_q
             })
-        
+        return group_results
+
+    if workers > 1 and len(folder_groups) > 1:
+        group_workers = min(workers, len(folder_groups))
+        job_state.log(f"[TỐI ƯU] Xử lý song song: {group_workers} folder worker(s)")
+        ordered_groups: list[list[dict[str, Any]] | None] = [None] * len(folder_groups)
+        with ThreadPoolExecutor(max_workers=group_workers) as executor:
+            futures = [executor.submit(process_group, folder_key, folder_images) for folder_key, folder_images in folder_groups]
+            for index, future in enumerate(futures):
+                ordered_groups[index] = future.result()
+        for group_results in ordered_groups:
+            results.extend(group_results or [])
+    else:
+        for folder_key, folder_images in folder_groups:
+            results.extend(process_group(folder_key, folder_images))
+    
     # Copy non-images
     for p in non_images:
         if cancel_check:
