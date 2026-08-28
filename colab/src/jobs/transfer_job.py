@@ -159,7 +159,7 @@ async def run_transfer(job: JobState) -> None:
         job.log(f"Failed: {exc}")
         job.set(status="failed", step="failed")
     finally:
-        if (payload.get("options") or {}).get("cleanupAfterFinish", True):
+        if job.status == "completed" and (payload.get("options") or {}).get("cleanupAfterFinish", True):
             cleanup_job(job.job_id)
         # Drop provider credential refs after run.
         payload.get("source", {}).pop("credentials", None)
@@ -182,55 +182,61 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         if item_type != "folder" and _is_video_item(item):
             job.files_skipped += 1
             job.log(f"[SKIP] Video ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
+            job.completed_items.append(_queue_item_ref(source, item))
             continue
 
         batch_input = dirs["input"] / f"batch-{index}"
         batch_output = dirs["output"] / f"batch-{index}" / "optimized"
         batch_input.mkdir(parents=True, exist_ok=True)
         batch_output.mkdir(parents=True, exist_ok=True)
-        try:
-            job.set(status="running", step="downloading")
-            downloaded = await _download_batch_item(job, source, src, item, batch_input)
-            if not downloaded:
-                job.log(f"No image files found for optimization: {_item_name(item)}")
-                continue
-            _validate_downloads(downloaded, batch_input)
-            job.log(f"Downloaded files: {len(downloaded)}")
-
-            job.set(step="optimizing")
-            job.log(f"Starting image optimization: {_item_name(item)}")
-            batch_results = await asyncio.to_thread(
-                optimize_directory, batch_input, batch_output, options, job,
-                cancel_check=job.check_cancelled,
-            )
-            job.optimized_files.extend(batch_results)
-            batch_files = [p for p in batch_output.rglob("*") if p.is_file()]
-            if not batch_results and not batch_files:
-                job.log(f"No image files found for optimization: {_item_name(item)}")
-                continue
-
-            if batch_results and action is None:
-                action = _wait_for_confirmation(job, len(batch_results))
-            action = action or ("replace" if options.get("replace") else "upload_new")
-            options["replace"] = action == "replace"
-            options.pop("upload_prefix", None)
-            if action == "upload_new":
-                options["upload_prefix"] = "results" if item_type != "folder" else f"results/{_item_name(item)} (optimized)"
-
-            upload_root = batch_output
-            if item_type == "folder":
-                folder_root = _only_child_dir(batch_output)
-                if folder_root:
-                    upload_root = folder_root
-            job.set(status="running", step="uploading")
-            before_total, before_uploaded, before_skipped = job.files_to_upload, job.files_uploaded, job.files_skipped
-            await _upload_outputs_with_retry(job, target, options, dst, upload_root, item)
-            job.files_to_upload += before_total
-            job.files_uploaded += before_uploaded
-            job.files_skipped += before_skipped
-        finally:
+        job.set(status="running", step="downloading")
+        downloaded = await _download_batch_item(job, source, src, item, batch_input)
+        if not downloaded:
+            job.log(f"No image files found for optimization: {_item_name(item)}")
             shutil.rmtree(batch_input, ignore_errors=True)
             shutil.rmtree(batch_output.parent, ignore_errors=True)
+            job.completed_items.append(_queue_item_ref(source, item))
+            continue
+        _validate_downloads(downloaded, batch_input)
+        job.log(f"Downloaded files: {len(downloaded)}")
+
+        job.set(step="optimizing")
+        job.log(f"Starting image optimization: {_item_name(item)}")
+        batch_results = await asyncio.to_thread(
+            optimize_directory, batch_input, batch_output, options, job,
+            cancel_check=job.check_cancelled,
+        )
+        job.optimized_files.extend(batch_results)
+        batch_files = [p for p in batch_output.rglob("*") if p.is_file()]
+        if not batch_results and not batch_files:
+            job.log(f"No image files found for optimization: {_item_name(item)}")
+            shutil.rmtree(batch_input, ignore_errors=True)
+            shutil.rmtree(batch_output.parent, ignore_errors=True)
+            job.completed_items.append(_queue_item_ref(source, item))
+            continue
+
+        if batch_results and action is None:
+            action = _wait_for_confirmation(job, len(batch_results))
+        action = action or ("replace" if options.get("replace") else "upload_new")
+        options["replace"] = action == "replace"
+        options.pop("upload_prefix", None)
+        if action == "upload_new":
+            options["upload_prefix"] = "results" if item_type != "folder" else f"results/{_item_name(item)} (optimized)"
+
+        upload_root = batch_output
+        if item_type == "folder":
+            folder_root = _only_child_dir(batch_output)
+            if folder_root:
+                upload_root = folder_root
+        job.set(status="running", step="uploading")
+        before_total, before_uploaded, before_skipped = job.files_to_upload, job.files_uploaded, job.files_skipped
+        await _upload_outputs_with_retry(job, target, options, dst, upload_root, item)
+        job.files_to_upload += before_total
+        job.files_uploaded += before_uploaded
+        job.files_skipped += before_skipped
+        shutil.rmtree(batch_input, ignore_errors=True)
+        shutil.rmtree(batch_output.parent, ignore_errors=True)
+        job.completed_items.append(_queue_item_ref(source, item))
 
     if not job.optimized_files and job.files_skipped:
         job.log("No image files found for optimization.")
@@ -337,6 +343,13 @@ def _item_target_folder(folder: dict[str, Any], item: dict[str, Any]) -> dict[st
 def _item_name(item: dict[str, Any]) -> str:
     raw_name = str(item.get("name") or item.get("path") or item.get("id") or "item").replace("\\", "/")
     return safe_name(PurePosixPath(raw_name).name or raw_name)
+
+def _queue_item_ref(source: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "provider": item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider"),
+        "id": item.get("id") or item.get("path"),
+        "path": item.get("path") or item.get("id"),
+    }
 
 def _is_video_item(item: dict[str, Any]) -> bool:
     return Path(str(item.get("name") or item.get("path") or item.get("id") or "")).suffix.lower() in VIDEO_EXTENSIONS

@@ -46,6 +46,7 @@ class JobState:
     confirm_event: threading.Event = field(default_factory=threading.Event, compare=False, hash=False)
     confirm_action: str | None = None
     optimized_files: list[dict[str, Any]] = field(default_factory=list)
+    completed_items: list[dict[str, Any]] = field(default_factory=list)
 
     def log(self, message: str) -> None:
         self.logs.append(message)
@@ -121,6 +122,7 @@ class JobState:
             "filesSkipped": self.files_skipped,
             "filesToUpload": self.files_to_upload,
             "optimizedFiles": self.optimized_files,
+            "completedItems": self.completed_items,
             "confirmAction": self.confirm_action,
             "targetProvider": (self.payload.get("target") or {}).get("provider"),
             "targetAccountId": (self.payload.get("target") or {}).get("accountId") or (self.payload.get("target") or {}).get("account_id"),

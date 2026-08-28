@@ -363,6 +363,64 @@ class TransferJobTests(TestCase):
         self.assertEqual(job.status, "completed", job.error)
         self.assertEqual(len(dst.calls), 1)
 
+    def test_optimized_batches_cleanup_only_uploaded_item_on_failure(self):
+        from src.utils.temp_storage import cleanup_job, job_dirs
+
+        class Source:
+            async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
+                path = local_dir / f"{file_ref['id']}.jpg"
+                path.write_bytes(b"x")
+                return path
+
+        class Dst(UploadRecorder):
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                if local_path.name == "b.jpg":
+                    raise ProviderFailure("OTHER", "boom")
+                return await super().upload_file(credentials, local_path, target_ref, progress)
+
+        dst = Dst()
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            src = next(input_dir.glob("*.jpg"))
+            out = output_dir / src.name
+            out.write_bytes(b"x")
+            return [{"name": src.name, "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95}]
+        PROVIDERS.update({"fake-source": Source(), "fake-dst": dst})
+        image_optimizer.optimize_directory = fake_optimize
+        try:
+            job = JobState("opt-cleanup-fail", {
+                "source": {"provider": "fake-source", "items": [
+                    {"type": "file", "id": "a", "name": "a.jpg"},
+                    {"type": "file", "id": "b", "name": "b.jpg"},
+                ]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": True, "optimize_image": True},
+            })
+            def confirm():
+                for _ in range(1000):
+                    if job.status == "waiting_confirmation":
+                        job.confirm_action = "upload_new"
+                        job.confirm_event.set()
+                        return
+                    time.sleep(0.01)
+            thread = threading.Thread(target=confirm)
+            thread.start()
+            dirs = job_dirs("opt-cleanup-fail")
+            asyncio.run(run_transfer(job))
+            thread.join(timeout=1)
+            self.assertEqual(job.status, "failed")
+            self.assertFalse((dirs["input"] / "batch-0").exists())
+            self.assertFalse((dirs["output"] / "batch-0").exists())
+            self.assertTrue((dirs["input"] / "batch-1").exists())
+            self.assertTrue((dirs["output"] / "batch-1").exists())
+            self.assertEqual(job.completed_items, [{"provider": "fake-source", "id": "a", "path": "a"}])
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            cleanup_job("opt-cleanup-fail")
+
     def test_folder_source_uses_path_basename(self):
         from src.utils.temp_storage import job_dirs
 
