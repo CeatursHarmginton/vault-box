@@ -180,6 +180,52 @@ class TransferJobTests(TestCase):
         self.assertEqual(provider.max_active, 2)
         self.assertEqual([p.name for p in saved], ["0.txt", "1.txt", "2.txt", "3.txt"])
 
+    def test_selected_files_downloads_are_concurrent_and_bounded(self):
+        class Source(base_mod.BaseProvider):
+            name = "selected-parallel"
+
+            def __init__(self):
+                self.active = 0
+                self.max_active = 0
+
+            async def validate_credentials(self, credentials):
+                return {"ok": True}
+
+            async def download_file(self, credentials, file_ref, local_path, progress):
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                await asyncio.sleep(0.01)
+                self.active -= 1
+                out = local_path / f"{file_ref['id']}.txt"
+                out.write_text(str(file_ref["id"]))
+                return out
+
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                return {"ok": True}
+
+        src = Source()
+        dst = UploadRecorder()
+        old_providers = dict(PROVIDERS)
+        old_concurrency = __import__("src.jobs.transfer_job", fromlist=["FOLDER_DOWNLOAD_CONCURRENCY"])
+        old_value = old_concurrency.FOLDER_DOWNLOAD_CONCURRENCY
+        old_concurrency.FOLDER_DOWNLOAD_CONCURRENCY = 2
+        PROVIDERS.update({"selected-parallel": src, "fake-dst": dst})
+        try:
+            job = JobState("selected-download-parallel", {
+                "source": {"provider": "selected-parallel", "items": [{"type": "file", "id": str(i), "name": f"{i}.txt"} for i in range(4)]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": True},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old_providers)
+            old_concurrency.FOLDER_DOWNLOAD_CONCURRENCY = old_value
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(src.max_active, 2)
+        self.assertEqual(len(dst.calls), 1)
+
     def test_folder_uploads_are_concurrent_and_bounded(self):
         class Provider(base_mod.BaseProvider):
             name = "parallel"

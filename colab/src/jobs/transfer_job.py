@@ -6,6 +6,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..extract.extractor import extract_archives
+from ..config import FOLDER_DOWNLOAD_CONCURRENCY
 from ..providers import PROVIDERS
 from ..providers.base import ProviderFailure, safe_name
 from ..security import redact
@@ -31,8 +32,19 @@ async def run_transfer(job: JobState) -> None:
         job.log(f"Job start: {source.get('provider')} -> {target.get('provider')}")
         job.log(f"Accounts: source={source.get('accountId') or source.get('account_id') or '-'} target={target.get('accountId') or target.get('account_id') or '-'}")
 
+        # Count individual files in the source list beforehand to prevent incorrect [index/index] counts
+        file_items = [item for item in (source.get("items") or []) if not (item.get("type") == "folder" or item.get("is_folder"))]
+        job.files_to_download = len(file_items)
+
         downloaded: list[Path] = []
         has_folder_source = False
+        sem = asyncio.Semaphore(max(1, FOLDER_DOWNLOAD_CONCURRENCY))
+
+        async def download_one(item: dict[str, Any]) -> Path:
+            async with sem:
+                job.check_cancelled()
+                return await src.download_file(source.get("credentials") or {}, item, dirs["input"], job)
+
         for item in source.get("items") or []:
             job.check_cancelled()
             item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
@@ -43,8 +55,8 @@ async def run_transfer(job: JobState) -> None:
                 folder_dir.mkdir(parents=True, exist_ok=True)
                 downloaded.extend(await src.download_folder(source.get("credentials") or {}, item, folder_dir, job))
             else:
-                job.files_to_download += 1
-                downloaded.append(await src.download_file(source.get("credentials") or {}, item, dirs["input"], job))
+                continue
+        downloaded.extend(await asyncio.gather(*(download_one(item) for item in file_items)))
         if not downloaded:
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "No source files downloaded")
         stray = [p for p in downloaded if not p.is_relative_to(dirs["input"])]
