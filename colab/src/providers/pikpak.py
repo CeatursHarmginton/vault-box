@@ -284,6 +284,7 @@ class PikPakProvider(BaseProvider):
         parent_id = await self._ensure_relative_parent(s, str(target_ref.get("id") or target_ref.get("path") or ""), str(target_ref.get("relative_path") or name))
         size = local_path.stat().st_size
         mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        progress.log(f"pikpak upload account {credentials.get('label') or credentials.get('account_id') or '-'}")
         progress.set(step="uploading", current_file=name)
         payload = {"hash": _gcid(local_path, size), "name": name, "size": str(size), "kind": "drive#file", "id": "", "parent_id": parent_id, "upload_type": "UPLOAD_TYPE_RESUMABLE", "folder_type": "NORMAL", "resumable": {"provider": "PROVIDER_ALIYUN"}}
         last: Exception | None = None

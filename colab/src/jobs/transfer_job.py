@@ -22,6 +22,7 @@ async def run_transfer(job: JobState) -> None:
         src = PROVIDERS[str(source.get("provider") or "").lower()]
         dst = PROVIDERS[str(target.get("provider") or "").lower()]
         job.log(f"Job start: {source.get('provider')} -> {target.get('provider')}")
+        job.log(f"Accounts: source={source.get('accountId') or source.get('account_id') or '-'} target={target.get('accountId') or target.get('account_id') or '-'}")
 
         downloaded: list[Path] = []
         has_folder_source = False
