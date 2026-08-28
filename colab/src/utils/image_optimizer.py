@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import logging
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import groupby
 from pathlib import Path
 from typing import Any, Callable
@@ -27,6 +28,18 @@ except ImportError:
 
 VIPS_CLI_AVAILABLE = shutil.which("vips") is not None
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
+
+def _optimize_workers(options: dict[str, Any], image_count: int) -> int:
+    try:
+        requested = int(float(options.get("optimize_workers") or 0))
+    except (TypeError, ValueError):
+        requested = 0
+    if requested > 0:
+        return min(image_count, max(1, min(64, requested)))
+    cpu = os.cpu_count() or 2
+    if options.get("upscale") and shutil.which("realesrgan-ncnn-vulkan"):
+        return min(image_count, min(4, max(2, cpu // 2)))
+    return min(image_count, min(32, max(2, cpu - 1)))
 
 def compress_image(src_path: Path, dest_path: Path, q: int, scale: float = 1.0) -> bool:
     """
@@ -199,6 +212,43 @@ def optimize_directory(
     results: list[dict[str, Any]] = []
     total_images = len(images)
     processed = 0
+    workers = _optimize_workers(options, total_images) if total_images else 1
+    if workers > 1:
+        job_state.log(f"[TỐI ƯU] Xử lý song song: {workers} worker(s)")
+
+        def run_one(index: int, p: Path) -> tuple[int, dict[str, Any]]:
+            if cancel_check:
+                cancel_check()
+            relative_path = p.relative_to(input_dir)
+            job_state.set(current_file=str(relative_path))
+            job_state.log(f"Đang tối ưu ảnh ({index + 1}/{total_images}): {p.name}")
+            orig_size = p.stat().st_size
+            out_path, final_q, status = optimize_image_file(p, output_dir / relative_path.parent, options, start_quality)
+            return index, {
+                "name": str(relative_path),
+                "original_size": orig_size,
+                "optimized_size": out_path.stat().st_size,
+                "status": status,
+                "quality": final_q
+            }
+
+        ordered: list[dict[str, Any] | None] = [None] * total_images
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(run_one, i, p) for i, p in enumerate(images)]
+            for future in as_completed(futures):
+                index, item = future.result()
+                ordered[index] = item
+        results.extend(item for item in ordered if item is not None)
+
+        for p in non_images:
+            if cancel_check:
+                cancel_check()
+            relative_path = p.relative_to(input_dir)
+            target_path = output_dir / relative_path
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, target_path)
+
+        return results
     
     # Process images grouped by folder
     for folder_key, folder_images in folder_groups:

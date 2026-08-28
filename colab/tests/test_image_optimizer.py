@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import tempfile
 import shutil
+import threading
+import time
 from pathlib import Path
 from unittest import TestCase
 from PIL import Image
+from src.utils import image_optimizer
 from src.utils.image_optimizer import optimize_directory
 
 class MockJobState:
@@ -71,3 +74,25 @@ class ImageOptimizerTests(TestCase):
         large_dest = self.dest_dir / "large.jpg"
         self.assertTrue(large_dest.exists())
         self.assertLessEqual(large_dest.stat().st_size, 0.2 * 1024 * 1024)
+
+    def test_optimize_directory_uses_worker_override(self) -> None:
+        for i in range(4):
+            (self.src_dir / f"{i}.jpg").write_bytes(b"x")
+
+        seen: set[int] = set()
+        old = image_optimizer.optimize_image_file
+        def fake_optimize(src_path, dest_dir, options, adaptive_quality):
+            seen.add(threading.get_ident())
+            time.sleep(0.02)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            out = dest_dir / src_path.name
+            out.write_bytes(b"x")
+            return out, adaptive_quality, "ok"
+        image_optimizer.optimize_image_file = fake_optimize
+        try:
+            results = optimize_directory(self.src_dir, self.dest_dir, {"optimize_workers": 4}, MockJobState())
+        finally:
+            image_optimizer.optimize_image_file = old
+
+        self.assertEqual([r["name"] for r in results], ["0.jpg", "1.jpg", "2.jpg", "3.jpg"])
+        self.assertGreater(len(seen), 1)

@@ -65,7 +65,7 @@ class BaseProvider(ABC):
         async def upload(path: Path) -> dict[str, Any] | None:
             progress.check_cancelled()
             async with sem:
-                rel = path.relative_to(local_dir).as_posix()
+                rel = "/".join(part for part in (str(root_target.get("relative_path") or "").strip("/"), path.relative_to(local_dir).as_posix()) if part)
                 try:
                     res = await self.upload_file(credentials, path, {**root_target, "relative_path": rel}, progress)
                     progress.files_uploaded += 1

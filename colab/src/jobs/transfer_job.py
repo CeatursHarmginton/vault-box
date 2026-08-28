@@ -88,6 +88,9 @@ async def run_transfer(job: JobState) -> None:
                 
                 if job.confirm_action == "replace":
                     options["replace"] = True
+                elif job.confirm_action == "upload_new":
+                    options["replace"] = False
+                    options["upload_prefix"] = "results"
             else:
                 job.log("No image files found for optimization, skipping confirmation.")
                 
@@ -98,7 +101,7 @@ async def run_transfer(job: JobState) -> None:
         if len(outputs) == 1 and outputs[0].is_file() and not preserve_tree:
             job.files_to_upload = 1
             try:
-                result = await dst.upload_file(target.get("credentials") or {}, outputs[0], target.get("folder") or {}, job)
+                result = await dst.upload_file(target.get("credentials") or {}, outputs[0], _upload_target(target.get("folder") or {}, outputs[0].name, options), job)
                 job.files_uploaded = 1
                 job.log(f"[1/1] Uploaded: {outputs[0].name}")
             except ProviderFailure as exc:
@@ -113,7 +116,7 @@ async def run_transfer(job: JobState) -> None:
             if out_root == dirs["input"] and len(outputs) == 1 and not preserve_tree:
                 job.files_to_upload = 1
                 try:
-                    result = await dst.upload_file(target.get("credentials") or {}, outputs[0], target.get("folder") or {}, job)
+                    result = await dst.upload_file(target.get("credentials") or {}, outputs[0], _upload_target(target.get("folder") or {}, outputs[0].name, options), job)
                     job.files_uploaded = 1
                     job.log(f"[1/1] Uploaded: {outputs[0].name}")
                 except ProviderFailure as exc:
@@ -126,7 +129,7 @@ async def run_transfer(job: JobState) -> None:
             else:
                 if not any(p.is_file() for p in upload_root.rglob("*")):
                     raise ProviderFailure("UPLOAD_FAILED", "No files staged for upload", {"root": str(upload_root)})
-                result = await dst.upload_folder(target.get("credentials") or {}, upload_root, target.get("folder") or {}, job)
+                result = await dst.upload_folder(target.get("credentials") or {}, upload_root, _upload_target(target.get("folder") or {}, "", options), job)
         job.log(f"Done: Downloaded {job.files_downloaded}/{job.files_to_download} file(s), Uploaded {job.files_uploaded}/{job.files_to_upload} file(s) (skipped {job.files_skipped} file(s))")
         job.set(status="completed", step="completed")
     except JobCancelled:
@@ -146,3 +149,10 @@ async def run_transfer(job: JobState) -> None:
         # Drop provider credential refs after run.
         payload.get("source", {}).pop("credentials", None)
         payload.get("target", {}).pop("credentials", None)
+
+
+def _upload_target(folder: dict[str, Any], relative_path: str, options: dict[str, Any]) -> dict[str, Any]:
+    prefix = str(options.get("upload_prefix") or "").strip("/")
+    if not prefix:
+        return {**folder, **({"relative_path": relative_path} if relative_path else {})}
+    return {**folder, "relative_path": f"{prefix}/{relative_path}".rstrip("/")}
