@@ -37,6 +37,8 @@ class ImageOptimizerTests(TestCase):
         # 1. Create a non-image file
         non_img = self.src_dir / "test.txt"
         non_img.write_text("Hello World", encoding="utf-8")
+        video = self.src_dir / "clip.mp4"
+        video.write_bytes(b"video")
 
         # 2. Create images (large & small)
         img_large_path = self.src_dir / "large.jpg"
@@ -64,6 +66,7 @@ class ImageOptimizerTests(TestCase):
         # Verify non-image copied as-is
         self.assertTrue((self.dest_dir / "test.txt").exists())
         self.assertEqual((self.dest_dir / "test.txt").read_text(encoding="utf-8"), "Hello World")
+        self.assertFalse((self.dest_dir / "clip.mp4").exists())
 
         # Verify images processed and sorted by size (small.jpg is smaller, so it's first)
         self.assertEqual(len(results), 2)

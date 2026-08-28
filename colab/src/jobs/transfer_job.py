@@ -10,6 +10,7 @@ from ..config import FOLDER_DOWNLOAD_CONCURRENCY
 from ..providers import PROVIDERS
 from ..providers.base import ProviderFailure, safe_name
 from ..security import redact
+from ..utils.image_optimizer import VIDEO_EXTENSIONS
 from ..utils.temp_storage import cleanup_job, job_dirs
 from .progress import JobCancelled, JobState
 
@@ -34,6 +35,12 @@ async def run_transfer(job: JobState) -> None:
 
         # Count individual files in the source list beforehand to prevent incorrect [index/index] counts
         file_items = [item for item in (source.get("items") or []) if not (item.get("type") == "folder" or item.get("is_folder"))]
+        if options.get("optimize_image"):
+            skipped_videos = [item for item in file_items if _is_video_item(item)]
+            for item in skipped_videos:
+                job.files_skipped += 1
+                job.log(f"[SKIP] Video ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
+            file_items = [item for item in file_items if not _is_video_item(item)]
         job.files_to_download = len(file_items)
 
         downloaded: list[Path] = []
@@ -57,6 +64,10 @@ async def run_transfer(job: JobState) -> None:
             else:
                 continue
         downloaded.extend(await asyncio.gather(*(download_one(item) for item in file_items)))
+        if not downloaded and options.get("optimize_image") and job.files_skipped:
+            job.log("No image files found for optimization.")
+            job.set(status="completed", step="completed")
+            return
         if not downloaded:
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "No source files downloaded")
         stray = [p for p in downloaded if not p.is_relative_to(dirs["input"])]
@@ -103,6 +114,8 @@ async def run_transfer(job: JobState) -> None:
                 elif job.confirm_action == "upload_new":
                     options["replace"] = False
                     options["upload_prefix"] = "results"
+                    if has_folder_source:
+                        options["upload_prefix"] = f"results/{_selected_folder_name(source)} (optimized)"
             else:
                 job.log("No image files found for optimization, skipping confirmation.")
                 
@@ -125,6 +138,10 @@ async def run_transfer(job: JobState) -> None:
                     raise
         else:
             upload_root = out_root
+            if options.get("optimize_image") and has_folder_source:
+                folder_root = _only_child_dir(out_root)
+                if folder_root:
+                    upload_root = folder_root
             if out_root == dirs["input"] and len(outputs) == 1 and not preserve_tree:
                 job.files_to_upload = 1
                 try:
@@ -168,3 +185,15 @@ def _upload_target(folder: dict[str, Any], relative_path: str, options: dict[str
     if not prefix:
         return {**folder, **({"relative_path": relative_path} if relative_path else {})}
     return {**folder, "relative_path": f"{prefix}/{relative_path}".rstrip("/")}
+
+def _is_video_item(item: dict[str, Any]) -> bool:
+    return Path(str(item.get("name") or item.get("path") or item.get("id") or "")).suffix.lower() in VIDEO_EXTENSIONS
+
+def _selected_folder_name(source: dict[str, Any]) -> str:
+    folder = next((item for item in source.get("items") or [] if item.get("type") == "folder" or item.get("is_folder")), {})
+    raw_name = str(folder.get("name") or folder.get("path") or folder.get("id") or "folder").replace("\\", "/")
+    return safe_name(PurePosixPath(raw_name).name or raw_name)
+
+def _only_child_dir(path: Path) -> Path | None:
+    children = [child for child in path.iterdir()]
+    return children[0] if len(children) == 1 and children[0].is_dir() else None

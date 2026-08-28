@@ -28,6 +28,7 @@ except ImportError:
 
 VIPS_CLI_AVAILABLE = shutil.which("vips") is not None
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts", ".3gp", ".flv", ".mpeg", ".mpg", ".wmv"}
 
 def _optimize_workers(options: dict[str, Any], image_count: int) -> int:
     try:
@@ -202,7 +203,7 @@ def optimize_directory(
     for p in all_files:
         if p.suffix.lower() in IMAGE_EXTENSIONS:
             images.append(p)
-        else:
+        elif p.suffix.lower() not in VIDEO_EXTENSIONS:
             non_images.append(p)
             
     # Group images by folder, sort by folder path, then by size within each folder

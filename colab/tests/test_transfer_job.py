@@ -102,6 +102,154 @@ class TransferJobTests(TestCase):
         self.assertEqual(job.status, "completed", job.error)
         self.assertEqual(dst.target_refs[0]["relative_path"], "results/a.jpg")
 
+    def test_optimized_folder_upload_new_goes_inside_selected_folder_results(self):
+        class Source:
+            async def download_folder(self, credentials, folder_ref, local_dir: Path, progress: JobState):
+                path = local_dir / "a.jpg"
+                path.write_bytes(b"x")
+                return [path]
+
+        dst = UploadRecorder()
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            out = output_dir / "testC" / "a.jpg"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"x")
+            return [{"name": "testC/a.jpg", "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95}]
+        PROVIDERS.update({"fake-source": Source(), "fake-dst": dst})
+        image_optimizer.optimize_directory = fake_optimize
+        try:
+            job = JobState("opt-folder-results", {
+                "source": {"provider": "fake-source", "items": [{"type": "folder", "name": "testC", "id": "/testA/testC"}]},
+                "target": {"provider": "fake-dst", "folder": {"id": "/testA/testC", "path": "/testA/testC"}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True},
+            })
+            def confirm():
+                for _ in range(1000):
+                    if job.status == "waiting_confirmation":
+                        job.confirm_action = "upload_new"
+                        job.confirm_event.set()
+                        return
+                    time.sleep(0.01)
+            thread = threading.Thread(target=confirm)
+            thread.start()
+            asyncio.run(run_transfer(job))
+            thread.join(timeout=1)
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-folder-results")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(dst.calls[0][1].name, "testC")
+        self.assertEqual(dst.target_refs[0]["relative_path"], "results/testC (optimized)")
+
+    def test_optimized_folder_replace_uploads_into_selected_folder_without_nested_folder(self):
+        class Source:
+            async def download_folder(self, credentials, folder_ref, local_dir: Path, progress: JobState):
+                path = local_dir / "a.jpg"
+                path.write_bytes(b"x")
+                return [path]
+
+        dst = UploadRecorder()
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            out = output_dir / "testC" / "a.jpg"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"x")
+            return [{"name": "testC/a.jpg", "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95}]
+        PROVIDERS.update({"fake-source": Source(), "fake-dst": dst})
+        image_optimizer.optimize_directory = fake_optimize
+        try:
+            job = JobState("opt-folder-replace", {
+                "source": {"provider": "fake-source", "items": [{"type": "folder", "name": "testC", "id": "/testA/testC"}]},
+                "target": {"provider": "fake-dst", "folder": {"id": "/testA/testC", "path": "/testA/testC"}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True},
+            })
+            def confirm():
+                for _ in range(1000):
+                    if job.status == "waiting_confirmation":
+                        job.confirm_action = "replace"
+                        job.confirm_event.set()
+                        return
+                    time.sleep(0.01)
+            thread = threading.Thread(target=confirm)
+            thread.start()
+            asyncio.run(run_transfer(job))
+            thread.join(timeout=1)
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-folder-replace")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(dst.calls[0][1].name, "testC")
+        self.assertNotIn("relative_path", dst.target_refs[0])
+
+    def test_optimized_folder_skips_video_before_download(self):
+        class Source(base_mod.BaseProvider):
+            def __init__(self):
+                self.downloaded = []
+
+            async def validate_credentials(self, credentials):
+                return {"ok": True}
+
+            async def list_files(self, credentials, path_or_id):
+                return {"items": [
+                    {"type": "file", "name": "a.jpg", "id": "a"},
+                    {"type": "file", "name": "clip.mp4", "id": "v"},
+                ]}
+
+            async def download_file(self, credentials, file_ref, local_path: Path, progress: JobState):
+                self.downloaded.append(file_ref["name"])
+                path = local_path if local_path.suffix else local_path / file_ref["name"]
+                path.write_bytes(b"x")
+                return path
+
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                return {"ok": True}
+
+        src = Source()
+        dst = UploadRecorder()
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            out = output_dir / "root" / "a.jpg"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"x")
+            return [{"name": "root/a.jpg", "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95}]
+        PROVIDERS.update({"fake-source": src, "fake-dst": dst})
+        image_optimizer.optimize_directory = fake_optimize
+        try:
+            job = JobState("opt-folder-skip-video", {
+                "source": {"provider": "fake-source", "items": [{"type": "folder", "name": "root", "id": "/root"}]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True},
+            })
+            def confirm():
+                for _ in range(1000):
+                    if job.status == "waiting_confirmation":
+                        job.confirm_action = "replace"
+                        job.confirm_event.set()
+                        return
+                    time.sleep(0.01)
+            thread = threading.Thread(target=confirm)
+            thread.start()
+            asyncio.run(run_transfer(job))
+            thread.join(timeout=1)
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-folder-skip-video")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(src.downloaded, ["a.jpg"])
+
     def test_folder_source_uses_path_basename(self):
         from src.utils.temp_storage import job_dirs
 

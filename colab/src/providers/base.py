@@ -10,6 +10,7 @@ import httpx
 
 from ..config import CHUNK_SIZE, FOLDER_DOWNLOAD_CONCURRENCY, FOLDER_UPLOAD_CONCURRENCY
 from ..jobs.progress import JobState
+from ..utils.image_optimizer import VIDEO_EXTENSIONS
 
 class ProviderFailure(RuntimeError):
     def __init__(self, code: str, message: str, details: dict[str, Any] | None = None) -> None:
@@ -35,7 +36,7 @@ class BaseProvider(ABC):
         items = listing.get("items") or listing.get("files") or []
         progress.log(f"{self.name} list folder {folder_ref.get('name') or folder_ref.get('path') or folder_ref.get('id')}: {len(items)} item(s)")
         for item in items:
-            if not (item.get("type") == "folder" or item.get("is_folder") or item.get("isdir")):
+            if not (item.get("type") == "folder" or item.get("is_folder") or item.get("isdir")) and not _skip_optimize_video(item, progress):
                 progress.files_to_download += 1
         sem = _sem or asyncio.Semaphore(max(1, FOLDER_DOWNLOAD_CONCURRENCY))
 
@@ -45,6 +46,10 @@ class BaseProvider(ABC):
                 sub = local_dir / _safe_name(item.get("name") or item.get("server_filename") or "folder")
                 sub.mkdir(parents=True, exist_ok=True)
                 return await self.download_folder(credentials, item, sub, progress, sem)
+            if _skip_optimize_video(item, progress):
+                progress.files_skipped += 1
+                progress.log(f"[SKIP] Video ignored by image optimizer: {item.get('name') or item.get('server_filename') or item.get('id') or 'file'}")
+                return []
             async with sem:
                 return [await self.download_file(credentials, item, local_dir / _safe_name(item.get("name") or item.get("server_filename") or item.get("id") or "file"), progress)]
 
@@ -117,6 +122,12 @@ def safe_name(name: str) -> str:
     return clean or "file"
 
 _safe_name = safe_name
+
+def _skip_optimize_video(item: dict[str, Any], progress: JobState) -> bool:
+    if not (progress.payload.get("options") or {}).get("optimize_image"):
+        return False
+    name = str(item.get("name") or item.get("server_filename") or item.get("path") or item.get("id") or "")
+    return Path(name).suffix.lower() in VIDEO_EXTENSIONS
 
 
 def copy_tree_files(src: Path, dst: Path) -> list[Path]:
