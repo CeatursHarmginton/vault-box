@@ -70,6 +70,18 @@ async def transfer_cancel(job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail={"code": "JOB_NOT_FOUND", "message": "Job not found"})
     return {"ok": True, "jobId": job_id}
 
+@app.post("/transfer/confirm/{job_id}", dependencies=[Depends(require_token)])
+async def transfer_confirm(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    job = manager.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail={"code": "JOB_NOT_FOUND", "message": "Job not found"})
+    action = payload.get("action")
+    if action not in {"replace", "upload_new", "cancel"}:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_ACTION", "message": "Invalid action"})
+    job.confirm_action = action
+    job.confirm_event.set()
+    return {"ok": True, "jobId": job_id, "action": action}
+
 @app.get("/transfer/logs/{job_id}", dependencies=[Depends(require_token)])
 async def transfer_logs(job_id: str) -> dict[str, Any]:
     job = manager.get(job_id)

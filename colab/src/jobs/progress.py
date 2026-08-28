@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -11,6 +13,7 @@ class JobCancelled(RuntimeError):
 class JobProgress:
     download: float = 0
     extract: float = 0
+    optimize: float = 0
     upload: float = 0
 
 @dataclass
@@ -35,6 +38,14 @@ class JobState:
     _phase_done: int = 0
     _phase_total: int = 0
     _phase_total_keys: set[tuple[str, str]] = field(default_factory=set)
+    files_downloaded: int = 0
+    files_to_download: int = 0
+    files_uploaded: int = 0
+    files_skipped: int = 0
+    files_to_upload: int = 0
+    confirm_event: threading.Event = field(default_factory=threading.Event, compare=False, hash=False)
+    confirm_action: str | None = None
+    optimized_files: list[dict[str, Any]] = field(default_factory=list)
 
     def log(self, message: str) -> None:
         self.logs.append(message)
@@ -82,7 +93,13 @@ class JobState:
             raise JobCancelled("JOB_CANCELLED")
 
     def view(self) -> dict[str, Any]:
-        phases = ["download", "extract", "upload"] if (self.payload.get("options") or {}).get("extract") else ["download", "upload"]
+        options = self.payload.get("options") or {}
+        phases = ["download"]
+        if options.get("extract"):
+            phases.append("extract")
+        if options.get("optimize_image"):
+            phases.append("optimize")
+        phases.append("upload")
         return {
             "jobId": self.job_id,
             "status": self.status,
@@ -98,4 +115,11 @@ class JobState:
             "error": self.error,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
+            "filesDownloaded": self.files_downloaded,
+            "filesToDownload": self.files_to_download,
+            "filesUploaded": self.files_uploaded,
+            "filesSkipped": self.files_skipped,
+            "filesToUpload": self.files_to_upload,
+            "optimizedFiles": self.optimized_files,
+            "confirmAction": self.confirm_action,
         }

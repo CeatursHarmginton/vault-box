@@ -35,4 +35,6 @@ class JobManager:
         if not job:
             return False
         job.cancel = True
+        # Wake up any thread waiting on confirmation so it can check the cancel flag
+        job.confirm_event.set()
         return True

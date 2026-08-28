@@ -179,7 +179,7 @@ class TransferJobTests(TestCase):
             async def _ensure_relative_parent(self, s, parent, relative_path):
                 return "/"
 
-            async def _precreate_upload(self, s, remote_path, parent, size, hashes):
+            async def _precreate_upload(self, s, remote_path, parent, size, hashes, **kwargs):
                 return {"uploadid": "up1"}
 
             async def _locate_upload_hosts(self, s):
@@ -228,7 +228,6 @@ class TransferJobTests(TestCase):
 
         self.assertEqual(out["phase"], "PHASE_TYPE_COMPLETE")
         self.assertEqual(job.progress.upload, 100)
-        self.assertTrue(any("PikPak upload task task1" in line for line in job.logs))
 
     def test_pikpak_upload_no_oss_params_waits_before_success(self):
         class Session:

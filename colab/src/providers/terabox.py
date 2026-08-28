@@ -214,14 +214,14 @@ class TeraBoxProvider(BaseProvider):
                     return [f"https://{server.removeprefix('https://').removeprefix('http://').strip('/')}" for server in servers]
         return ["https://dm1-cdata.terabox.com", "https://dm2-cdata.terabox.com", "https://kul-cdata.terabox.com"]
 
-    async def _precreate_upload(self, s: TeraBoxSession, remote_path: str, parent: str, size: int, hashes: dict[str, Any]) -> dict[str, Any]:
+    async def _precreate_upload(self, s: TeraBoxSession, remote_path: str, parent: str, size: int, hashes: dict[str, Any], rtype: str = "2") -> dict[str, Any]:
         form = {
             "path": remote_path,
             "autoinit": "1",
             "target_path": parent,
             "block_list": json.dumps(hashes["chunks"]),
             "size": str(size),
-            "rtype": "2",
+            "rtype": rtype,
             "file_limit_switch_v34": "true",
             "g_identity": "",
             "local_mtime": "0",
@@ -306,7 +306,12 @@ class TeraBoxProvider(BaseProvider):
         size = local_path.stat().st_size
         hashes = _hashes(local_path)
         progress.set(step="uploading", current_file=name)
-        pre = await self._precreate_upload(s, remote_path, parent, size, hashes)
+        
+        options = progress.payload.get("options") or {}
+        replace = bool(options.get("replace"))
+        rtype = "3" if replace else "2"
+        
+        pre = await self._precreate_upload(s, remote_path, parent, size, hashes, rtype=rtype)
         upload_id = pre.get("uploadid") or pre.get("upload_id")
         if not upload_id:
             raise ProviderFailure("UPLOAD_FAILED", "TeraBox precreate did not return uploadid")
@@ -327,5 +332,5 @@ class TeraBoxProvider(BaseProvider):
         if not uploaded:
             raise ProviderFailure("UPLOAD_FAILED", f"TeraBox upload parts failed: {last}")
         return await s.request_json("POST", f"{s.base}/api/create", context=f"upload create {remote_path}", params=s.params(a="commit"), data={
-            "path": remote_path, "size": str(size), "isdir": "0", "uploadid": str(upload_id), "target_path": parent, "block_list": json.dumps(hashes["chunks"]), "content-md5": hashes["file"], "slice-md5": hashes["slice"], "content-crc32": str(hashes["crc32"]), "rtype": "2", "local_mtime": "0",
+            "path": remote_path, "size": str(size), "isdir": "0", "uploadid": str(upload_id), "target_path": parent, "block_list": json.dumps(hashes["chunks"]), "content-md5": hashes["file"], "slice-md5": hashes["slice"], "content-crc32": str(hashes["crc32"]), "rtype": rtype, "local_mtime": "0",
         }, headers={**s.headers(), "Content-Type": "application/x-www-form-urlencoded"})

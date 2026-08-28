@@ -237,7 +237,6 @@ class PikPakProvider(BaseProvider):
             last = task
             phase = str(task.get("phase") or task.get("status") or "")
             if phase != last_phase:
-                progress.log(f"PikPak upload task {task_id}: {phase or 'unknown'}")
                 last_phase = phase
             if phase == "PHASE_TYPE_COMPLETE":
                 progress.progress.upload = 100
@@ -267,7 +266,6 @@ class PikPakProvider(BaseProvider):
             last = info
             phase = str(info.get("phase") or "")
             if phase != last_phase:
-                progress.log(f"PikPak upload file {file_id}: {phase or 'unknown'}")
                 last_phase = phase
             if phase == "PHASE_TYPE_COMPLETE":
                 progress.progress.upload = 100
@@ -284,7 +282,6 @@ class PikPakProvider(BaseProvider):
         parent_id = await self._ensure_relative_parent(s, str(target_ref.get("id") or target_ref.get("path") or ""), str(target_ref.get("relative_path") or name))
         size = local_path.stat().st_size
         mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
-        progress.log(f"pikpak upload account {credentials.get('label') or credentials.get('account_id') or '-'}")
         progress.set(step="uploading", current_file=name)
         payload = {"hash": _gcid(local_path, size), "name": name, "size": str(size), "kind": "drive#file", "id": "", "parent_id": parent_id, "upload_type": "UPLOAD_TYPE_RESUMABLE", "folder_type": "NORMAL", "resumable": {"provider": "PROVIDER_ALIYUN"}}
         last: Exception | None = None

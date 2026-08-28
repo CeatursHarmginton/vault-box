@@ -34,6 +34,9 @@ class BaseProvider(ABC):
         listing = await self.list_files(credentials, str(folder_ref.get("id") or folder_ref.get("path") or "/"))
         items = listing.get("items") or listing.get("files") or []
         progress.log(f"{self.name} list folder {folder_ref.get('name') or folder_ref.get('path') or folder_ref.get('id')}: {len(items)} item(s)")
+        for item in items:
+            if not (item.get("type") == "folder" or item.get("is_folder") or item.get("isdir")):
+                progress.files_to_download += 1
         sem = _sem or asyncio.Semaphore(max(1, FOLDER_DOWNLOAD_CONCURRENCY))
 
         async def save(item: dict[str, Any]) -> list[Path]:
@@ -55,21 +58,29 @@ class BaseProvider(ABC):
         sem = asyncio.Semaphore(max(1, FOLDER_UPLOAD_CONCURRENCY))
         root_target = target_ref
 
+        progress.files_to_upload = len(paths)
+        progress.files_uploaded = 0
+        progress.files_skipped = 0
+
         async def upload(path: Path) -> dict[str, Any] | None:
             progress.check_cancelled()
             async with sem:
                 rel = path.relative_to(local_dir).as_posix()
                 try:
-                    return await self.upload_file(credentials, path, {**root_target, "relative_path": rel}, progress)
+                    res = await self.upload_file(credentials, path, {**root_target, "relative_path": rel}, progress)
+                    progress.files_uploaded += 1
+                    progress.log(f"[{progress.files_uploaded + progress.files_skipped}/{progress.files_to_upload}] Uploaded: {path.name}")
+                    return res
                 except ProviderFailure as exc:
                     if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
+                        progress.files_skipped += 1
+                        progress.log(f"[{progress.files_uploaded + progress.files_skipped}/{progress.files_to_upload}] Skipped: {path.name}")
                         return None
                     raise
 
         results = await asyncio.gather(*(upload(path) for path in paths))
         uploaded = [item for item in results if item is not None]
         skipped = len(results) - len(uploaded)
-        progress.log(f"{self.name} upload folder {local_dir.name}: {len(uploaded)} uploaded, {skipped} skipped")
         return {"ok": True, "uploaded": len(uploaded), "skipped": skipped, "items": uploaded}
 
 async def stream_download(url: str, dest: Path, progress: JobState, *, headers: dict[str, str] | None = None, phase: str = "download") -> Path:
@@ -95,6 +106,8 @@ async def stream_download(url: str, dest: Path, progress: JobState, *, headers: 
                     done += len(chunk)
                     progress.add_bytes(len(chunk), total, phase, str(dest))
     part.replace(dest)
+    progress.files_downloaded += 1
+    progress.log(f"[{progress.files_downloaded}/{progress.files_to_download}] Downloaded: {dest.name}")
     return dest
 
 def safe_name(name: str) -> str:
