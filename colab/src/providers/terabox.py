@@ -131,6 +131,9 @@ class TeraBoxSession:
 class TeraBoxProvider(BaseProvider):
     name = "terabox"
 
+    def __init__(self) -> None:
+        self._folder_lock = asyncio.Lock()
+
     async def validate_credentials(self, credentials: dict[str, Any]) -> dict[str, Any]:
         s = TeraBoxSession(credentials)
         await s.ready()
@@ -171,14 +174,16 @@ class TeraBoxProvider(BaseProvider):
         return ""
 
     async def _ensure_relative_parent(self, s: TeraBoxSession, parent: str, relative_path: str) -> str:
-        current = parent.rstrip("/") or "/"
-        for part in [p for p in Path(relative_path).parent.as_posix().split("/") if p and p != "."]:
-            next_path = await self._find_child_folder(s, current, part)
-            if not next_path:
-                next_path = f"{current}/{part}" if current != "/" else f"/{part}"
-                await self._create_folder(s, next_path)
-            current = next_path
-        return current
+        # ponytail: one provider-wide lock; use per-parent locks if folder creation throughput matters.
+        async with self._folder_lock:
+            current = parent.rstrip("/") or "/"
+            for part in [p for p in Path(relative_path).parent.as_posix().split("/") if p and p != "."]:
+                next_path = await self._find_child_folder(s, current, part)
+                if not next_path:
+                    next_path = f"{current}/{part}" if current != "/" else f"/{part}"
+                    await self._create_folder(s, next_path)
+                current = next_path
+            return current
 
     async def download_file(self, credentials: dict[str, Any], file_ref: dict[str, Any], local_path: Path, progress: JobState) -> Path:
         s = TeraBoxSession(credentials)

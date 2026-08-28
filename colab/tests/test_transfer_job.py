@@ -288,6 +288,41 @@ class TransferJobTests(TestCase):
         self.assertEqual(parent, "/photos/results")
         self.assertFalse(any(call[1].startswith("create folder /photos/results") for call in s.calls))
 
+    def test_terabox_results_folder_creation_is_serialized(self):
+        class Session:
+            base = "https://www.terabox.com"
+
+            def __init__(self):
+                self.created = False
+                self.creates = 0
+
+            def params(self, **extra):
+                return extra
+
+            def headers(self):
+                return {}
+
+            async def request_json(self, method, url, *, context, **kwargs):
+                await asyncio.sleep(0.01)
+                if context == "list /photos" and self.created:
+                    return {"list": [{"isdir": 1, "server_filename": "results", "path": "/photos/results"}]}
+                if context == "create folder /photos/results":
+                    self.created = True
+                    self.creates += 1
+                    return {}
+                return {"list": []}
+
+        async def run():
+            s = Session()
+            p = TeraBoxProvider()
+            parents = await asyncio.gather(*(p._ensure_relative_parent(s, "/photos", "results/a.jpg") for _ in range(3)))
+            return s.creates, parents
+
+        creates, parents = asyncio.run(run())
+
+        self.assertEqual(creates, 1)
+        self.assertEqual(parents, ["/photos/results", "/photos/results", "/photos/results"])
+
     def test_pikpak_upload_waits_for_task_when_oss_params_missing(self):
         class Session:
             calls = 0
