@@ -42,6 +42,13 @@ class DriveProvider(BaseProvider):
     def _use_mount(self, credentials: dict[str, Any]) -> bool:
         return bool(credentials.get("mount"))
 
+    def _mount_ref(self, ref: dict[str, Any]) -> bool:
+        if "path" in ref:
+            raw = str(ref.get("path") or "")
+            return bool(raw and not raw.startswith("id:"))
+        raw = str(ref.get("id") or "")
+        return raw.startswith("/") or "/" in raw
+
     def _require_mount(self) -> None:
         if not self._mounted():
             raise ProviderFailure("DRIVE_NOT_MOUNTED", "Mount Google Drive in Colab first")
@@ -89,7 +96,7 @@ class DriveProvider(BaseProvider):
         return {"items": [{"id": f["id"], "name": f["name"], "type": "folder" if f.get("mimeType") == FOLDER_MIME else "file", "mimeType": f.get("mimeType"), "size": f.get("size")} for f in files]}
 
     async def download_file(self, credentials: dict[str, Any], file_ref: dict[str, Any], local_path: Path, progress: JobState) -> Path:
-        if self._use_mount(credentials):
+        if self._use_mount(credentials) and self._mount_ref(file_ref):
             self._require_mount()
             src = self._mount_path(file_ref)
             if not src.is_file():
@@ -102,6 +109,8 @@ class DriveProvider(BaseProvider):
             progress.add_bytes(src.stat().st_size, src.stat().st_size, "download", str(dest))
             progress.log(f"[{progress.files_downloaded}/{progress.files_to_download}] Downloaded: {dest.name}")
             return dest
+        if self._use_mount(credentials) and not (credentials.get("access_token") or credentials.get("token") or credentials.get("web_access_token")):
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Drive source must be a MyDrive path after mounting")
         fid = str(file_ref.get("id") or "")
         if not fid:
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Drive file id missing")

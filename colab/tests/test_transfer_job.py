@@ -50,6 +50,20 @@ def test_drive_mount_required(tmp_path, monkeypatch):
     else:
         raise AssertionError("expected DRIVE_NOT_MOUNTED")
 
+def test_drive_mount_source_id_without_token_fails_with_path_hint(tmp_path, monkeypatch):
+    mount = tmp_path / "MyDrive"
+    mount.mkdir()
+    monkeypatch.setattr(drive_mod, "DRIVE_MOUNT", mount)
+    provider = DriveProvider()
+
+    try:
+        asyncio.run(provider.download_file({"mount": True}, {"id": "drive-file-id", "path": "id:drive-file-id"}, tmp_path, JobState("drive-id", {})))
+    except ProviderFailure as exc:
+        assert exc.code == "SOURCE_FILE_NOT_FOUND"
+        assert "MyDrive path" in exc.message
+    else:
+        raise AssertionError("expected SOURCE_FILE_NOT_FOUND")
+
 
 class OneFileFolderSource:
     async def download_folder(self, credentials, folder_ref, local_dir: Path, progress: JobState):

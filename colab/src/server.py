@@ -30,15 +30,6 @@ drive_mount_state: dict[str, Any] = {"status": "idle", "message": "", "mountPath
 def _drive_mounted() -> bool:
     return DRIVE_MOUNT_PATH.exists() and DRIVE_MOUNT_PATH.is_dir()
 
-def _mount_drive() -> None:
-    drive_mount_state.update({"status": "mounting", "message": "Mounting Google Drive"})
-    try:
-        from google.colab import drive
-        drive.mount("/content/drive")
-        drive_mount_state.update({"status": "mounted" if _drive_mounted() else "failed", "message": "Mounted" if _drive_mounted() else "Drive mount path not found"})
-    except Exception as exc:
-        drive_mount_state.update({"status": "failed", "message": str(exc)})
-
 @app.get("/health")
 async def health() -> dict[str, Any]:
     return {"ok": True, "service": "vaultbox-colab-worker", "version": "2.0.0", "jobs": len(manager.jobs)}
@@ -62,8 +53,8 @@ async def drive_mount_status() -> dict[str, Any]:
 async def drive_mount() -> dict[str, Any]:
     if _drive_mounted():
         drive_mount_state.update({"status": "mounted", "message": "Mounted"})
-    elif drive_mount_state.get("status") != "mounting":
-        asyncio.create_task(asyncio.to_thread(_mount_drive))
+    else:
+        drive_mount_state.update({"status": "idle", "message": "Run the Mount Google Drive cell in the Colab launcher, then check again."})
     return await drive_mount_status()
 
 @app.post("/providers/{provider}/validate", dependencies=[Depends(require_token)])
