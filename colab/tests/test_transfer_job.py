@@ -15,11 +15,40 @@ from src.providers.base import ProviderFailure
 from src.providers.pikpak import PikPakProvider
 from src.providers import pikpak as pikpak_mod
 from src.providers.terabox import TeraBoxProvider, TeraBoxSession
+from src.providers import drive as drive_mod
+from src.providers.drive import DriveProvider
 
 def test_colab_download_concurrency_default_is_cdn_friendly():
     from src.config import FOLDER_DOWNLOAD_CONCURRENCY
 
     assert FOLDER_DOWNLOAD_CONCURRENCY == 12
+
+def test_drive_mount_download_and_upload(tmp_path, monkeypatch):
+    mount = tmp_path / "MyDrive"
+    mount.mkdir()
+    source = mount / "in.txt"
+    source.write_text("ok")
+    monkeypatch.setattr(drive_mod, "DRIVE_MOUNT", mount)
+    provider = DriveProvider()
+    job = JobState("drive-mount", {})
+
+    downloaded = asyncio.run(provider.download_file({"mount": True}, {"path": "/in.txt"}, tmp_path / "input", job))
+    assert downloaded.read_text() == "ok"
+
+    uploaded = asyncio.run(provider.upload_file({"mount": True}, downloaded, {"path": "/out", "relative_path": "copy.txt"}, job))
+    assert uploaded["path"] == "out/copy.txt"
+    assert (mount / "out" / "copy.txt").read_text() == "ok"
+
+def test_drive_mount_required(tmp_path, monkeypatch):
+    monkeypatch.setattr(drive_mod, "DRIVE_MOUNT", tmp_path / "missing")
+    provider = DriveProvider()
+
+    try:
+        asyncio.run(provider.download_file({"mount": True}, {"path": "/x.txt"}, tmp_path, JobState("drive-missing", {})))
+    except ProviderFailure as exc:
+        assert exc.code == "DRIVE_NOT_MOUNTED"
+    else:
+        raise AssertionError("expected DRIVE_NOT_MOUNTED")
 
 
 class OneFileFolderSource:

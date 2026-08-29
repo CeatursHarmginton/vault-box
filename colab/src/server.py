@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -23,6 +24,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 manager = JobManager()
+DRIVE_MOUNT_PATH = Path("/content/drive/MyDrive")
+drive_mount_state: dict[str, Any] = {"status": "idle", "message": "", "mountPath": str(DRIVE_MOUNT_PATH)}
+
+def _drive_mounted() -> bool:
+    return DRIVE_MOUNT_PATH.exists() and DRIVE_MOUNT_PATH.is_dir()
+
+def _mount_drive() -> None:
+    drive_mount_state.update({"status": "mounting", "message": "Mounting Google Drive"})
+    try:
+        from google.colab import drive
+        drive.mount("/content/drive")
+        drive_mount_state.update({"status": "mounted" if _drive_mounted() else "failed", "message": "Mounted" if _drive_mounted() else "Drive mount path not found"})
+    except Exception as exc:
+        drive_mount_state.update({"status": "failed", "message": str(exc)})
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
@@ -35,6 +50,21 @@ async def connect_verify() -> dict[str, Any]:
 @app.get("/providers", dependencies=[Depends(require_token)])
 async def providers() -> dict[str, Any]:
     return {"providers": list(PROVIDERS)}
+
+@app.get("/drive/mount/status", dependencies=[Depends(require_token)])
+async def drive_mount_status() -> dict[str, Any]:
+    mounted = _drive_mounted()
+    if mounted:
+        drive_mount_state.update({"status": "mounted", "message": "Mounted"})
+    return {**drive_mount_state, "mounted": mounted}
+
+@app.post("/drive/mount", dependencies=[Depends(require_token)])
+async def drive_mount() -> dict[str, Any]:
+    if _drive_mounted():
+        drive_mount_state.update({"status": "mounted", "message": "Mounted"})
+    elif drive_mount_state.get("status") != "mounting":
+        asyncio.create_task(asyncio.to_thread(_mount_drive))
+    return await drive_mount_status()
 
 @app.post("/providers/{provider}/validate", dependencies=[Depends(require_token)])
 async def validate_provider(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
