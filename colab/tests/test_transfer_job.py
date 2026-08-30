@@ -221,6 +221,7 @@ def test_drive_web_session_large_upload_uses_resumable(monkeypatch, tmp_path):
     assert out["id"] == "file1"
     assert calls[0][0] == "POST"
     assert calls[0][2]["uploadType"] == "resumable"
+    assert "fields" not in calls[0][2]
     assert calls[1] == ("PUT", "https://upload.test/session", f"bytes 0-{path.stat().st_size - 1}/{path.stat().st_size}")
 
 

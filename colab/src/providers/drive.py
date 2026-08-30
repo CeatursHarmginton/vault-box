@@ -297,7 +297,7 @@ class DriveProvider(BaseProvider):
 
     async def _web_upload_resumable(self, credentials: dict[str, Any], local_path: Path, parent: str, name: str, mime: str, progress: JobState) -> dict[str, Any]:
         size = local_path.stat().st_size
-        params = {"uploadType": "resumable", "supportsTeamDrives": "true", "fields": FIELDS}
+        params = {"uploadType": "resumable", "supportsTeamDrives": "true"}
         key = self._web_key(credentials)
         if key:
             params["key"] = key
