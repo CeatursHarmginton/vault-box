@@ -101,6 +101,10 @@ class DriveProvider(BaseProvider):
         keys = c.get("api_keys") or {}
         return str(keys.get("drivefrontend-pa.clients6.google.com") or keys.get("clients6.google.com") or "")
 
+    def _api_parent(self, ref: Any) -> str:
+        raw = ref if isinstance(ref, str) else (ref.get("id") or ref.get("path") or "root")
+        return "root" if str(raw or "").strip() in {"", "/"} else str(raw)
+
     def _headers(self, c: dict[str, Any], extra: dict[str, str] | None = None) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token(c)}", **(extra or {})}
 
@@ -130,7 +134,7 @@ class DriveProvider(BaseProvider):
             if not folder.is_dir():
                 raise ProviderFailure("TARGET_FOLDER_NOT_FOUND", "Drive folder not found")
             return {"items": [{"id": p.relative_to(DRIVE_MOUNT).as_posix(), "path": p.relative_to(DRIVE_MOUNT).as_posix(), "name": p.name, "type": "folder" if p.is_dir() else "file", "size": p.stat().st_size if p.is_file() else 0} for p in sorted(folder.iterdir())]}
-        parent = path_or_id or "root"
+        parent = self._api_parent(path_or_id)
         resp = await self._request(credentials, "GET", f"{DRIVE_API}/files", params={
             "q": f"'{parent}' in parents and trashed=false",
             "fields": f"files({FIELDS})",
@@ -195,7 +199,7 @@ class DriveProvider(BaseProvider):
             return {"id": dest.relative_to(DRIVE_MOUNT).as_posix(), "name": dest.name, "path": dest.relative_to(DRIVE_MOUNT).as_posix()}
         if self._web_session(credentials):
             return await self._web_upload_file(credentials, local_path, target_ref, progress)
-        parent = str(target_ref.get("id") or target_ref.get("path") or "root")
+        parent = self._api_parent(target_ref)
         name = Path(target_ref.get("relative_path") or local_path.name).name
         size = local_path.stat().st_size
         mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
@@ -257,7 +261,7 @@ class DriveProvider(BaseProvider):
 
     async def _web_upload_file(self, credentials: dict[str, Any], local_path: Path, target_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:
         size = local_path.stat().st_size
-        parent = str(target_ref.get("id") or target_ref.get("path") or "root")
+        parent = self._api_parent(target_ref)
         name = Path(target_ref.get("relative_path") or local_path.name).name
         mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
         if size > WEB_MULTIPART_MAX:

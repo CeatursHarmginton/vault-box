@@ -224,6 +224,41 @@ def test_drive_web_session_large_upload_uses_resumable(monkeypatch, tmp_path):
     assert calls[1] == ("PUT", "https://upload.test/session", f"bytes 0-{path.stat().st_size - 1}/{path.stat().st_size}")
 
 
+def test_drive_web_session_upload_maps_slash_to_root(monkeypatch, tmp_path):
+    seen = {}
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"id": "file1", "title": "a.txt"}
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, **kwargs):
+            seen["body"] = kwargs["content"]
+            return Response()
+
+    monkeypatch.setattr(drive_mod.httpx, "AsyncClient", Client)
+    path = tmp_path / "a.txt"
+    path.write_text("ok")
+
+    out = asyncio.run(DriveProvider().upload_file({
+        "access_token": "SAPISIDHASH old",
+        "cookies": {"SAPISID": "s"},
+    }, path, {"id": "/", "path": "/"}, JobState("drive-web-root", {})))
+
+    assert out["id"] == "file1"
+    assert b'"parents": [{"id": "root"}]' in seen["body"]
+
 class OneFileFolderSource:
     async def download_folder(self, credentials, folder_ref, local_dir: Path, progress: JobState):
         path = local_dir / "only.txt"
