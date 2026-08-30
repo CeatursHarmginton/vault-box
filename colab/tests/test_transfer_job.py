@@ -177,20 +177,51 @@ def test_drive_web_session_validate_does_not_call_api(tmp_path):
 
     assert out == {"ok": True, "authMode": "web_session"}
 
-def test_drive_web_session_large_upload_has_clear_error(tmp_path):
+def test_drive_web_session_large_upload_uses_resumable(monkeypatch, tmp_path):
+    calls = []
+
+    class Init:
+        status_code = 200
+        headers = {"Location": "https://upload.test/session"}
+
+    class Done:
+        status_code = 200
+        headers = {}
+
+        def json(self):
+            return {"id": "file1", "title": "big.bin"}
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, **kwargs):
+            calls.append(("POST", url, kwargs.get("params")))
+            return Init()
+
+        async def put(self, url, **kwargs):
+            calls.append(("PUT", url, kwargs["headers"].get("content-range")))
+            return Done()
+
+    monkeypatch.setattr(drive_mod.httpx, "AsyncClient", Client)
     path = tmp_path / "big.bin"
     path.write_bytes(b"x" * (drive_mod.WEB_MULTIPART_MAX + 1))
 
-    try:
-        asyncio.run(DriveProvider().upload_file({
-            "access_token": "SAPISIDHASH old",
-            "cookies": {"SAPISID": "s"},
-        }, path, {"id": "root"}, JobState("drive-web-big", {})))
-    except ProviderFailure as exc:
-        assert exc.code == "UPLOAD_FAILED"
-        assert "OAuth Drive API credentials" in exc.message
-    else:
-        raise AssertionError("large web-session upload should fail clearly")
+    out = asyncio.run(DriveProvider().upload_file({
+        "access_token": "SAPISIDHASH old",
+        "cookies": {"SAPISID": "s"},
+    }, path, {"id": "root"}, JobState("drive-web-big", {})))
+
+    assert out["id"] == "file1"
+    assert calls[0][0] == "POST"
+    assert calls[0][2]["uploadType"] == "resumable"
+    assert calls[1] == ("PUT", "https://upload.test/session", f"bytes 0-{path.stat().st_size - 1}/{path.stat().st_size}")
 
 
 class OneFileFolderSource:

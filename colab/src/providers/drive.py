@@ -257,11 +257,11 @@ class DriveProvider(BaseProvider):
 
     async def _web_upload_file(self, credentials: dict[str, Any], local_path: Path, target_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:
         size = local_path.stat().st_size
-        if size > WEB_MULTIPART_MAX:
-            raise ProviderFailure("UPLOAD_FAILED", "Drive web-session upload over 5 MiB is not supported without OAuth Drive API credentials")
         parent = str(target_ref.get("id") or target_ref.get("path") or "root")
         name = Path(target_ref.get("relative_path") or local_path.name).name
         mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        if size > WEB_MULTIPART_MAX:
+            return await self._web_upload_resumable(credentials, local_path, parent, name, mime, progress)
         boundary = f"vaultbox-drive-web-{int(time.time() * 1000)}"
         metadata = {"title": name, "mimeType": mime, "parents": [{"id": parent}]}
         body = (
@@ -290,3 +290,57 @@ class DriveProvider(BaseProvider):
         progress.add_bytes(size, size, "upload", str(local_path))
         data = resp.json()
         return {"id": data.get("id"), "name": data.get("title") or data.get("name") or name}
+
+    async def _web_upload_resumable(self, credentials: dict[str, Any], local_path: Path, parent: str, name: str, mime: str, progress: JobState) -> dict[str, Any]:
+        size = local_path.stat().st_size
+        params = {"uploadType": "resumable", "supportsTeamDrives": "true", "fields": FIELDS}
+        key = self._web_key(credentials)
+        if key:
+            params["key"] = key
+        init_headers = {
+            "content-type": "application/json",
+            "x-upload-content-type": mime,
+            "x-upload-content-length": str(size),
+        }
+        progress.set(step="uploading", current_file=name)
+        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+            init = await client.post(
+                f"{DRIVE_WEB_UPLOAD_API}/files",
+                params=params,
+                headers=self._web_headers(credentials, init_headers),
+                content=json.dumps({"title": name, "mimeType": mime, "parents": [{"id": parent}]}),
+            )
+            if init.status_code in (401, 403):
+                raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked")
+            if init.status_code >= 400:
+                raise ProviderFailure("UPLOAD_FAILED", init.text[:500], {"status": init.status_code})
+            session = init.headers.get("Location") or init.headers.get("location")
+            if not session:
+                raise ProviderFailure("UPLOAD_FAILED", "Drive web resumable session missing")
+            offset = 0
+            with local_path.open("rb") as fh:
+                while offset < size:
+                    progress.check_cancelled()
+                    fh.seek(offset)
+                    data = fh.read(min(CHUNK, size - offset))
+                    end = offset + len(data) - 1
+                    resp = await client.put(
+                        session,
+                        headers=self._web_headers(credentials, {
+                            "content-length": str(len(data)),
+                            "content-range": f"bytes {offset}-{end}/{size}",
+                            "content-type": mime,
+                        }),
+                        content=data,
+                    )
+                    if resp.status_code in (200, 201):
+                        progress.add_bytes(len(data), size, "upload", str(local_path))
+                        result = resp.json()
+                        return {"id": result.get("id"), "name": result.get("title") or result.get("name") or name}
+                    if resp.status_code != 308:
+                        raise ProviderFailure("UPLOAD_FAILED", resp.text[:500], {"status": resp.status_code})
+                    rng = resp.headers.get("Range") or resp.headers.get("range") or ""
+                    next_offset = int(rng.rsplit("-", 1)[1]) + 1 if "-" in rng else end + 1
+                    progress.add_bytes(max(0, next_offset - offset), size, "upload", str(local_path))
+                    offset = next_offset
+        raise ProviderFailure("UPLOAD_FAILED", "Drive web resumable upload ended early")
