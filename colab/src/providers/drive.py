@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
 import mimetypes
 import os
 import shutil
@@ -17,9 +19,13 @@ from ..jobs.progress import JobState
 
 DRIVE_API = "https://www.googleapis.com/drive/v3"
 DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
+DRIVE_WEB_UPLOAD_API = "https://clients6.google.com/upload/drive/v2internal"
+DRIVE_USERCONTENT = "https://drive.usercontent.google.com"
+DRIVE_WEB_ORIGIN = "https://drive.google.com"
 FOLDER_MIME = "application/vnd.google-apps.folder"
 FIELDS = "id,name,mimeType,size,parents,webContentLink,webViewLink"
 CHUNK = 8 * 1024 * 1024
+WEB_MULTIPART_MAX = 5 * 1024 * 1024
 DRIVE_MOUNT = Path(os.environ.get("COLAB_DRIVE_MOUNT", "/content/drive/MyDrive"))
 
 class DriveProvider(BaseProvider):
@@ -59,6 +65,42 @@ class DriveProvider(BaseProvider):
             raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive access token missing")
         return str(token)
 
+    def _web_session(self, c: dict[str, Any]) -> bool:
+        return self._token(c).lower().startswith("sapisidhash ")
+
+    def _cookie_header(self, c: dict[str, Any]) -> str:
+        return "; ".join(f"{k}={v}" for k, v in (c.get("cookies") or {}).items() if k and v)
+
+    def _web_auth(self, c: dict[str, Any]) -> str:
+        token = self._token(c)
+        cookies = c.get("cookies") or {}
+        sapisid = cookies.get("SAPISID") or cookies.get("__Secure-3PAPISID") or cookies.get("__Secure-1PAPISID")
+        if token.lower().startswith("sapisidhash ") and sapisid:
+            ts = str(int(time.time()))
+            return f"SAPISIDHASH {ts}_{hashlib.sha1(f'{ts} {sapisid} {DRIVE_WEB_ORIGIN}'.encode('utf-8')).hexdigest()}"
+        return token
+
+    def _web_headers(self, c: dict[str, Any], extra: dict[str, str] | None = None, *, auth: bool = True) -> dict[str, str]:
+        headers = {
+            "origin": DRIVE_WEB_ORIGIN,
+            "referer": DRIVE_WEB_ORIGIN + "/",
+            "user-agent": "Mozilla/5.0",
+            "x-goog-authuser": str(c.get("authuser") or "0"),
+        }
+        cookie = self._cookie_header(c)
+        if cookie:
+            headers["cookie"] = cookie
+        headers.update({k: v for k, v in (c.get("auth_headers") or {}).items() if str(k).lower() not in {"authorization", "x-goog-api-key"}})
+        if auth:
+            headers["Authorization"] = self._web_auth(c)
+        if extra:
+            headers.update(extra)
+        return headers
+
+    def _web_key(self, c: dict[str, Any]) -> str:
+        keys = c.get("api_keys") or {}
+        return str(keys.get("drivefrontend-pa.clients6.google.com") or keys.get("clients6.google.com") or "")
+
     def _headers(self, c: dict[str, Any], extra: dict[str, str] | None = None) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token(c)}", **(extra or {})}
 
@@ -74,6 +116,10 @@ class DriveProvider(BaseProvider):
     async def validate_credentials(self, credentials: dict[str, Any]) -> dict[str, Any]:
         if self._use_mount(credentials):
             return {"ok": self._mounted(), "mounted": self._mounted(), "mountPath": str(DRIVE_MOUNT)}
+        if self._web_session(credentials):
+            if not self._cookie_header(credentials):
+                raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web-session cookies missing")
+            return {"ok": True, "authMode": "web_session"}
         resp = await self._request(credentials, "GET", f"{DRIVE_API}/about", params={"fields": "user"})
         return {"ok": True, "account": resp.json().get("user") or {}}
 
@@ -114,6 +160,12 @@ class DriveProvider(BaseProvider):
         fid = str(file_ref.get("id") or "")
         if not fid:
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Drive file id missing")
+        if self._web_session(credentials):
+            info = await self._web_download_info(credentials, fid)
+            name = file_ref.get("name") or info.get("name") or fid
+            local_path = local_path if local_path.suffix else local_path / safe_name(name)
+            progress.set(step="downloading", current_file=local_path.name)
+            return await stream_download(info["url"], local_path, progress, headers=self._web_headers(credentials, auth=False))
         meta = (await self._request(credentials, "GET", f"{DRIVE_API}/files/{fid}", params={"fields": FIELDS, "supportsAllDrives": "true"})).json()
         name = file_ref.get("name") or meta.get("name") or fid
         local_path = local_path if local_path.suffix else local_path / safe_name(name)
@@ -141,6 +193,8 @@ class DriveProvider(BaseProvider):
             size = local_path.stat().st_size
             progress.add_bytes(size, size, "upload", str(local_path))
             return {"id": dest.relative_to(DRIVE_MOUNT).as_posix(), "name": dest.name, "path": dest.relative_to(DRIVE_MOUNT).as_posix()}
+        if self._web_session(credentials):
+            return await self._web_upload_file(credentials, local_path, target_ref, progress)
         parent = str(target_ref.get("id") or target_ref.get("path") or "root")
         name = Path(target_ref.get("relative_path") or local_path.name).name
         size = local_path.stat().st_size
@@ -173,3 +227,66 @@ class DriveProvider(BaseProvider):
                 progress.add_bytes(max(0, next_offset - offset), size, "upload", str(local_path))
                 offset = next_offset
         raise ProviderFailure("UPLOAD_FAILED", "Drive upload ended early")
+
+    async def _web_download_info(self, credentials: dict[str, Any], file_id: str) -> dict[str, Any]:
+        params = {"id": file_id, "authuser": str(credentials.get("authuser") or "0"), "export": "download"}
+        headers = self._web_headers(credentials, {
+            "x-json-requested": "true",
+            "x-drive-first-party": "DriveWebUi",
+            "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+        }, auth=False)
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            try:
+                await client.get(f"{DRIVE_USERCONTENT}/auth_warmup", headers=self._web_headers(credentials, auth=False))
+            except Exception:
+                pass
+            resp = await client.post(f"{DRIVE_USERCONTENT}/uc", params=params, headers=headers, content=b"")
+        if resp.status_code in (401, 403):
+            raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked")
+        if resp.status_code >= 400:
+            raise ProviderFailure("DOWNLOAD_FAILED", resp.text[:500], {"status": resp.status_code})
+        text = resp.text.lstrip(")]}'\n")
+        try:
+            payload = json.loads(text)
+        except Exception:
+            payload = {}
+        return {
+            "url": payload.get("downloadUrl") or f"{DRIVE_USERCONTENT}/download?id={file_id}&export=download&authuser={credentials.get('authuser') or '0'}&confirm=t",
+            "name": payload.get("fileName") or "",
+        }
+
+    async def _web_upload_file(self, credentials: dict[str, Any], local_path: Path, target_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:
+        size = local_path.stat().st_size
+        if size > WEB_MULTIPART_MAX:
+            raise ProviderFailure("UPLOAD_FAILED", "Drive web-session upload over 5 MiB is not supported without OAuth Drive API credentials")
+        parent = str(target_ref.get("id") or target_ref.get("path") or "root")
+        name = Path(target_ref.get("relative_path") or local_path.name).name
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        boundary = f"vaultbox-drive-web-{int(time.time() * 1000)}"
+        metadata = {"title": name, "mimeType": mime, "parents": [{"id": parent}]}
+        body = (
+            f"--{boundary}\r\ncontent-type: application/json; charset=UTF-8\r\n\r\n"
+            + json.dumps(metadata, ensure_ascii=False)
+            + f"\r\n--{boundary}\r\ncontent-transfer-encoding: base64\r\ncontent-type: {mime}\r\n\r\n"
+            + base64.b64encode(local_path.read_bytes()).decode("ascii")
+            + f"\r\n--{boundary}--\r\n"
+        ).encode("utf-8")
+        params = {"uploadType": "multipart", "supportsTeamDrives": "true"}
+        key = self._web_key(credentials)
+        if key:
+            params["key"] = key
+        progress.set(step="uploading", current_file=name)
+        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+            resp = await client.post(
+                f"{DRIVE_WEB_UPLOAD_API}/files",
+                params=params,
+                headers=self._web_headers(credentials, {"content-type": f"multipart/related; boundary={boundary}"}),
+                content=body,
+            )
+        if resp.status_code in (401, 403):
+            raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked")
+        if resp.status_code >= 400:
+            raise ProviderFailure("UPLOAD_FAILED", resp.text[:500], {"status": resp.status_code})
+        progress.add_bytes(size, size, "upload", str(local_path))
+        data = resp.json()
+        return {"id": data.get("id"), "name": data.get("title") or data.get("name") or name}

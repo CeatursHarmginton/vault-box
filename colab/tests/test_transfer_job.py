@@ -64,6 +64,134 @@ def test_drive_mount_source_id_without_token_fails_with_path_hint(tmp_path, monk
     else:
         raise AssertionError("expected SOURCE_FILE_NOT_FOUND")
 
+def test_drive_api_mode_validate_does_not_require_mount(monkeypatch, tmp_path):
+    monkeypatch.setattr(drive_mod, "DRIVE_MOUNT", tmp_path / "missing")
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"user": {"emailAddress": "a@example.com"}}
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            return Response()
+
+    monkeypatch.setattr(drive_mod.httpx, "AsyncClient", Client)
+
+    out = asyncio.run(DriveProvider().validate_credentials({"access_token": "A", "mount": False}))
+
+    assert out["ok"] is True
+
+def test_drive_api_download_uses_media_endpoint(monkeypatch, tmp_path):
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"id": "file1", "name": "a.txt", "mimeType": "text/plain"}
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            return Response()
+
+    async def fake_stream_download(url, dest, progress, *, headers=None, phase="download"):
+        calls.append((url, headers))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("ok")
+        return dest
+
+    monkeypatch.setattr(drive_mod.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(drive_mod, "stream_download", fake_stream_download)
+
+    out = asyncio.run(DriveProvider().download_file({"access_token": "A", "mount": False}, {"id": "file1"}, tmp_path, JobState("drive-api-download", {})))
+
+    assert out.read_text() == "ok"
+    assert calls == [(f"{drive_mod.DRIVE_API}/files/file1?alt=media&supportsAllDrives=true", {"Authorization": "Bearer A"})]
+
+def test_drive_api_upload_uses_resumable_endpoint(monkeypatch, tmp_path):
+    calls = []
+
+    class InitResponse:
+        status_code = 200
+        headers = {"Location": "https://upload.test/session"}
+
+    class DoneResponse:
+        status_code = 200
+        headers = {}
+
+        def json(self):
+            return {"id": "file1", "name": "a.txt"}
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            calls.append((method, url))
+            return InitResponse()
+
+        async def put(self, url, **kwargs):
+            calls.append(("PUT", url))
+            return DoneResponse()
+
+    monkeypatch.setattr(drive_mod.httpx, "AsyncClient", Client)
+    path = tmp_path / "a.txt"
+    path.write_text("ok")
+
+    out = asyncio.run(DriveProvider().upload_file({"access_token": "A", "mount": False}, path, {"id": "root"}, JobState("drive-api-upload", {})))
+
+    assert out["id"] == "file1"
+    assert calls == [("POST", f"{drive_mod.DRIVE_UPLOAD_API}/files"), ("PUT", "https://upload.test/session")]
+
+def test_drive_web_session_validate_does_not_call_api(tmp_path):
+    out = asyncio.run(DriveProvider().validate_credentials({
+        "access_token": "SAPISIDHASH old",
+        "cookies": {"SAPISID": "s"},
+    }))
+
+    assert out == {"ok": True, "authMode": "web_session"}
+
+def test_drive_web_session_large_upload_has_clear_error(tmp_path):
+    path = tmp_path / "big.bin"
+    path.write_bytes(b"x" * (drive_mod.WEB_MULTIPART_MAX + 1))
+
+    try:
+        asyncio.run(DriveProvider().upload_file({
+            "access_token": "SAPISIDHASH old",
+            "cookies": {"SAPISID": "s"},
+        }, path, {"id": "root"}, JobState("drive-web-big", {})))
+    except ProviderFailure as exc:
+        assert exc.code == "UPLOAD_FAILED"
+        assert "OAuth Drive API credentials" in exc.message
+    else:
+        raise AssertionError("large web-session upload should fail clearly")
+
 
 class OneFileFolderSource:
     async def download_folder(self, credentials, folder_ref, local_dir: Path, progress: JobState):
