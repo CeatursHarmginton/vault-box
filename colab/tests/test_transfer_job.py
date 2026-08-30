@@ -302,6 +302,7 @@ class TransferJobTests(TestCase):
 
         self.assertEqual(job.status, "completed")
         self.assertEqual(dst.calls[0][0], "folder")
+        self.assertEqual(dst.calls[0][1].name, "input")
 
     def test_optimized_upload_new_goes_to_results_folder(self):
         class Source:
@@ -682,6 +683,7 @@ class TransferJobTests(TestCase):
             self.assertEqual(job.status, "completed", job.error)
             self.assertEqual(src.dirs[0], dirs["input"] / "Coser@九言 - 2026年02月月票2 卡芙卡自拍")
             self.assertEqual(dst.calls[0], ("folder", dirs["input"]))
+            self.assertEqual(dst.target_refs[0], {})
         finally:
             PROVIDERS.clear()
             PROVIDERS.update(old)
@@ -701,8 +703,21 @@ class TransferJobTests(TestCase):
         view = job.view()
         self.assertEqual(view["bytesDone"], 12)
         self.assertEqual(view["bytesTotal"], 12)
+        self.assertEqual(view["bytesOverallDone"], 12)
+        self.assertEqual(view["bytesOverallTotal"], 12)
         self.assertEqual(job.progress.download, 100)
         self.assertGreater(job.speed, 0)
+
+    def test_progress_overall_counts_download_and_upload(self):
+        job = JobState("overall-progress", {})
+        job.add_bytes(5, 10, "download", "a.bin")
+        job.add_bytes(5, 10, "upload", "a.bin")
+
+        view = job.view()
+        self.assertEqual(view["bytesDone"], 5)
+        self.assertEqual(view["bytesTotal"], 10)
+        self.assertEqual(view["bytesOverallDone"], 10)
+        self.assertEqual(view["bytesOverallTotal"], 20)
 
     def test_stream_download_resumes_after_incomplete_body(self):
         class Stream:

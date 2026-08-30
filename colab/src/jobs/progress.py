@@ -38,6 +38,8 @@ class JobState:
     _phase_done: int = 0
     _phase_total: int = 0
     _phase_total_keys: set[tuple[str, str]] = field(default_factory=set)
+    _phase_done_by_name: dict[str, int] = field(default_factory=dict)
+    _phase_total_by_name: dict[str, int] = field(default_factory=dict)
     files_downloaded: int = 0
     files_to_download: int = 0
     files_uploaded: int = 0
@@ -78,9 +80,11 @@ class JobState:
             self._phase_total = total
         self.bytes_done += n
         self._phase_done += n
+        self._phase_done_by_name[phase] = self._phase_done_by_name.get(phase, 0) + n
         if self._phase_total:
             self.bytes_total = self._phase_total
             setattr(self.progress, phase, min(100, self._phase_done / self._phase_total * 100))
+            self._phase_total_by_name[phase] = self._phase_total
         now = time.time()
         elapsed = now - self._tick_at
         if elapsed >= 1:
@@ -110,6 +114,8 @@ class JobState:
             "currentFile": self.current_file,
             "bytesDone": self._phase_done,
             "bytesTotal": self._phase_total or self.bytes_total,
+            "bytesOverallDone": sum(self._phase_done_by_name.values()),
+            "bytesOverallTotal": sum(self._phase_total_by_name.values()),
             "bytesCumulative": self.bytes_done,
             "speed": self.speed,
             "logs": self.logs[-50:],
