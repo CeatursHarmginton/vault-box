@@ -263,6 +263,56 @@ def test_drive_api_upload_preserves_relative_parent(monkeypatch, tmp_path):
     assert seen["uploaded"]["name"] == "image1.jpg"
     assert seen["uploaded"]["parents"] == ["folderA-id"]
 
+def test_drive_api_upload_folder_reuses_concurrent_parent(monkeypatch, tmp_path):
+    state = {"folder_id": "", "creates": 0}
+
+    class Response:
+        status_code = 200
+        headers = {"Location": "https://upload.test/session"}
+        text = ""
+
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            if method == "GET":
+                await asyncio.sleep(0.01)
+                files = [{"id": state["folder_id"], "name": "folderA"}] if state["folder_id"] else []
+                return Response({"files": files})
+            if url == f"{drive_mod.DRIVE_API}/files":
+                state["creates"] += 1
+                state["folder_id"] = "folderA-id"
+                return Response({"id": "folderA-id", "name": "folderA"})
+            return Response()
+
+        async def put(self, url, **kwargs):
+            return Response({"id": "file1", "name": "image.jpg"})
+
+    monkeypatch.setattr(drive_mod.httpx, "AsyncClient", Client)
+    root = tmp_path / "root"
+    folder = root / "folderA"
+    folder.mkdir(parents=True)
+    for idx in range(3):
+        (folder / f"{idx}.jpg").write_text("ok")
+
+    out = asyncio.run(DriveProvider().upload_folder({"access_token": "A", "mount": False}, root, {"id": "root"}, JobState("drive-api-race", {})))
+
+    assert out["uploaded"] == 3
+    assert state["creates"] == 1
+
 def test_drive_web_session_validate_does_not_call_api(tmp_path):
     out = asyncio.run(DriveProvider().validate_credentials({
         "access_token": "SAPISIDHASH old",
@@ -401,6 +451,57 @@ def test_drive_web_session_upload_preserves_relative_parent(monkeypatch, tmp_pat
     assert seen["created"]["title"] == "folderA"
     assert seen["created"]["parents"] == [{"id": "root"}]
     assert b'"parents": [{"id": "folderA-id"}]' in seen["body"]
+
+def test_drive_web_session_upload_folder_reuses_concurrent_parent(monkeypatch, tmp_path):
+    state = {"folder_id": "", "creates": 0}
+
+    class Response:
+        status_code = 200
+        headers = {}
+        text = ""
+
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, **kwargs):
+            await asyncio.sleep(0.01)
+            items = [{"id": state["folder_id"], "title": "folderA"}] if state["folder_id"] else []
+            return Response({"items": items})
+
+        async def post(self, url, **kwargs):
+            if url == f"{drive_mod.DRIVE_WEB_FILES_API}/files":
+                state["creates"] += 1
+                state["folder_id"] = "folderA-id"
+                return Response({"id": "folderA-id", "title": "folderA"})
+            return Response({"id": "file1", "title": "image.jpg"})
+
+    monkeypatch.setattr(drive_mod.httpx, "AsyncClient", Client)
+    root = tmp_path / "root"
+    folder = root / "folderA"
+    folder.mkdir(parents=True)
+    for idx in range(3):
+        (folder / f"{idx}.jpg").write_text("ok")
+
+    out = asyncio.run(DriveProvider().upload_folder({
+        "access_token": "SAPISIDHASH old",
+        "cookies": {"SAPISID": "s"},
+    }, root, {"id": "root"}, JobState("drive-web-race", {})))
+
+    assert out["uploaded"] == 3
+    assert state["creates"] == 1
 
 class OneFileFolderSource:
     async def download_folder(self, credentials, folder_ref, local_dir: Path, progress: JobState):

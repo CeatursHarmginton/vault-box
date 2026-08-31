@@ -40,6 +40,9 @@ def _relative_folder_parts(relative_path: str) -> list[str]:
 class DriveProvider(BaseProvider):
     name = "drive"
 
+    def __init__(self) -> None:
+        self._folder_lock = asyncio.Lock()
+
     def _mounted(self) -> bool:
         return DRIVE_MOUNT.exists() and DRIVE_MOUNT.is_dir()
 
@@ -243,17 +246,19 @@ class DriveProvider(BaseProvider):
         raise ProviderFailure("UPLOAD_FAILED", "Drive upload ended early")
 
     async def _api_ensure_relative_parent(self, credentials: dict[str, Any], parent: str, relative_path: str) -> str:
-        current = parent or "root"
-        for part in _relative_folder_parts(relative_path):
-            query = f"'{_q_escape(current)}' in parents and name='{_q_escape(part)}' and mimeType='{FOLDER_MIME}' and trashed=false"
-            resp = await self._request(credentials, "GET", f"{DRIVE_API}/files", params={"q": query, "fields": "files(id,name)", "supportsAllDrives": "true", "includeItemsFromAllDrives": "true", "pageSize": "1"})
-            match = next(iter(resp.json().get("files") or []), None)
-            if match:
-                current = str(match["id"])
-                continue
-            created = await self._request(credentials, "POST", f"{DRIVE_API}/files", params={"fields": FIELDS, "supportsAllDrives": "true"}, json={"name": part, "mimeType": FOLDER_MIME, "parents": [current]})
-            current = str(created.json().get("id") or "")
-        return current
+        # ponytail: one Drive folder lock; use per-parent locks if folder creation throughput matters.
+        async with self._folder_lock:
+            current = parent or "root"
+            for part in _relative_folder_parts(relative_path):
+                query = f"'{_q_escape(current)}' in parents and name='{_q_escape(part)}' and mimeType='{FOLDER_MIME}' and trashed=false"
+                resp = await self._request(credentials, "GET", f"{DRIVE_API}/files", params={"q": query, "fields": "files(id,name)", "supportsAllDrives": "true", "includeItemsFromAllDrives": "true", "pageSize": "1"})
+                match = next(iter(resp.json().get("files") or []), None)
+                if match:
+                    current = str(match["id"])
+                    continue
+                created = await self._request(credentials, "POST", f"{DRIVE_API}/files", params={"fields": FIELDS, "supportsAllDrives": "true"}, json={"name": part, "mimeType": FOLDER_MIME, "parents": [current]})
+                current = str(created.json().get("id") or "")
+            return current
 
     async def _web_download_info(self, credentials: dict[str, Any], file_id: str) -> dict[str, Any]:
         params = {"id": file_id, "authuser": str(credentials.get("authuser") or "0"), "export": "download"}
@@ -320,28 +325,30 @@ class DriveProvider(BaseProvider):
         return {"id": data.get("id"), "name": data.get("title") or data.get("name") or name}
 
     async def _web_ensure_relative_parent(self, credentials: dict[str, Any], parent: str, relative_path: str) -> str:
-        current = parent or "root"
-        key = self._web_key(credentials)
-        params_base = {"supportsTeamDrives": "true", **({"key": key} if key else {})}
-        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
-            for part in _relative_folder_parts(relative_path):
-                query = f"'{_q_escape(current)}' in parents and title='{_q_escape(part)}' and mimeType='{FOLDER_MIME}' and trashed = false"
-                resp = await client.get(f"{DRIVE_WEB_FILES_API}/files", params={**params_base, "q": query, "fields": "items(id,title,mimeType)"}, headers=self._web_headers(credentials))
-                if resp.status_code in (401, 403):
-                    raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked")
-                if resp.status_code >= 400:
-                    raise ProviderFailure("UPLOAD_FAILED", resp.text[:500], {"status": resp.status_code})
-                match = next(iter(resp.json().get("items") or []), None)
-                if match:
-                    current = str(match.get("id") or "")
-                    continue
-                resp = await client.post(f"{DRIVE_WEB_FILES_API}/files", params={**params_base, "fields": "id,title,mimeType,parents"}, headers=self._web_headers(credentials), json={"title": part, "mimeType": FOLDER_MIME, "parents": [{"id": current}]})
-                if resp.status_code in (401, 403):
-                    raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked")
-                if resp.status_code >= 400:
-                    raise ProviderFailure("UPLOAD_FAILED", resp.text[:500], {"status": resp.status_code})
-                current = str(resp.json().get("id") or "")
-        return current
+        # ponytail: one Drive folder lock; use per-parent locks if folder creation throughput matters.
+        async with self._folder_lock:
+            current = parent or "root"
+            key = self._web_key(credentials)
+            params_base = {"supportsTeamDrives": "true", **({"key": key} if key else {})}
+            async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+                for part in _relative_folder_parts(relative_path):
+                    query = f"'{_q_escape(current)}' in parents and title='{_q_escape(part)}' and mimeType='{FOLDER_MIME}' and trashed = false"
+                    resp = await client.get(f"{DRIVE_WEB_FILES_API}/files", params={**params_base, "q": query, "fields": "items(id,title,mimeType)"}, headers=self._web_headers(credentials))
+                    if resp.status_code in (401, 403):
+                        raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked")
+                    if resp.status_code >= 400:
+                        raise ProviderFailure("UPLOAD_FAILED", resp.text[:500], {"status": resp.status_code})
+                    match = next(iter(resp.json().get("items") or []), None)
+                    if match:
+                        current = str(match.get("id") or "")
+                        continue
+                    resp = await client.post(f"{DRIVE_WEB_FILES_API}/files", params={**params_base, "fields": "id,title,mimeType,parents"}, headers=self._web_headers(credentials), json={"title": part, "mimeType": FOLDER_MIME, "parents": [{"id": current}]})
+                    if resp.status_code in (401, 403):
+                        raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked")
+                    if resp.status_code >= 400:
+                        raise ProviderFailure("UPLOAD_FAILED", resp.text[:500], {"status": resp.status_code})
+                    current = str(resp.json().get("id") or "")
+            return current
 
     async def _web_upload_resumable(self, credentials: dict[str, Any], local_path: Path, parent: str, name: str, mime: str, progress: JobState) -> dict[str, Any]:
         size = local_path.stat().st_size
