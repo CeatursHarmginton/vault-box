@@ -87,7 +87,8 @@ async def run_transfer(job: JobState) -> None:
         out_root = dirs["input"]
         outputs = downloaded
         if options.get("extract"):
-            outputs = await extract_archives(dirs["input"], dirs["output"], job, options.get("archivePassword") or options.get("archive_password"), bool(options.get("deleteArchiveAfterExtract")))
+            pws = options.get("archive_passwords") or options.get("archivePasswords") or options.get("archivePassword") or options.get("archive_password")
+            outputs = await extract_archives(dirs["input"], dirs["output"], job, pws, bool(options.get("deleteArchiveAfterExtract")))
             out_root = dirs["output"] if any(p.is_relative_to(dirs["output"]) for p in outputs) else dirs["input"]
 
         if options.get("optimize_image"):

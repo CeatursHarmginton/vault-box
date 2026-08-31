@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import TestCase
 
 from src.jobs.progress import JobState
+from src.extract.extractor import archives, is_archive_name
 from src.jobs.transfer_job import run_transfer
 from src.providers import PROVIDERS
 from src.providers import base as base_mod
@@ -23,6 +24,25 @@ def test_colab_download_concurrency_default_is_cdn_friendly():
     from src.config import FOLDER_DOWNLOAD_CONCURRENCY
 
     assert FOLDER_DOWNLOAD_CONCURRENCY == 12
+
+def test_archive_detection_supports_common_and_split_formats(tmp_path):
+    names = [
+        "a.zip", "b.7z", "c.rar", "d.tar.gz", "e.iso",
+        "movie.7z.001", "movie.7z.002",
+        "book.zip.001", "book.zip.002",
+        "rarset.part01.rar", "rarset.part02.rar",
+        "manual.part.rar", "notapart1.rar", "chapter part1.rar",
+        "old.rar", "old.r00",
+    ]
+    for name in names:
+        (tmp_path / name).write_text("x")
+
+    picked = {p.name for p in archives(tmp_path)}
+
+    assert {"a.zip", "b.7z", "c.rar", "d.tar.gz", "e.iso", "movie.7z.001", "book.zip.001", "rarset.part01.rar", "manual.part.rar", "notapart1.rar", "chapter part1.rar", "old.rar"} <= picked
+    assert {"movie.7z.002", "book.zip.002", "rarset.part02.rar", "old.r00"}.isdisjoint(picked)
+    assert is_archive_name("anything.001")
+    assert not is_archive_name("anything.002")
 
 def test_drive_mount_download_and_upload(tmp_path, monkeypatch):
     mount = tmp_path / "MyDrive"
