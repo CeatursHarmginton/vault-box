@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 
 from ..jobs.progress import JobState
-from ..providers.base import ProviderFailure
+from ..providers.base import ProviderFailure, safe_name
 
 ARCHIVE_EXTS = (".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".iso")
 
@@ -65,6 +65,20 @@ def _copy_to_output(path: Path, input_dir: Path, output_dir: Path) -> Path:
     shutil.copy2(path, dest)
     return dest
 
+def _archive_output_dir(archive: Path, input_dir: Path, output_dir: Path) -> Path:
+    name = archive.name
+    m = re.search(r"^(.*)\.part0*1\.rar$", name, re.I)
+    base = m.group(1) if m else name
+    if not m:
+        m = re.search(r"^(.*)\.\d{3}$", name, re.I)
+        base = Path(m.group(1)).stem if m else base
+    if not m:
+        for suffix in (".tar.gz", ".tar.bz2", ".tar.xz", ".zip", ".7z", ".rar", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".iso"):
+            if base.lower().endswith(suffix):
+                base = base[:-len(suffix)]
+                break
+    return output_dir / archive.parent.relative_to(input_dir) / safe_name(base)
+
 def _extract_cmd(tool: str, archive: Path, output_dir: Path, pw: str | None) -> list[str]:
     if tool == "unrar":
         return ["unrar", "x", "-o+", f"-p{pw}" if pw else "-p-", str(archive), str(output_dir)]
@@ -103,7 +117,9 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
     for i, archive in enumerate(found, 1):
         progress.check_cancelled()
         progress.set(step="extracting", current_file=archive.name)
-        before = {p for p in output_dir.rglob("*") if p.is_file()}
+        extract_dir = _archive_output_dir(archive, input_dir, output_dir)
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        before = {p for p in extract_dir.rglob("*") if p.is_file()}
 
         extracted = False
         last_error_text = ""
@@ -115,7 +131,7 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
             for tool in tools:
                 progress.log(f"Trying {tool}: {archive.name}")
                 for pw in pw_candidates:
-                    proc = await asyncio.create_subprocess_exec(*_extract_cmd(tool, archive, output_dir, pw), stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                    proc = await asyncio.create_subprocess_exec(*_extract_cmd(tool, archive, extract_dir, pw), stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
                     out, _ = await proc.communicate()
                     text = out.decode(errors="ignore")
                     if proc.returncode == 0:
@@ -134,7 +150,7 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
             originals = _archive_originals(archive)
             keep_originals.extend(_copy_to_output(p, input_dir, output_dir) for p in originals if p.is_file())
             progress.log(f"[SKIP] Extract failed, uploading original archive: {archive.name} ({last_error_text[-160:]})")
-            for p in set(output_dir.rglob("*")) - before:
+            for p in set(extract_dir.rglob("*")) - before:
                 if p.is_file() and p not in keep_originals:
                     p.unlink(missing_ok=True)
             progress.progress.extract = i / total * 100

@@ -113,7 +113,8 @@ def test_extract_mixed_success_and_fallback_are_staged_together(tmp_path, monkey
     async def fake_exec(*args, **kwargs):
         archive = Path(args[-1])
         if archive.name == "good.zip":
-            (output_dir / "good.jpg").write_text("ok")
+            out_arg = next(arg for arg in args if str(arg).startswith("-o"))
+            (Path(str(out_arg)[2:]) / "good.jpg").write_text("ok")
             return Proc(0)
         return Proc(2)
 
@@ -122,7 +123,33 @@ def test_extract_mixed_success_and_fallback_are_staged_together(tmp_path, monkey
 
     out = asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, JobState("mixed", {}), ["bad"]))
 
-    assert {p.relative_to(output_dir).as_posix() for p in out} == {"good.jpg", "bad.part01.rar", "bad.part02.rar", "note.txt"}
+    assert {p.relative_to(output_dir).as_posix() for p in out} == {"good/good.jpg", "bad.part01.rar", "bad.part02.rar", "note.txt"}
+
+def test_archive_extract_keeps_parent_folder_and_archive_folder(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    (input_dir / "testA").mkdir(parents=True)
+    (input_dir / "testA" / "testZip.rar").write_text("x")
+    (input_dir / "testA" / "img1.png").write_text("ok")
+
+    class Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", None
+
+    async def fake_exec(*args, **kwargs):
+        target = Path(args[-1]) if args[0] == "unrar" else Path(next(arg for arg in args if str(arg).startswith("-o"))[2:])
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "unzipped.png").write_text("ok")
+        return Proc()
+
+    monkeypatch.setattr(extractor_mod.shutil, "which", lambda name: name)
+    monkeypatch.setattr(extractor_mod.asyncio, "create_subprocess_exec", fake_exec)
+
+    out = asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, JobState("paths", {}), ["ok"]))
+
+    assert {p.relative_to(output_dir).as_posix() for p in out} == {"testA/testZip/unzipped.png", "testA/img1.png"}
 
 def test_extract_without_archives_stages_input_files(tmp_path, monkeypatch):
     input_dir = tmp_path / "input"
