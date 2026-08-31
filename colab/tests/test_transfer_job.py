@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from pathlib import Path
@@ -169,6 +170,54 @@ def test_drive_api_upload_uses_resumable_endpoint(monkeypatch, tmp_path):
     assert out["id"] == "file1"
     assert calls == [("POST", f"{drive_mod.DRIVE_UPLOAD_API}/files"), ("PUT", "https://upload.test/session")]
 
+def test_drive_api_upload_preserves_relative_parent(monkeypatch, tmp_path):
+    seen = {}
+
+    class Response:
+        status_code = 200
+        headers = {"Location": "https://upload.test/session"}
+        text = ""
+
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            if method == "GET":
+                return Response({"files": []})
+            if url == f"{drive_mod.DRIVE_API}/files":
+                seen["created"] = kwargs["json"]
+                return Response({"id": "folderA-id", "name": "folderA"})
+            seen["uploaded"] = json.loads(kwargs["content"])
+            return Response()
+
+        async def put(self, url, **kwargs):
+            return Response({"id": "file1", "name": "image1.jpg"})
+
+    monkeypatch.setattr(drive_mod.httpx, "AsyncClient", Client)
+    path = tmp_path / "image1.jpg"
+    path.write_text("ok")
+
+    out = asyncio.run(DriveProvider().upload_file({"access_token": "A", "mount": False}, path, {"id": "root", "relative_path": "folderA/image1.jpg"}, JobState("drive-api-folder", {})))
+
+    assert out["id"] == "file1"
+    assert seen["created"]["name"] == "folderA"
+    assert seen["created"]["parents"] == ["root"]
+    assert seen["uploaded"]["name"] == "image1.jpg"
+    assert seen["uploaded"]["parents"] == ["folderA-id"]
+
 def test_drive_web_session_validate_does_not_call_api(tmp_path):
     out = asyncio.run(DriveProvider().validate_credentials({
         "access_token": "SAPISIDHASH old",
@@ -259,6 +308,54 @@ def test_drive_web_session_upload_maps_slash_to_root(monkeypatch, tmp_path):
 
     assert out["id"] == "file1"
     assert b'"parents": [{"id": "root"}]' in seen["body"]
+
+def test_drive_web_session_upload_preserves_relative_parent(monkeypatch, tmp_path):
+    seen = {}
+
+    class Response:
+        status_code = 200
+        headers = {}
+        text = ""
+
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, **kwargs):
+            return Response({"items": []})
+
+        async def post(self, url, **kwargs):
+            if url == f"{drive_mod.DRIVE_WEB_FILES_API}/files":
+                seen["created"] = kwargs["json"]
+                return Response({"id": "folderA-id", "title": "folderA"})
+            seen["body"] = kwargs["content"]
+            return Response({"id": "file1", "title": "image1.jpg"})
+
+    monkeypatch.setattr(drive_mod.httpx, "AsyncClient", Client)
+    path = tmp_path / "image1.jpg"
+    path.write_text("ok")
+
+    out = asyncio.run(DriveProvider().upload_file({
+        "access_token": "SAPISIDHASH old",
+        "cookies": {"SAPISID": "s"},
+    }, path, {"id": "root", "relative_path": "folderA/image1.jpg"}, JobState("drive-web-folder", {})))
+
+    assert out["id"] == "file1"
+    assert seen["created"]["title"] == "folderA"
+    assert seen["created"]["parents"] == [{"id": "root"}]
+    assert b'"parents": [{"id": "folderA-id"}]' in seen["body"]
 
 class OneFileFolderSource:
     async def download_folder(self, credentials, folder_ref, local_dir: Path, progress: JobState):

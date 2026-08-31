@@ -8,7 +8,7 @@ import os
 import shutil
 import time
 import asyncio
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlencode
 
@@ -19,6 +19,7 @@ from ..jobs.progress import JobState
 
 DRIVE_API = "https://www.googleapis.com/drive/v3"
 DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
+DRIVE_WEB_FILES_API = "https://clients6.google.com/drive/v2internal"
 DRIVE_WEB_UPLOAD_API = "https://clients6.google.com/upload/drive/v2internal"
 DRIVE_USERCONTENT = "https://drive.usercontent.google.com"
 DRIVE_WEB_ORIGIN = "https://drive.google.com"
@@ -27,6 +28,14 @@ FIELDS = "id,name,mimeType,size,parents,webContentLink,webViewLink"
 CHUNK = 8 * 1024 * 1024
 WEB_MULTIPART_MAX = 5 * 1024 * 1024
 DRIVE_MOUNT = Path(os.environ.get("COLAB_DRIVE_MOUNT", "/content/drive/MyDrive"))
+
+def _q_escape(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace("'", "\\'")
+
+def _relative_folder_parts(relative_path: str) -> list[str]:
+    rel = str(relative_path or "").replace("\\", "/").strip("/")
+    parent = PurePosixPath(rel).parent
+    return [safe_name(part) for part in parent.parts if part and part not in (".", "..")]
 
 class DriveProvider(BaseProvider):
     name = "drive"
@@ -199,8 +208,9 @@ class DriveProvider(BaseProvider):
             return {"id": dest.relative_to(DRIVE_MOUNT).as_posix(), "name": dest.name, "path": dest.relative_to(DRIVE_MOUNT).as_posix()}
         if self._web_session(credentials):
             return await self._web_upload_file(credentials, local_path, target_ref, progress)
-        parent = self._api_parent(target_ref)
-        name = Path(target_ref.get("relative_path") or local_path.name).name
+        rel = str(target_ref.get("relative_path") or local_path.name)
+        parent = await self._api_ensure_relative_parent(credentials, self._api_parent(target_ref), rel)
+        name = PurePosixPath(rel.replace("\\", "/")).name
         size = local_path.stat().st_size
         mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
         progress.set(step="uploading", current_file=name)
@@ -232,6 +242,19 @@ class DriveProvider(BaseProvider):
                 offset = next_offset
         raise ProviderFailure("UPLOAD_FAILED", "Drive upload ended early")
 
+    async def _api_ensure_relative_parent(self, credentials: dict[str, Any], parent: str, relative_path: str) -> str:
+        current = parent or "root"
+        for part in _relative_folder_parts(relative_path):
+            query = f"'{_q_escape(current)}' in parents and name='{_q_escape(part)}' and mimeType='{FOLDER_MIME}' and trashed=false"
+            resp = await self._request(credentials, "GET", f"{DRIVE_API}/files", params={"q": query, "fields": "files(id,name)", "supportsAllDrives": "true", "includeItemsFromAllDrives": "true", "pageSize": "1"})
+            match = next(iter(resp.json().get("files") or []), None)
+            if match:
+                current = str(match["id"])
+                continue
+            created = await self._request(credentials, "POST", f"{DRIVE_API}/files", params={"fields": FIELDS, "supportsAllDrives": "true"}, json={"name": part, "mimeType": FOLDER_MIME, "parents": [current]})
+            current = str(created.json().get("id") or "")
+        return current
+
     async def _web_download_info(self, credentials: dict[str, Any], file_id: str) -> dict[str, Any]:
         params = {"id": file_id, "authuser": str(credentials.get("authuser") or "0"), "export": "download"}
         headers = self._web_headers(credentials, {
@@ -261,8 +284,9 @@ class DriveProvider(BaseProvider):
 
     async def _web_upload_file(self, credentials: dict[str, Any], local_path: Path, target_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:
         size = local_path.stat().st_size
-        parent = self._api_parent(target_ref)
-        name = Path(target_ref.get("relative_path") or local_path.name).name
+        rel = str(target_ref.get("relative_path") or local_path.name)
+        parent = await self._web_ensure_relative_parent(credentials, self._api_parent(target_ref), rel)
+        name = PurePosixPath(rel.replace("\\", "/")).name
         mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
         if size > WEB_MULTIPART_MAX:
             return await self._web_upload_resumable(credentials, local_path, parent, name, mime, progress)
@@ -294,6 +318,30 @@ class DriveProvider(BaseProvider):
         progress.add_bytes(size, size, "upload", str(local_path))
         data = resp.json()
         return {"id": data.get("id"), "name": data.get("title") or data.get("name") or name}
+
+    async def _web_ensure_relative_parent(self, credentials: dict[str, Any], parent: str, relative_path: str) -> str:
+        current = parent or "root"
+        key = self._web_key(credentials)
+        params_base = {"supportsTeamDrives": "true", **({"key": key} if key else {})}
+        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+            for part in _relative_folder_parts(relative_path):
+                query = f"'{_q_escape(current)}' in parents and title='{_q_escape(part)}' and mimeType='{FOLDER_MIME}' and trashed = false"
+                resp = await client.get(f"{DRIVE_WEB_FILES_API}/files", params={**params_base, "q": query, "fields": "items(id,title,mimeType)"}, headers=self._web_headers(credentials))
+                if resp.status_code in (401, 403):
+                    raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked")
+                if resp.status_code >= 400:
+                    raise ProviderFailure("UPLOAD_FAILED", resp.text[:500], {"status": resp.status_code})
+                match = next(iter(resp.json().get("items") or []), None)
+                if match:
+                    current = str(match.get("id") or "")
+                    continue
+                resp = await client.post(f"{DRIVE_WEB_FILES_API}/files", params={**params_base, "fields": "id,title,mimeType,parents"}, headers=self._web_headers(credentials), json={"title": part, "mimeType": FOLDER_MIME, "parents": [{"id": current}]})
+                if resp.status_code in (401, 403):
+                    raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked")
+                if resp.status_code >= 400:
+                    raise ProviderFailure("UPLOAD_FAILED", resp.text[:500], {"status": resp.status_code})
+                current = str(resp.json().get("id") or "")
+        return current
 
     async def _web_upload_resumable(self, credentials: dict[str, Any], local_path: Path, parent: str, name: str, mime: str, progress: JobState) -> dict[str, Any]:
         size = local_path.stat().st_size
