@@ -205,6 +205,15 @@ def test_drive_mount_source_id_without_token_fails_with_path_hint(tmp_path, monk
     else:
         raise AssertionError("expected SOURCE_FILE_NOT_FOUND")
 
+def test_provider_folder_locks_are_loop_local():
+    async def lock(provider):
+        return provider._lock()
+
+    for provider in (DriveProvider(), TeraBoxProvider()):
+        first = asyncio.run(lock(provider))
+        second = asyncio.run(lock(provider))
+        assert first is not second
+
 def test_drive_api_mode_validate_does_not_require_mount(monkeypatch, tmp_path):
     monkeypatch.setattr(drive_mod, "DRIVE_MOUNT", tmp_path / "missing")
 

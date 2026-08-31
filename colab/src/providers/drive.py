@@ -41,7 +41,15 @@ class DriveProvider(BaseProvider):
     name = "drive"
 
     def __init__(self) -> None:
-        self._folder_lock = asyncio.Lock()
+        self._folder_lock: asyncio.Lock | None = None
+        self._folder_lock_loop: asyncio.AbstractEventLoop | None = None
+
+    def _lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        if self._folder_lock is None or self._folder_lock_loop is not loop:
+            self._folder_lock = asyncio.Lock()
+            self._folder_lock_loop = loop
+        return self._folder_lock
 
     def _mounted(self) -> bool:
         return DRIVE_MOUNT.exists() and DRIVE_MOUNT.is_dir()
@@ -247,7 +255,7 @@ class DriveProvider(BaseProvider):
 
     async def _api_ensure_relative_parent(self, credentials: dict[str, Any], parent: str, relative_path: str) -> str:
         # ponytail: one Drive folder lock; use per-parent locks if folder creation throughput matters.
-        async with self._folder_lock:
+        async with self._lock():
             current = parent or "root"
             for part in _relative_folder_parts(relative_path):
                 query = f"'{_q_escape(current)}' in parents and name='{_q_escape(part)}' and mimeType='{FOLDER_MIME}' and trashed=false"
@@ -326,7 +334,7 @@ class DriveProvider(BaseProvider):
 
     async def _web_ensure_relative_parent(self, credentials: dict[str, Any], parent: str, relative_path: str) -> str:
         # ponytail: one Drive folder lock; use per-parent locks if folder creation throughput matters.
-        async with self._folder_lock:
+        async with self._lock():
             current = parent or "root"
             key = self._web_key(credentials)
             params_base = {"supportsTeamDrives": "true", **({"key": key} if key else {})}

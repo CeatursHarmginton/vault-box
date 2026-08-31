@@ -132,7 +132,15 @@ class TeraBoxProvider(BaseProvider):
     name = "terabox"
 
     def __init__(self) -> None:
-        self._folder_lock = asyncio.Lock()
+        self._folder_lock: asyncio.Lock | None = None
+        self._folder_lock_loop: asyncio.AbstractEventLoop | None = None
+
+    def _lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        if self._folder_lock is None or self._folder_lock_loop is not loop:
+            self._folder_lock = asyncio.Lock()
+            self._folder_lock_loop = loop
+        return self._folder_lock
 
     async def validate_credentials(self, credentials: dict[str, Any]) -> dict[str, Any]:
         s = TeraBoxSession(credentials)
@@ -175,7 +183,7 @@ class TeraBoxProvider(BaseProvider):
 
     async def _ensure_relative_parent(self, s: TeraBoxSession, parent: str, relative_path: str) -> str:
         # ponytail: one provider-wide lock; use per-parent locks if folder creation throughput matters.
-        async with self._folder_lock:
+        async with self._lock():
             current = parent.rstrip("/") or "/"
             for part in [p for p in Path(relative_path).parent.as_posix().split("/") if p and p != "."]:
                 next_path = await self._find_child_folder(s, current, part)
