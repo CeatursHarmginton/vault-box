@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import TestCase
 
 from src.jobs.progress import JobState
+from src.extract import extractor as extractor_mod
 from src.extract.extractor import archives, is_archive_name
 from src.jobs.transfer_job import run_transfer
 from src.providers import PROVIDERS
@@ -43,6 +44,30 @@ def test_archive_detection_supports_common_and_split_formats(tmp_path):
     assert {"movie.7z.002", "book.zip.002", "rarset.part02.rar", "old.r00"}.isdisjoint(picked)
     assert is_archive_name("anything.001")
     assert not is_archive_name("anything.002")
+
+def test_extract_failure_falls_back_to_original_archive_files(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    (input_dir / "broken.part01.rar").write_text("x")
+    (input_dir / "broken.part02.rar").write_text("x")
+    (input_dir / "note.txt").write_text("ok")
+
+    class Proc:
+        returncode = 2
+
+        async def communicate(self):
+            return b"Wrong password", None
+
+    async def fake_exec(*args, **kwargs):
+        return Proc()
+
+    monkeypatch.setattr(extractor_mod.shutil, "which", lambda name: "7z")
+    monkeypatch.setattr(extractor_mod.asyncio, "create_subprocess_exec", fake_exec)
+
+    out = asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, JobState("extract-fail", {}), ["bad"]))
+
+    assert {p.name for p in out} == {"broken.part01.rar", "broken.part02.rar", "note.txt"}
 
 def test_drive_mount_download_and_upload(tmp_path, monkeypatch):
     mount = tmp_path / "MyDrive"

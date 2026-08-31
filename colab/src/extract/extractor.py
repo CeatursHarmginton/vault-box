@@ -31,6 +31,18 @@ def _is_first_volume(name: str) -> bool:
 def archives(root: Path) -> list[Path]:
     return [p for p in root.rglob("*") if p.is_file() and _is_first_volume(p.name)]
 
+def _archive_originals(first: Path) -> list[Path]:
+    name = first.name
+    m = re.search(r"^(.*)\.part0*1\.rar$", name, re.I)
+    if m:
+        return sorted(first.parent.glob(f"{m.group(1)}.part*.rar"))
+    m = re.search(r"^(.*)\.001$", name, re.I)
+    if m:
+        return sorted(p for p in first.parent.glob(f"{m.group(1)}.*") if re.search(r"\.\d{3}$", p.name))
+    if first.suffix.lower() == ".rar":
+        return [first, *sorted(first.parent.glob(f"{first.stem}.r[0-9][0-9]"))]
+    return [first]
+
 def _check_multipart(first: Path) -> None:
     m = re.search(r"^(.*)\.part0*1\.rar$", first.name, re.I)
     if not m:
@@ -52,6 +64,8 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
         return [p for p in input_dir.rglob("*") if p.is_file()]
     output_dir.mkdir(parents=True, exist_ok=True)
     total = len(found)
+    archive_originals = {p for archive in found for p in _archive_originals(archive)}
+    keep_originals: list[Path] = []
 
     # Build candidates
     pw_candidates: list[str | None] = []
@@ -70,42 +84,49 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
 
     for i, archive in enumerate(found, 1):
         progress.check_cancelled()
-        _check_multipart(archive)
         progress.set(step="extracting", current_file=archive.name)
+        before = {p for p in output_dir.rglob("*") if p.is_file()}
 
         extracted = False
         last_error_text = ""
-        if len(pw_candidates) > 1:
-            progress.log(f"Archive password candidates: {len(pw_candidates) - 1}; trying all, then no-password fallback")
-        for attempt, pw in enumerate(pw_candidates):
-            cmd = ["7z", "x", "-y", f"-o{output_dir}", str(archive)]
-            if pw:
-                cmd.insert(2, f"-p{pw}")
-            proc = await asyncio.create_subprocess_exec(*cmd, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-            out, _ = await proc.communicate()
-            text = out.decode(errors="ignore")
-            if proc.returncode == 0:
-                extracted = True
+        try:
+            _check_multipart(archive)
+            if len(pw_candidates) > 1:
+                progress.log(f"Archive password candidates: {len(pw_candidates) - 1}; trying all, then no-password fallback")
+            for attempt, pw in enumerate(pw_candidates):
+                cmd = ["7z", "x", "-y", f"-o{output_dir}", str(archive)]
+                if pw:
+                    cmd.insert(2, f"-p{pw}")
+                proc = await asyncio.create_subprocess_exec(*cmd, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                out, _ = await proc.communicate()
+                text = out.decode(errors="ignore")
+                if proc.returncode == 0:
+                    extracted = True
+                    break
+                last_error_text = text
+                lowered = text.lower()
+                if "volume" in lowered and "missing" in lowered:
+                    raise ProviderFailure("ARCHIVE_PART_MISSING", text[-500:])
+                if attempt < len(pw_candidates) - 1:
+                    continue
                 break
-            last_error_text = text
-            lowered = text.lower()
-            if "wrong password" in lowered or "encrypted" in lowered or "cannot open encrypted" in lowered:
-                continue
-            if "volume" in lowered and "missing" in lowered:
-                raise ProviderFailure("ARCHIVE_PART_MISSING", text[-500:])
-            if attempt < len(pw_candidates) - 1:
-                continue
-            break
+        except ProviderFailure as exc:
+            last_error_text = exc.message
 
         if not extracted:
-            lowered = last_error_text.lower()
-            if "wrong password" in lowered or "encrypted" in lowered or "cannot open encrypted" in lowered:
-                raise ProviderFailure("ARCHIVE_PASSWORD_REQUIRED", "Archive password required or invalid")
-            if "volume" in lowered and "missing" in lowered:
-                raise ProviderFailure("ARCHIVE_PART_MISSING", last_error_text[-500:])
-            raise ProviderFailure("EXTRACT_FAILED", last_error_text[-500:] or "Failed to extract archive")
+            originals = _archive_originals(archive)
+            keep_originals.extend(p for p in originals if p.is_file() and p not in keep_originals)
+            progress.log(f"[SKIP] Extract failed, uploading original archive: {archive.name}")
+            for p in set(output_dir.rglob("*")) - before:
+                if p.is_file():
+                    p.unlink(missing_ok=True)
+            progress.progress.extract = i / total * 100
+            continue
 
         progress.progress.extract = i / total * 100
         if delete_archive:
-            archive.unlink(missing_ok=True)
-    return [p for p in output_dir.rglob("*") if p.is_file()]
+            for p in _archive_originals(archive):
+                p.unlink(missing_ok=True)
+    extracted_files = [p for p in output_dir.rglob("*") if p.is_file()]
+    passthrough = [p for p in input_dir.rglob("*") if p.is_file() and p not in archive_originals]
+    return extracted_files + passthrough + keep_originals
