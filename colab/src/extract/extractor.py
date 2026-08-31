@@ -75,11 +75,13 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
 
         extracted = False
         last_error_text = ""
-        for pw in pw_candidates:
+        if len(pw_candidates) > 1:
+            progress.log(f"Archive password candidates: {len(pw_candidates) - 1}; trying all, then no-password fallback")
+        for attempt, pw in enumerate(pw_candidates):
             cmd = ["7z", "x", "-y", f"-o{output_dir}", str(archive)]
             if pw:
                 cmd.insert(2, f"-p{pw}")
-            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            proc = await asyncio.create_subprocess_exec(*cmd, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             out, _ = await proc.communicate()
             text = out.decode(errors="ignore")
             if proc.returncode == 0:
@@ -91,6 +93,8 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
                 continue
             if "volume" in lowered and "missing" in lowered:
                 raise ProviderFailure("ARCHIVE_PART_MISSING", text[-500:])
+            if attempt < len(pw_candidates) - 1:
+                continue
             break
 
         if not extracted:
