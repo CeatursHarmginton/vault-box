@@ -13,6 +13,7 @@ from .config import PUBLIC_URL, SERVER_TOKEN
 from .jobs.job_manager import JobManager
 from .providers import PROVIDERS
 from .providers.base import ProviderFailure
+from .relay_client import start_colab_relay
 from .security import require_token
 
 app = FastAPI(title="VaultBox Colab Transfer Worker", version="2.0.0")
@@ -24,8 +25,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 manager = JobManager()
+relay_task: asyncio.Task | None = None
 DRIVE_MOUNT_PATH = Path("/content/drive/MyDrive")
 drive_mount_state: dict[str, Any] = {"status": "idle", "message": "", "mountPath": str(DRIVE_MOUNT_PATH)}
+
+@app.on_event("startup")
+async def startup() -> None:
+    global relay_task
+    relay_task = start_colab_relay(manager)
 
 def _drive_mounted() -> bool:
     return DRIVE_MOUNT_PATH.exists() and DRIVE_MOUNT_PATH.is_dir()
