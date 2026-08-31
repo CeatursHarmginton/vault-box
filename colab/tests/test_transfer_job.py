@@ -68,6 +68,74 @@ def test_extract_failure_falls_back_to_original_archive_files(tmp_path, monkeypa
     out = asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, JobState("extract-fail", {}), ["bad"]))
 
     assert {p.name for p in out} == {"broken.part01.rar", "broken.part02.rar", "note.txt"}
+    assert all(p.is_relative_to(output_dir) for p in out)
+
+def test_rar_extract_prefers_unrar(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    (input_dir / "ok.rar").write_text("x")
+    calls = []
+
+    class Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", None
+
+    async def fake_exec(*args, **kwargs):
+        calls.append(args)
+        return Proc()
+
+    monkeypatch.setattr(extractor_mod.shutil, "which", lambda name: name)
+    monkeypatch.setattr(extractor_mod.asyncio, "create_subprocess_exec", fake_exec)
+
+    asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, JobState("rar-unrar", {}), ["ok"]))
+
+    assert calls[0][0] == "unrar"
+
+def test_extract_mixed_success_and_fallback_are_staged_together(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    (input_dir / "good.zip").write_text("x")
+    (input_dir / "bad.part01.rar").write_text("x")
+    (input_dir / "bad.part02.rar").write_text("x")
+    (input_dir / "note.txt").write_text("ok")
+
+    class Proc:
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+        async def communicate(self):
+            return (b"" if self.returncode == 0 else b"Wrong password"), None
+
+    async def fake_exec(*args, **kwargs):
+        archive = Path(args[-1])
+        if archive.name == "good.zip":
+            (output_dir / "good.jpg").write_text("ok")
+            return Proc(0)
+        return Proc(2)
+
+    monkeypatch.setattr(extractor_mod.shutil, "which", lambda name: "7z" if name == "7z" else None)
+    monkeypatch.setattr(extractor_mod.asyncio, "create_subprocess_exec", fake_exec)
+
+    out = asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, JobState("mixed", {}), ["bad"]))
+
+    assert {p.relative_to(output_dir).as_posix() for p in out} == {"good.jpg", "bad.part01.rar", "bad.part02.rar", "note.txt"}
+
+def test_extract_without_archives_stages_input_files(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    (input_dir / "folder").mkdir()
+    (input_dir / "folder" / "note.txt").write_text("ok")
+
+    monkeypatch.setattr(extractor_mod.shutil, "which", lambda name: "7z")
+
+    out = asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, JobState("plain", {}), None))
+
+    assert [p.relative_to(output_dir).as_posix() for p in out] == ["folder/note.txt"]
 
 def test_drive_mount_download_and_upload(tmp_path, monkeypatch):
     mount = tmp_path / "MyDrive"

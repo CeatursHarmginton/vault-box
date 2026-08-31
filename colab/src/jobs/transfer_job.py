@@ -89,7 +89,8 @@ async def run_transfer(job: JobState) -> None:
         if options.get("extract"):
             pws = options.get("archive_passwords") or options.get("archivePasswords") or options.get("archivePassword") or options.get("archive_password")
             outputs = await extract_archives(dirs["input"], dirs["output"], job, pws, bool(options.get("deleteArchiveAfterExtract")))
-            out_root = dirs["output"] if any(p.is_relative_to(dirs["output"]) for p in outputs) else dirs["input"]
+            out_root = dirs["output"]
+            job.log(f"Extract stage output files: {len(outputs)}")
 
         if options.get("optimize_image"):
             job.set(step="optimizing")

@@ -56,12 +56,30 @@ def _check_multipart(first: Path) -> None:
     if idx == 1:
         raise ProviderFailure("ARCHIVE_PART_MISSING", f"Missing multipart RAR first part near {first.name}")
 
+def _is_rar(first: Path) -> bool:
+    return first.suffix.lower() == ".rar"
+
+def _copy_to_output(path: Path, input_dir: Path, output_dir: Path) -> Path:
+    dest = output_dir / path.relative_to(input_dir)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, dest)
+    return dest
+
+def _extract_cmd(tool: str, archive: Path, output_dir: Path, pw: str | None) -> list[str]:
+    if tool == "unrar":
+        return ["unrar", "x", "-o+", f"-p{pw}" if pw else "-p-", str(archive), str(output_dir)]
+    cmd = ["7z", "x", "-y", f"-o{output_dir}", str(archive)]
+    if pw:
+        cmd.insert(2, f"-p{pw}")
+    return cmd
+
 async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState, password: str | list[str] | None = None, delete_archive: bool = False) -> list[Path]:
     if not shutil.which("7z"):
         raise ProviderFailure("EXTRACT_FAILED", "7z not installed. In Colab run: apt-get install -y p7zip-full unrar")
     found = archives(input_dir)
     if not found:
-        return [p for p in input_dir.rglob("*") if p.is_file()]
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return [_copy_to_output(p, input_dir, output_dir) for p in input_dir.rglob("*") if p.is_file()]
     output_dir.mkdir(parents=True, exist_ok=True)
     total = len(found)
     archive_originals = {p for archive in found for p in _archive_originals(archive)}
@@ -93,32 +111,31 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
             _check_multipart(archive)
             if len(pw_candidates) > 1:
                 progress.log(f"Archive password candidates: {len(pw_candidates) - 1}; trying all, then no-password fallback")
-            for attempt, pw in enumerate(pw_candidates):
-                cmd = ["7z", "x", "-y", f"-o{output_dir}", str(archive)]
-                if pw:
-                    cmd.insert(2, f"-p{pw}")
-                proc = await asyncio.create_subprocess_exec(*cmd, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-                out, _ = await proc.communicate()
-                text = out.decode(errors="ignore")
-                if proc.returncode == 0:
-                    extracted = True
+            tools = (["unrar"] if _is_rar(archive) and shutil.which("unrar") else []) + ["7z"]
+            for tool in tools:
+                progress.log(f"Trying {tool}: {archive.name}")
+                for pw in pw_candidates:
+                    proc = await asyncio.create_subprocess_exec(*_extract_cmd(tool, archive, output_dir, pw), stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                    out, _ = await proc.communicate()
+                    text = out.decode(errors="ignore")
+                    if proc.returncode == 0:
+                        extracted = True
+                        break
+                    last_error_text = text
+                    lowered = text.lower()
+                    if "volume" in lowered and "missing" in lowered:
+                        raise ProviderFailure("ARCHIVE_PART_MISSING", text[-500:])
+                if extracted:
                     break
-                last_error_text = text
-                lowered = text.lower()
-                if "volume" in lowered and "missing" in lowered:
-                    raise ProviderFailure("ARCHIVE_PART_MISSING", text[-500:])
-                if attempt < len(pw_candidates) - 1:
-                    continue
-                break
         except ProviderFailure as exc:
             last_error_text = exc.message
 
         if not extracted:
             originals = _archive_originals(archive)
-            keep_originals.extend(p for p in originals if p.is_file() and p not in keep_originals)
-            progress.log(f"[SKIP] Extract failed, uploading original archive: {archive.name}")
+            keep_originals.extend(_copy_to_output(p, input_dir, output_dir) for p in originals if p.is_file())
+            progress.log(f"[SKIP] Extract failed, uploading original archive: {archive.name} ({last_error_text[-160:]})")
             for p in set(output_dir.rglob("*")) - before:
-                if p.is_file():
+                if p.is_file() and p not in keep_originals:
                     p.unlink(missing_ok=True)
             progress.progress.extract = i / total * 100
             continue
@@ -127,6 +144,7 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
         if delete_archive:
             for p in _archive_originals(archive):
                 p.unlink(missing_ok=True)
-    extracted_files = [p for p in output_dir.rglob("*") if p.is_file()]
-    passthrough = [p for p in input_dir.rglob("*") if p.is_file() and p not in archive_originals]
-    return extracted_files + passthrough + keep_originals
+    for p in input_dir.rglob("*"):
+        if p.is_file() and p not in archive_originals:
+            _copy_to_output(p, input_dir, output_dir)
+    return [p for p in output_dir.rglob("*") if p.is_file()]
