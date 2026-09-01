@@ -5,6 +5,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import TestCase
 from PIL import Image
 from src.utils import image_optimizer
@@ -14,6 +15,8 @@ class MockJobState:
     def __init__(self) -> None:
         self.logs: list[str] = []
         self.current_file: str = ""
+        self.progress = SimpleNamespace(optimize=0)
+        self.updated_at = 0.0
 
     def set(self, **kwargs) -> None:
         if "current_file" in kwargs:
@@ -99,6 +102,25 @@ class ImageOptimizerTests(TestCase):
 
         self.assertEqual([r["name"] for r in results], ["0.jpg", "1.jpg", "2.jpg", "3.jpg"])
         self.assertGreater(len(seen), 1)
+
+    def test_optimize_directory_updates_optimize_progress(self) -> None:
+        for i in range(3):
+            (self.src_dir / f"{i}.jpg").write_bytes(b"x")
+
+        old = image_optimizer.optimize_image_file
+        def fake_optimize(src_path, dest_dir, options, adaptive_quality):
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            out = dest_dir / src_path.name
+            out.write_bytes(b"x")
+            return out, adaptive_quality, "ok"
+        image_optimizer.optimize_image_file = fake_optimize
+        try:
+            job = MockJobState()
+            optimize_directory(self.src_dir, self.dest_dir, {"optimize_workers": 1}, job)
+        finally:
+            image_optimizer.optimize_image_file = old
+
+        self.assertEqual(job.progress.optimize, 100)
 
     def test_auto_size_worker_override_still_resets_quality_per_folder(self) -> None:
         for rel in ("a/1.jpg", "a/2.jpg", "b/1.jpg"):

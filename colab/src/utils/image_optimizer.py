@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import logging
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import groupby
 from pathlib import Path
@@ -222,6 +223,12 @@ def optimize_directory(
     total_images = len(images)
     processed = 0
     workers = _optimize_workers(options, total_images) if total_images else 1
+
+    def set_optimize_progress(done: int) -> None:
+        if total_images and hasattr(job_state, "progress"):
+            setattr(job_state.progress, "optimize", min(100, done / total_images * 100))
+            job_state.updated_at = time.time()
+
     if workers > 1 and not options.get("auto_size", True):
         job_state.log(f"[TỐI ƯU] Xử lý song song: {workers} worker(s)")
 
@@ -247,6 +254,8 @@ def optimize_directory(
             for future in as_completed(futures):
                 index, item = future.result()
                 ordered[index] = item
+                processed += 1
+                set_optimize_progress(processed)
         results.extend(item for item in ordered if item is not None)
 
         for p in non_images:
@@ -290,6 +299,7 @@ def optimize_directory(
                 "status": status,
                 "quality": final_q
             })
+            set_optimize_progress(current)
         return group_results
 
     if workers > 1 and len(folder_groups) > 1:
