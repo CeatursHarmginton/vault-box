@@ -31,16 +31,20 @@ def _is_first_volume(name: str) -> bool:
 def archives(root: Path) -> list[Path]:
     return [p for p in root.rglob("*") if p.is_file() and _is_first_volume(p.name)]
 
+def _matching_siblings(first: Path, pattern: str) -> list[Path]:
+    rx = re.compile(pattern, re.I)
+    return sorted(p for p in first.parent.iterdir() if p.is_file() and rx.match(p.name))
+
 def _archive_originals(first: Path) -> list[Path]:
     name = first.name
     m = re.search(r"^(.*)\.part0*1\.rar$", name, re.I)
     if m:
-        return sorted(first.parent.glob(f"{m.group(1)}.part*.rar"))
+        return _matching_siblings(first, rf"^{re.escape(m.group(1))}\.part\d+\.rar$")
     m = re.search(r"^(.*)\.001$", name, re.I)
     if m:
-        return sorted(p for p in first.parent.glob(f"{m.group(1)}.*") if re.search(r"\.\d{3}$", p.name))
+        return _matching_siblings(first, rf"^{re.escape(m.group(1))}\.\d{{3}}$")
     if first.suffix.lower() == ".rar":
-        return [first, *sorted(first.parent.glob(f"{first.stem}.r[0-9][0-9]"))]
+        return [first, *_matching_siblings(first, rf"^{re.escape(first.stem)}\.r\d\d$")]
     return [first]
 
 def _check_multipart(first: Path) -> None:
@@ -48,12 +52,12 @@ def _check_multipart(first: Path) -> None:
     if not m:
         return
     prefix = m.group(1)
-    siblings = {p.name.lower() for p in first.parent.glob(f"{prefix}.part*.rar")}
-    idx = 1
-    while f"{prefix}.part{idx}.rar".lower() in siblings or f"{prefix}.part{idx:02d}.rar".lower() in siblings:
-        idx += 1
-    # 7z catches most missing middle parts too; this catches obvious single-part gaps.
-    if idx == 1:
+    numbers = []
+    for p in _matching_siblings(first, rf"^{re.escape(prefix)}\.part\d+\.rar$"):
+        part = re.search(r"\.part(\d+)\.rar$", p.name, re.I)
+        if part:
+            numbers.append(int(part.group(1)))
+    if 1 not in numbers:
         raise ProviderFailure("ARCHIVE_PART_MISSING", f"Missing multipart RAR first part near {first.name}")
 
 def _is_rar(first: Path) -> bool:

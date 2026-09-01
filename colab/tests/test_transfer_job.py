@@ -47,6 +47,32 @@ def test_archive_detection_supports_common_and_split_formats(tmp_path):
     assert is_archive_name("anything.001")
     assert not is_archive_name("anything.002")
 
+def test_multipart_rar_with_glob_chars_does_not_fail_precheck(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    archive = input_dir / "[XR Unc3ns0red] name.part1.rar"
+    archive.write_text("x")
+
+    class Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", None
+
+    async def fake_exec(*args, **kwargs):
+        target = Path(args[-1]) if args[0] == "unrar" else Path(next(arg for arg in args if str(arg).startswith("-o"))[2:])
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "ok.jpg").write_text("ok")
+        return Proc()
+
+    monkeypatch.setattr(extractor_mod.shutil, "which", lambda name: name)
+    monkeypatch.setattr(extractor_mod.asyncio, "create_subprocess_exec", fake_exec)
+
+    out = asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, JobState("globchars", {}), None))
+
+    assert [p.relative_to(output_dir).as_posix() for p in out] == ["[XR Unc3ns0red] name/ok.jpg"]
+
 def test_extract_failure_falls_back_to_original_archive_files(tmp_path, monkeypatch):
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"
