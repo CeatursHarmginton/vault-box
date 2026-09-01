@@ -204,7 +204,7 @@ def optimize_directory(
     for p in all_files:
         if p.suffix.lower() in IMAGE_EXTENSIONS:
             images.append(p)
-        elif p.suffix.lower() not in VIDEO_EXTENSIONS:
+        else:
             non_images.append(p)
             
     # Group images by folder, sort by folder path, then by size within each folder

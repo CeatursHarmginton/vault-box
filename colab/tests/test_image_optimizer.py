@@ -66,7 +66,7 @@ class ImageOptimizerTests(TestCase):
         # Verify non-image copied as-is
         self.assertTrue((self.dest_dir / "test.txt").exists())
         self.assertEqual((self.dest_dir / "test.txt").read_text(encoding="utf-8"), "Hello World")
-        self.assertFalse((self.dest_dir / "clip.mp4").exists())
+        self.assertTrue((self.dest_dir / "clip.mp4").exists())
 
         # Verify images processed and sorted by size (small.jpg is smaller, so it's first)
         self.assertEqual(len(results), 2)

@@ -87,8 +87,7 @@ async def run_transfer(job: JobState) -> None:
         out_root = dirs["input"]
         outputs = downloaded
         if options.get("extract"):
-            pws = options.get("archive_passwords") or options.get("archivePasswords") or options.get("archivePassword") or options.get("archive_password")
-            outputs = await extract_archives(dirs["input"], dirs["output"], job, pws, bool(options.get("deleteArchiveAfterExtract")))
+            outputs = await extract_archives(dirs["input"], dirs["output"], job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
             out_root = dirs["output"]
             job.log(f"Extract stage output files: {len(outputs)}")
 
@@ -202,10 +201,17 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         _validate_downloads(downloaded, batch_input)
         job.log(f"Downloaded files: {len(downloaded)}")
 
+        optimize_input = batch_input
+        if options.get("extract"):
+            batch_extract = dirs["output"] / f"batch-{index}" / "extracted"
+            outputs = await extract_archives(batch_input, batch_extract, job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
+            optimize_input = batch_extract
+            job.log(f"Extract stage output files: {len(outputs)}")
+
         job.set(step="optimizing")
         job.log(f"Starting image optimization: {_item_name(item)}")
         batch_results = await asyncio.to_thread(
-            optimize_directory, batch_input, batch_output, options, job,
+            optimize_directory, optimize_input, batch_output, options, job,
             cancel_check=job.check_cancelled,
         )
         job.optimized_files.extend(batch_results)
@@ -355,6 +361,9 @@ def _queue_item_ref(source: dict[str, Any], item: dict[str, Any]) -> dict[str, A
 
 def _is_video_item(item: dict[str, Any]) -> bool:
     return Path(str(item.get("name") or item.get("path") or item.get("id") or "")).suffix.lower() in VIDEO_EXTENSIONS
+
+def _archive_passwords(options: dict[str, Any]) -> Any:
+    return options.get("archive_passwords") or options.get("archivePasswords") or options.get("archivePassword") or options.get("archive_password")
 
 def _selected_folder_name(source: dict[str, Any]) -> str:
     folder = next((item for item in source.get("items") or [] if item.get("type") == "folder" or item.get("is_folder")), {})

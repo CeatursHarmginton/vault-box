@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -10,6 +11,7 @@ from unittest import TestCase
 from src.jobs.progress import JobState
 from src.extract import extractor as extractor_mod
 from src.extract.extractor import archives, is_archive_name
+from src.jobs import transfer_job as transfer_job_mod
 from src.jobs.transfer_job import run_transfer
 from src.providers import PROVIDERS
 from src.providers import base as base_mod
@@ -163,6 +165,54 @@ def test_extract_without_archives_stages_input_files(tmp_path, monkeypatch):
     out = asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, JobState("plain", {}), None))
 
     assert [p.relative_to(output_dir).as_posix() for p in out] == ["folder/note.txt"]
+
+def test_optimize_queue_unzip_fallback_uploads_archive_and_passwords(monkeypatch):
+    class Source:
+        async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
+            path = local_dir / file_ref["name"]
+            path.write_text("zip")
+            return path
+
+    dst = UploadRecorder()
+    old = dict(PROVIDERS)
+    seen_passwords = []
+
+    async def fake_extract(input_dir, output_dir, progress, password=None, delete_archive=False):
+        seen_passwords.append(password)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out = output_dir / next(input_dir.glob("*.zip")).name
+        out.write_text("zip")
+        return [out]
+
+    def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+        for path in input_dir.rglob("*"):
+            if path.is_file():
+                target = output_dir / path.relative_to(input_dir)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target)
+        return []
+
+    PROVIDERS.update({"fake-source": Source(), "fake-dst": dst})
+    monkeypatch.setattr(transfer_job_mod, "extract_archives", fake_extract)
+    monkeypatch.setattr(image_optimizer, "optimize_directory", fake_optimize)
+    try:
+        job = JobState("opt-unzip-fallback", {
+            "source": {"provider": "fake-source", "items": [
+                {"type": "file", "id": "a", "name": "a.zip"},
+                {"type": "file", "id": "b", "name": "b.zip"},
+            ]},
+            "target": {"provider": "fake-dst", "folder": {"id": "/", "path": "/"}},
+            "options": {"cleanupAfterFinish": False, "optimize_image": True, "extract": True, "archive_passwords": ["pw1", "pw2"], "replace": True},
+        })
+        asyncio.run(run_transfer(job))
+    finally:
+        PROVIDERS.clear()
+        PROVIDERS.update(old)
+        __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-unzip-fallback")
+
+    assert job.status == "completed", job.error
+    assert seen_passwords == [["pw1", "pw2"], ["pw1", "pw2"]]
+    assert [call[1].name for call in dst.calls] == ["a.zip", "b.zip"]
 
 def test_drive_mount_download_and_upload(tmp_path, monkeypatch):
     mount = tmp_path / "MyDrive"
