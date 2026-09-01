@@ -89,7 +89,9 @@ def _extract_cmd(tool: str, archive: Path, output_dir: Path, pw: str | None) -> 
 
 async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState, password: str | list[str] | None = None, delete_archive: bool = False) -> list[Path]:
     if not shutil.which("7z"):
-        raise ProviderFailure("EXTRACT_FAILED", "7z not installed. In Colab run: apt-get install -y p7zip-full unrar")
+        progress.log("[SKIP] 7z not installed, uploading original files without extract.")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return [_copy_to_output(p, input_dir, output_dir) for p in input_dir.rglob("*") if p.is_file()]
     found = archives(input_dir)
     if not found:
         output_dir.mkdir(parents=True, exist_ok=True)

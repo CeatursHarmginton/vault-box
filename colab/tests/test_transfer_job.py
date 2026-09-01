@@ -72,6 +72,17 @@ def test_extract_failure_falls_back_to_original_archive_files(tmp_path, monkeypa
     assert {p.name for p in out} == {"broken.part01.rar", "broken.part02.rar", "note.txt"}
     assert all(p.is_relative_to(output_dir) for p in out)
 
+def test_extract_missing_7z_falls_back_to_original_files(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    (input_dir / "a.zip").write_text("zip")
+
+    monkeypatch.setattr(extractor_mod.shutil, "which", lambda name: None)
+    out = asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, JobState("no-7z", {}), ["pw"]))
+
+    assert [p.relative_to(output_dir).as_posix() for p in out] == ["a.zip"]
+
 def test_rar_extract_prefers_unrar(tmp_path, monkeypatch):
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"

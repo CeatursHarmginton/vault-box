@@ -87,6 +87,7 @@ async def run_transfer(job: JobState) -> None:
         out_root = dirs["input"]
         outputs = downloaded
         if options.get("extract"):
+            job.log("Extract enabled: scanning downloaded files for archives...")
             outputs = await extract_archives(dirs["input"], dirs["output"], job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
             out_root = dirs["output"]
             job.log(f"Extract stage output files: {len(outputs)}")
@@ -203,6 +204,7 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
 
         optimize_input = batch_input
         if options.get("extract"):
+            job.log("Extract enabled: scanning downloaded files for archives...")
             batch_extract = dirs["output"] / f"batch-{index}" / "extracted"
             outputs = await extract_archives(batch_input, batch_extract, job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
             optimize_input = batch_extract
