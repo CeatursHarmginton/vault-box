@@ -132,6 +132,40 @@ def test_rar_extract_prefers_unrar(tmp_path, monkeypatch):
     asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, JobState("rar-unrar", {}), ["ok"]))
 
     assert calls[0][0] == "unrar"
+    assert "-p-" in calls[0]
+
+def test_extract_tries_no_password_before_candidates(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    (input_dir / "locked.zip").write_text("x")
+    calls = []
+
+    class Proc:
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+        async def communicate(self):
+            return (b"" if self.returncode == 0 else b"Wrong password"), None
+
+    async def fake_exec(*args, **kwargs):
+        calls.append(args)
+        out_arg = next(arg for arg in args if str(arg).startswith("-o"))
+        if not any(str(arg).startswith("-p") for arg in args):
+            return Proc(2)
+        Path(str(out_arg)[2:]).mkdir(parents=True, exist_ok=True)
+        (Path(str(out_arg)[2:]) / "ok.jpg").write_text("ok")
+        return Proc(0)
+
+    monkeypatch.setattr(extractor_mod.shutil, "which", lambda name: "7z")
+    monkeypatch.setattr(extractor_mod.asyncio, "create_subprocess_exec", fake_exec)
+
+    job = JobState("pw-order", {})
+    asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, job, ["pw1", "pw2"]))
+
+    assert not any(str(arg).startswith("-p") for arg in calls[0])
+    assert "-ppw1" in calls[1]
+    assert all("Archive password candidates" not in line for line in job.logs)
 
 def test_extract_mixed_success_and_fallback_are_staged_together(tmp_path, monkeypatch):
     input_dir = tmp_path / "input"
@@ -189,6 +223,31 @@ def test_archive_extract_keeps_parent_folder_and_archive_folder(tmp_path, monkey
     out = asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, JobState("paths", {}), ["ok"]))
 
     assert {p.relative_to(output_dir).as_posix() for p in out} == {"testA/testZip/unzipped.png", "testA/img1.png"}
+
+def test_archive_extract_flattens_same_name_root_folder(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    (input_dir / "folderA.rar").write_text("x")
+
+    class Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", None
+
+    async def fake_exec(*args, **kwargs):
+        target = Path(args[-1]) if args[0] == "unrar" else Path(next(arg for arg in args if str(arg).startswith("-o"))[2:])
+        (target / "folderA").mkdir(parents=True, exist_ok=True)
+        (target / "folderA" / "file.txt").write_text("ok")
+        return Proc()
+
+    monkeypatch.setattr(extractor_mod.shutil, "which", lambda name: name)
+    monkeypatch.setattr(extractor_mod.asyncio, "create_subprocess_exec", fake_exec)
+
+    out = asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, JobState("flatten", {}), None))
+
+    assert [p.relative_to(output_dir).as_posix() for p in out] == ["folderA/file.txt"]
 
 def test_extract_without_archives_stages_input_files(tmp_path, monkeypatch):
     input_dir = tmp_path / "input"

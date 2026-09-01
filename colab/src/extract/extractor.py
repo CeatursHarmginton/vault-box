@@ -91,6 +91,15 @@ def _extract_cmd(tool: str, archive: Path, output_dir: Path, pw: str | None) -> 
         cmd.insert(2, f"-p{pw}")
     return cmd
 
+def _flatten_same_name_root(extract_dir: Path) -> None:
+    entries = list(extract_dir.iterdir())
+    if len(entries) != 1 or not entries[0].is_dir() or entries[0].name.lower() != extract_dir.name.lower():
+        return
+    nested = entries[0]
+    for child in nested.iterdir():
+        shutil.move(str(child), str(extract_dir / child.name))
+    nested.rmdir()
+
 async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState, password: str | list[str] | None = None, delete_archive: bool = False) -> list[Path]:
     if not shutil.which("7z"):
         progress.log("[SKIP] 7z not installed, uploading original files without extract.")
@@ -105,20 +114,13 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
     archive_originals = {p for archive in found for p in _archive_originals(archive)}
     keep_originals: list[Path] = []
 
-    # Build candidates
-    pw_candidates: list[str | None] = []
+    pw_candidates: list[str | None] = [None]
     if isinstance(password, list):
         for pw in password:
             if pw and pw not in pw_candidates:
                 pw_candidates.append(pw)
     elif isinstance(password, str) and password:
         pw_candidates.append(password)
-
-    if not pw_candidates:
-        pw_candidates = [None]
-    else:
-        if None not in pw_candidates:
-            pw_candidates.append(None)
 
     for i, archive in enumerate(found, 1):
         progress.check_cancelled()
@@ -131,8 +133,6 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
         last_error_text = ""
         try:
             _check_multipart(archive)
-            if len(pw_candidates) > 1:
-                progress.log(f"Archive password candidates: {len(pw_candidates) - 1}; trying all, then no-password fallback")
             tools = (["unrar"] if _is_rar(archive) and shutil.which("unrar") else []) + ["7z"]
             for tool in tools:
                 progress.log(f"Trying {tool}: {archive.name}")
@@ -162,6 +162,7 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
             progress.progress.extract = i / total * 100
             continue
 
+        _flatten_same_name_root(extract_dir)
         progress.progress.extract = i / total * 100
         if delete_archive:
             for p in _archive_originals(archive):
