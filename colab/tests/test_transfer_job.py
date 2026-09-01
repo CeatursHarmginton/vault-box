@@ -780,6 +780,85 @@ class TransferJobTests(TestCase):
         self.assertEqual(job.status, "completed", job.error)
         self.assertEqual(dst.target_refs[0]["relative_path"], "results/a.jpg")
 
+    def test_optimized_confirmation_timeout_uploads_new(self):
+        class Source:
+            async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
+                path = local_dir / "a.jpg"
+                path.write_bytes(b"x")
+                return path
+
+        dst = UploadRecorder()
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        old_timeout = transfer_job_mod.CONFIRM_TIMEOUT_SECONDS
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            out = output_dir / "a.jpg"
+            out.write_bytes(b"x")
+            return [{"name": "a.jpg", "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95}]
+        PROVIDERS.update({"fake-source": Source(), "fake-dst": dst})
+        image_optimizer.optimize_directory = fake_optimize
+        transfer_job_mod.CONFIRM_TIMEOUT_SECONDS = 0.01
+        try:
+            job = JobState("opt-timeout", {
+                "source": {"provider": "fake-source", "items": [{"type": "file", "name": "a.jpg"}]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True, "replace": True},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            transfer_job_mod.CONFIRM_TIMEOUT_SECONDS = old_timeout
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-timeout")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertIn("Confirmation timeout", "\n".join(job.logs))
+        self.assertEqual(dst.target_refs[0]["relative_path"], "results/a.jpg")
+
+    def test_optimized_confirmation_timeout_falls_back_to_replace(self):
+        class Source:
+            async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
+                path = local_dir / "a.jpg"
+                path.write_bytes(b"x")
+                return path
+
+        class Dst(UploadRecorder):
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                if not (progress.payload.get("options") or {}).get("replace"):
+                    raise ProviderFailure("UPLOAD_FAILED", "results folder unavailable")
+                return await super().upload_file(credentials, local_path, target_ref, progress)
+
+        dst = Dst()
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        old_timeout = transfer_job_mod.CONFIRM_TIMEOUT_SECONDS
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            out = output_dir / "a.jpg"
+            out.write_bytes(b"x")
+            return [{"name": "a.jpg", "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95}]
+        PROVIDERS.update({"fake-source": Source(), "fake-dst": dst})
+        image_optimizer.optimize_directory = fake_optimize
+        transfer_job_mod.CONFIRM_TIMEOUT_SECONDS = 0.01
+        try:
+            job = JobState("opt-timeout-replace", {
+                "source": {"provider": "fake-source", "items": [{"type": "file", "name": "a.jpg"}]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            transfer_job_mod.CONFIRM_TIMEOUT_SECONDS = old_timeout
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-timeout-replace")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertIn("retrying with replace", "\n".join(job.logs))
+        self.assertTrue(job.payload["options"]["replace"])
+        self.assertEqual(dst.target_refs[0]["relative_path"], "a.jpg")
+
     def test_optimized_folder_upload_new_goes_inside_selected_folder_results(self):
         class Source:
             async def download_folder(self, credentials, folder_ref, local_dir: Path, progress: JobState):

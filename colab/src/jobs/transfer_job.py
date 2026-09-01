@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import time
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -13,6 +14,8 @@ from ..security import redact
 from ..utils.image_optimizer import VIDEO_EXTENSIONS
 from ..utils.temp_storage import cleanup_job, job_dirs
 from .progress import JobCancelled, JobState
+
+CONFIRM_TIMEOUT_SECONDS = 120
 
 async def run_transfer(job: JobState) -> None:
     dirs = job_dirs(job.job_id)
@@ -107,19 +110,10 @@ async def run_transfer(job: JobState) -> None:
             
             # Only ask for confirmation if there are actual optimized image results
             if job.optimized_files:
-                # Wait for user confirmation (threading.Event — poll with cancel check)
-                job.set(status="waiting_confirmation", step="optimized")
-                job.log(f"Optimization finished: processed {len(job.optimized_files)} images. Waiting for confirmation...")
-                while not job.confirm_event.wait(timeout=1.0):
-                    job.check_cancelled()
-                
-                job.log(f"User confirmation received: action={job.confirm_action}")
-                if job.confirm_action == "cancel":
-                    raise JobCancelled()
-                
-                if job.confirm_action == "replace":
+                action = _wait_for_confirmation(job, len(job.optimized_files))
+                if action == "replace":
                     options["replace"] = True
-                elif job.confirm_action == "upload_new":
+                elif action == "upload_new":
                     options["replace"] = False
                     options["upload_prefix"] = "results"
                     if has_folder_source:
@@ -284,6 +278,8 @@ async def _upload_one_with_retry(job: JobState, target: dict[str, Any], options:
             job.log(f"[1/1] Uploaded: {path.name}")
             return result
         except ProviderFailure as exc:
+            if _fallback_auto_upload_new_to_replace(job, options, exc):
+                continue
             if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
                 job.files_skipped = 1
                 job.log(f"[1/1] Skipped (duplicate): {path.name}")
@@ -301,8 +297,19 @@ async def _upload_outputs_with_retry(job: JobState, target: dict[str, Any], opti
         except ProviderFailure as exc:
             if exc.code != "UPLOAD_FAILED":
                 raise
+            if _fallback_auto_upload_new_to_replace(job, options, exc):
+                continue
             await _wait_for_retry_account(job, target, exc)
             continue
+
+def _fallback_auto_upload_new_to_replace(job: JobState, options: dict[str, Any], exc: ProviderFailure) -> bool:
+    if not options.get("_auto_confirm_upload_new") or options.get("replace"):
+        return False
+    options["_auto_confirm_upload_new"] = False
+    options["replace"] = True
+    options.pop("upload_prefix", None)
+    job.log(f"Auto upload_new failed ({exc.message}); retrying with replace.")
+    return True
 
 async def _wait_for_retry_account(job: JobState, target: dict[str, Any], exc: ProviderFailure) -> None:
     job.error = {"code": exc.code, "message": exc.message, "details": exc.details}
@@ -324,8 +331,14 @@ async def _wait_for_retry_account(job: JobState, target: dict[str, Any], exc: Pr
 def _wait_for_confirmation(job: JobState, count: int) -> str:
     job.set(status="waiting_confirmation", step="optimized")
     job.log(f"Optimization finished: processed {count} images. Waiting for confirmation...")
+    deadline = time.monotonic() + CONFIRM_TIMEOUT_SECONDS
     while not job.confirm_event.wait(timeout=1.0):
         job.check_cancelled()
+        if time.monotonic() >= deadline:
+            job.confirm_action = "upload_new"
+            (job.payload.get("options") or {})["_auto_confirm_upload_new"] = True
+            job.log("Confirmation timeout after 120s; auto action=upload_new")
+            break
     job.log(f"User confirmation received: action={job.confirm_action}")
     if job.confirm_action == "cancel":
         raise JobCancelled()
