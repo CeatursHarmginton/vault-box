@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -11,6 +12,8 @@ import httpx
 from ..config import CHUNK_SIZE, FOLDER_DOWNLOAD_CONCURRENCY, FOLDER_UPLOAD_CONCURRENCY
 from ..jobs.progress import JobState
 from ..utils.image_optimizer import IMAGE_EXTENSIONS
+
+_DOWNLOAD_LOG_CONTEXT = contextvars.ContextVar("download_log_context", default=None)
 
 class ProviderFailure(RuntimeError):
     def __init__(self, code: str, message: str, details: dict[str, Any] | None = None) -> None:
@@ -35,10 +38,10 @@ class BaseProvider(ABC):
         listing = await self.list_files(credentials, str(folder_ref.get("id") or folder_ref.get("path") or "/"))
         items = listing.get("items") or listing.get("files") or []
         progress.log(f"{self.name} list folder {folder_ref.get('name') or folder_ref.get('path') or folder_ref.get('id')}: {len(items)} item(s)")
-        for item in items:
-            if not (item.get("type") == "folder" or item.get("is_folder") or item.get("isdir")) and not _skip_optimize_item(item, progress):
-                progress.files_to_download += 1
+        eligible = [item for item in items if not (item.get("type") == "folder" or item.get("is_folder") or item.get("isdir")) and not _skip_optimize_item(item, progress)]
+        progress.files_to_download += len(eligible)
         sem = _sem or asyncio.Semaphore(max(1, FOLDER_DOWNLOAD_CONCURRENCY))
+        log_token = _DOWNLOAD_LOG_CONTEXT.set({"done": 0, "total": len(eligible), "lock": asyncio.Lock()})
 
         async def save(item: dict[str, Any]) -> list[Path]:
             progress.check_cancelled()
@@ -53,7 +56,10 @@ class BaseProvider(ABC):
             async with sem:
                 return [await self.download_file(credentials, item, local_dir / _safe_name(item.get("name") or item.get("server_filename") or item.get("id") or "file"), progress)]
 
-        return [path for batch in await asyncio.gather(*(save(item) for item in items)) for path in batch]
+        try:
+            return [path for batch in await asyncio.gather(*(save(item) for item in items)) for path in batch]
+        finally:
+            _DOWNLOAD_LOG_CONTEXT.reset(log_token)
 
     @abstractmethod
     async def upload_file(self, credentials: dict[str, Any], local_path: Path, target_ref: dict[str, Any], progress: JobState) -> dict[str, Any]: ...
@@ -134,7 +140,13 @@ async def stream_download(url: str, dest: Path, progress: JobState, *, headers: 
         raise last_exc
     part.replace(dest)
     progress.files_downloaded += 1
-    progress.log(f"[{progress.files_downloaded}/{progress.files_to_download}] Downloaded: {dest.name}")
+    ctx = _DOWNLOAD_LOG_CONTEXT.get()
+    if ctx:
+        async with ctx["lock"]:
+            ctx["done"] += 1
+            progress.log(f"[{ctx['done']}/{ctx['total']}] Downloaded: {dest.name}")
+    else:
+        progress.log(f"[{progress.files_downloaded}/{progress.files_to_download}] Downloaded: {dest.name}")
     return dest
 
 def safe_name(name: str) -> str:

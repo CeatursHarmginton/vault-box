@@ -261,9 +261,13 @@ async def _upload_outputs(job: JobState, target: dict[str, Any], options: dict[s
     item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
     if len(files) == 1 and item_type != "folder":
         job.files_to_upload += 1
+        job._upload_log_done = 0
+        job._upload_log_total = 1
         await _upload_path_with_retry(job, target, options, dst, files[0], files[0].name, item)
         return
     job.files_to_upload += len(files)
+    job._upload_log_done = 0
+    job._upload_log_total = len(files)
     for path in sorted(files):
         rel = path.relative_to(upload_root).as_posix()
         await _upload_path_with_retry(job, target, options, dst, path, rel, item)
@@ -276,14 +280,16 @@ async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options
             await dst.upload_file(target.get("credentials") or {}, path, target_ref, job)
             job.files_uploaded += 1
             job.error = None
-            job.log(f"[{job.files_uploaded + job.files_skipped}/{job.files_to_upload}] Uploaded: {path.name}")
+            job._upload_log_done = getattr(job, "_upload_log_done", 0) + 1
+            job.log(f"[{job._upload_log_done}/{getattr(job, '_upload_log_total', job.files_to_upload)}] Uploaded: {path.name}")
             return
         except ProviderFailure as exc:
             if _fallback_auto_upload_new_to_replace(job, options, exc):
                 continue
             if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
                 job.files_skipped += 1
-                job.log(f"[{job.files_uploaded + job.files_skipped}/{job.files_to_upload}] Skipped (duplicate): {path.name}")
+                job._upload_log_done = getattr(job, "_upload_log_done", 0) + 1
+                job.log(f"[{job._upload_log_done}/{getattr(job, '_upload_log_total', job.files_to_upload)}] Skipped (duplicate): {path.name}")
                 return
             if exc.code != "UPLOAD_FAILED":
                 raise

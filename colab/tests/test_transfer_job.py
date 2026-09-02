@@ -1066,6 +1066,7 @@ class TransferJobTests(TestCase):
 
         self.assertEqual(job.status, "completed", job.error)
         self.assertEqual(src.downloaded, ["large.jpg"])
+        self.assertIn("[1/1] Uploaded: large.jpg", job.logs)
 
     def test_optimize_queue_processes_folders_one_at_a_time(self):
         events = []
