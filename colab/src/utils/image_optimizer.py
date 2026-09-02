@@ -32,6 +32,14 @@ VIPS_CLI_AVAILABLE = shutil.which("vips") is not None
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts", ".3gp", ".flv", ".mpeg", ".mpg", ".wmv"}
 
+def should_optimize_image_file(path: Path, options: dict[str, Any]) -> bool:
+    if path.suffix.lower() not in IMAGE_EXTENSIONS:
+        return False
+    size = path.stat().st_size
+    min_target = int(float(options.get("min_target_mb", 1.0)) * 1024 * 1024)
+    max_target = int(float(options.get("max_target_mb", 3.0)) * 1024 * 1024)
+    return size < min_target if options.get("upscale") else size > max_target
+
 def _optimize_workers(options: dict[str, Any], image_count: int) -> int:
     try:
         requested = int(float(options.get("optimize_workers") or 0))
@@ -201,12 +209,12 @@ def optimize_directory(
     
     # Separate images and non-images
     images = []
-    non_images = []
+    passthrough = []
     for p in all_files:
-        if p.suffix.lower() in IMAGE_EXTENSIONS:
+        if should_optimize_image_file(p, options):
             images.append(p)
         else:
-            non_images.append(p)
+            passthrough.append(p)
             
     # Group images by folder, sort by folder path, then by size within each folder
     # This exactly replicates fiximg_vips.ps1 which groups by folder, resets
@@ -258,7 +266,7 @@ def optimize_directory(
                 set_optimize_progress(processed)
         results.extend(item for item in ordered if item is not None)
 
-        for p in non_images:
+        for p in passthrough:
             if cancel_check:
                 cancel_check()
             relative_path = p.relative_to(input_dir)
@@ -316,8 +324,8 @@ def optimize_directory(
         for folder_key, folder_images in folder_groups:
             results.extend(process_group(folder_key, folder_images))
     
-    # Copy non-images
-    for p in non_images:
+    # Copy files that should pass through unchanged.
+    for p in passthrough:
         if cancel_check:
             cancel_check()
         relative_path = p.relative_to(input_dir)

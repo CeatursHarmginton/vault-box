@@ -140,7 +140,10 @@ async def run_transfer(job: JobState) -> None:
             else:
                 if not any(p.is_file() for p in upload_root.rglob("*")):
                     raise ProviderFailure("UPLOAD_FAILED", "No files staged for upload", {"root": str(upload_root)})
-                result = await dst.upload_folder(target.get("credentials") or {}, upload_root, _upload_target(target.get("folder") or {}, "", options), job)
+                if options.get("optimize_image"):
+                    result = await _upload_outputs_with_retry(job, target, options, dst, upload_root, {})
+                else:
+                    result = await dst.upload_folder(target.get("credentials") or {}, upload_root, _upload_target(target.get("folder") or {}, "", options), job)
         job.log(f"Done: Downloaded {job.files_downloaded}/{job.files_to_download} file(s), Uploaded {job.files_uploaded}/{job.files_to_upload} file(s) (skipped {job.files_skipped} file(s))")
         job.set(status="completed", step="completed")
     except JobCancelled:
@@ -233,11 +236,7 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
             if folder_root:
                 upload_root = folder_root
         job.set(status="running", step="uploading")
-        before_total, before_uploaded, before_skipped = job.files_to_upload, job.files_uploaded, job.files_skipped
         await _upload_outputs_with_retry(job, target, options, dst, upload_root, item)
-        job.files_to_upload += before_total
-        job.files_uploaded += before_uploaded
-        job.files_skipped += before_skipped
         shutil.rmtree(batch_input, ignore_errors=True)
         shutil.rmtree(batch_output.parent, ignore_errors=True)
         job.completed_items.append(_queue_item_ref(source, item))
@@ -259,15 +258,36 @@ async def _upload_outputs(job: JobState, target: dict[str, Any], options: dict[s
     files = [p for p in upload_root.rglob("*") if p.is_file()]
     if not files:
         raise ProviderFailure("UPLOAD_FAILED", "No files staged for upload", {"root": str(upload_root)})
-    folder = _item_target_folder(target.get("folder") or {}, item)
     item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
     if len(files) == 1 and item_type != "folder":
         job.files_to_upload += 1
-        await dst.upload_file(target.get("credentials") or {}, files[0], _upload_target(folder, files[0].name, options), job)
-        job.files_uploaded += 1
-        job.log(f"[{job.files_uploaded}/{job.files_to_upload}] Uploaded: {files[0].name}")
+        await _upload_path_with_retry(job, target, options, dst, files[0], files[0].name, item)
         return
-    await dst.upload_folder(target.get("credentials") or {}, upload_root, _upload_target(folder, "", options), job)
+    job.files_to_upload += len(files)
+    for path in sorted(files):
+        rel = path.relative_to(upload_root).as_posix()
+        await _upload_path_with_retry(job, target, options, dst, path, rel, item)
+
+async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options: dict[str, Any], dst: Any, path: Path, rel: str, item: dict[str, Any]) -> None:
+    while True:
+        folder = _item_target_folder(target.get("folder") or {}, item)
+        target_ref = _upload_target(folder, rel, options)
+        try:
+            await dst.upload_file(target.get("credentials") or {}, path, target_ref, job)
+            job.files_uploaded += 1
+            job.error = None
+            job.log(f"[{job.files_uploaded + job.files_skipped}/{job.files_to_upload}] Uploaded: {path.name}")
+            return
+        except ProviderFailure as exc:
+            if _fallback_auto_upload_new_to_replace(job, options, exc):
+                continue
+            if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
+                job.files_skipped += 1
+                job.log(f"[{job.files_uploaded + job.files_skipped}/{job.files_to_upload}] Skipped (duplicate): {path.name}")
+                return
+            if exc.code != "UPLOAD_FAILED":
+                raise
+            await _wait_for_retry_account(job, target, exc)
 
 async def _upload_one_with_retry(job: JobState, target: dict[str, Any], options: dict[str, Any], dst: Any, path: Path) -> dict[str, Any]:
     while True:

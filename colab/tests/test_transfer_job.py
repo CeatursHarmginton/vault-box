@@ -959,8 +959,8 @@ class TransferJobTests(TestCase):
             __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-folder-results")
 
         self.assertEqual(job.status, "completed", job.error)
-        self.assertEqual(dst.calls[0][1].name, "testC")
-        self.assertEqual(dst.target_refs[0]["relative_path"], "results/testC (optimized)")
+        self.assertEqual(dst.calls[0][1].name, "a.jpg")
+        self.assertEqual(dst.target_refs[0]["relative_path"], "results/testC (optimized)/a.jpg")
 
     def test_optimized_folder_replace_uploads_into_selected_folder_without_nested_folder(self):
         class Source:
@@ -1003,8 +1003,8 @@ class TransferJobTests(TestCase):
             __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-folder-replace")
 
         self.assertEqual(job.status, "completed", job.error)
-        self.assertEqual(dst.calls[0][1].name, "testC")
-        self.assertNotIn("relative_path", dst.target_refs[0])
+        self.assertEqual(dst.calls[0][1].name, "a.jpg")
+        self.assertEqual(dst.target_refs[0]["relative_path"], "a.jpg")
 
     def test_optimized_folder_skips_video_before_download(self):
         class Source(base_mod.BaseProvider):
@@ -1077,6 +1077,10 @@ class TransferJobTests(TestCase):
                 return [path]
 
         class Dst(UploadRecorder):
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                events.append(f"upload:{local_path.parent.name}")
+                return await super().upload_file(credentials, local_path, target_ref, progress)
+
             async def upload_folder(self, credentials, local_dir, target_ref, progress):
                 events.append(f"upload:{local_dir.name}")
                 return await super().upload_folder(credentials, local_dir, target_ref, progress)
@@ -1121,7 +1125,7 @@ class TransferJobTests(TestCase):
 
         self.assertEqual(job.status, "completed", job.error)
         self.assertEqual(events, ["download:A", "opt:A", "upload:A", "download:B", "opt:B", "upload:B"])
-        self.assertEqual([r["relative_path"] for r in dst.target_refs], ["results/A (optimized)", "results/B (optimized)"])
+        self.assertEqual([r["relative_path"] for r in dst.target_refs], ["results/A (optimized)/a.jpg", "results/B (optimized)/a.jpg"])
         self.assertEqual(len([line for line in job.logs if "Waiting for confirmation" in line]), 1)
 
     def test_optimized_upload_failure_waits_for_retry_account(self):
@@ -1178,6 +1182,68 @@ class TransferJobTests(TestCase):
 
         self.assertEqual(job.status, "completed", job.error)
         self.assertEqual(len(dst.calls), 1)
+
+    def test_optimized_folder_upload_retries_only_failed_file(self):
+        events = []
+
+        class Source:
+            async def download_folder(self, credentials, folder_ref, local_dir: Path, progress: JobState):
+                for name in ("a.jpg", "b.jpg"):
+                    path = local_dir / name
+                    path.write_bytes(b"x")
+                return list(local_dir.glob("*.jpg"))
+
+        class Dst:
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                events.append((credentials.get("account"), local_path.name))
+                if local_path.name == "b.jpg" and credentials.get("account") != "b":
+                    raise ProviderFailure("UPLOAD_FAILED", "part 0 failed HTTP 403")
+                return {"ok": True}
+
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            results = []
+            for src in sorted(input_dir.rglob("*.jpg")):
+                out = output_dir / src.relative_to(input_dir)
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(b"x")
+                results.append({"name": out.name, "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95})
+            return results
+        PROVIDERS.update({"fake-source": Source(), "fake-dst": Dst()})
+        image_optimizer.optimize_directory = fake_optimize
+        try:
+            job = JobState("opt-folder-file-retry", {
+                "source": {"provider": "fake-source", "items": [{"type": "folder", "name": "root", "id": "/root"}]},
+                "target": {"provider": "fake-dst", "folder": {}, "credentials": {"account": "a"}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True},
+            })
+            def confirm():
+                for _ in range(1000):
+                    if job.status == "waiting_confirmation":
+                        job.confirm_action = "replace"
+                        job.confirm_event.set()
+                        break
+                    time.sleep(0.01)
+                for _ in range(1000):
+                    if job.status == "waiting_target_account":
+                        job.payload["target"]["credentials"] = {"account": "b"}
+                        job.confirm_action = "retry_upload"
+                        job.confirm_event.set()
+                        return
+                    time.sleep(0.01)
+            thread = threading.Thread(target=confirm)
+            thread.start()
+            asyncio.run(run_transfer(job))
+            thread.join(timeout=1)
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-folder-file-retry")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(events, [("a", "a.jpg"), ("a", "b.jpg"), ("b", "b.jpg")])
 
     def test_optimized_batches_cleanup_only_uploaded_item_on_failure(self):
         from src.utils.temp_storage import cleanup_job, job_dirs

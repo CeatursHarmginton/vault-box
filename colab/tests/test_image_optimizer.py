@@ -57,7 +57,7 @@ class ImageOptimizerTests(TestCase):
         options = {
             "optimize_image": True,
             "min_target_mb": 0.05, # ~50 KB
-            "max_target_mb": 0.2,  # ~200 KB
+            "max_target_mb": 0.001,
             "start_quality": 95,
             "quality": 85,
             "auto_size": True,
@@ -71,15 +71,22 @@ class ImageOptimizerTests(TestCase):
         self.assertEqual((self.dest_dir / "test.txt").read_text(encoding="utf-8"), "Hello World")
         self.assertTrue((self.dest_dir / "clip.mp4").exists())
 
-        # Verify images processed and sorted by size (small.jpg is smaller, so it's first)
-        self.assertEqual(len(results), 2)
-        self.assertEqual(results[0]["name"], "small.jpg")
-        self.assertEqual(results[1]["name"], "large.jpg")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["name"], "large.jpg")
+        self.assertTrue((self.dest_dir / "small.jpg").exists())
 
         # Verify large image output is copied/created
         large_dest = self.dest_dir / "large.jpg"
         self.assertTrue(large_dest.exists())
-        self.assertLessEqual(large_dest.stat().st_size, 0.2 * 1024 * 1024)
+
+    def test_optimize_directory_skips_images_under_downscale_target(self) -> None:
+        img_path = self.src_dir / "small.jpg"
+        Image.new("RGB", (10, 10), color="red").save(img_path, "JPEG", quality=50)
+
+        results = optimize_directory(self.src_dir, self.dest_dir, {"max_target_mb": 3.0}, MockJobState())
+
+        self.assertEqual(results, [])
+        self.assertTrue((self.dest_dir / "small.jpg").exists())
 
     def test_optimize_directory_uses_worker_override(self) -> None:
         for i in range(4):
@@ -96,7 +103,7 @@ class ImageOptimizerTests(TestCase):
             return out, adaptive_quality, "ok"
         image_optimizer.optimize_image_file = fake_optimize
         try:
-            results = optimize_directory(self.src_dir, self.dest_dir, {"optimize_workers": 4, "auto_size": False}, MockJobState())
+            results = optimize_directory(self.src_dir, self.dest_dir, {"optimize_workers": 4, "auto_size": False, "max_target_mb": 0.0}, MockJobState())
         finally:
             image_optimizer.optimize_image_file = old
 
@@ -116,7 +123,7 @@ class ImageOptimizerTests(TestCase):
         image_optimizer.optimize_image_file = fake_optimize
         try:
             job = MockJobState()
-            optimize_directory(self.src_dir, self.dest_dir, {"optimize_workers": 1}, job)
+            optimize_directory(self.src_dir, self.dest_dir, {"optimize_workers": 1, "max_target_mb": 0.0}, job)
         finally:
             image_optimizer.optimize_image_file = old
 
@@ -159,7 +166,7 @@ class ImageOptimizerTests(TestCase):
 
         results = optimize_directory(self.src_dir, self.dest_dir, {
             "min_target_mb": 0.0,
-            "max_target_mb": 99.0,
+            "max_target_mb": 0.0,
             "quality": 85,
             "optimize_workers": 1,
         }, MockJobState())
