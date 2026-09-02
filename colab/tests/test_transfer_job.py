@@ -1006,7 +1006,7 @@ class TransferJobTests(TestCase):
         self.assertEqual(dst.calls[0][1].name, "a.jpg")
         self.assertEqual(dst.target_refs[0]["relative_path"], "a.jpg")
 
-    def test_optimized_folder_skips_video_before_download(self):
+    def test_optimized_folder_skips_non_candidates_before_download(self):
         class Source(base_mod.BaseProvider):
             def __init__(self):
                 self.downloaded = []
@@ -1016,7 +1016,8 @@ class TransferJobTests(TestCase):
 
             async def list_files(self, credentials, path_or_id):
                 return {"items": [
-                    {"type": "file", "name": "a.jpg", "id": "a"},
+                    {"type": "file", "name": "large.jpg", "id": "a", "size": 4 * 1024 * 1024},
+                    {"type": "file", "name": "small.jpg", "id": "s", "size": 1024},
                     {"type": "file", "name": "clip.mp4", "id": "v"},
                 ]}
 
@@ -1034,10 +1035,10 @@ class TransferJobTests(TestCase):
         old = dict(PROVIDERS)
         old_optimize = image_optimizer.optimize_directory
         def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
-            out = output_dir / "root" / "a.jpg"
+            out = output_dir / "root" / "large.jpg"
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_bytes(b"x")
-            return [{"name": "root/a.jpg", "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95}]
+            return [{"name": "root/large.jpg", "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95}]
         PROVIDERS.update({"fake-source": src, "fake-dst": dst})
         image_optimizer.optimize_directory = fake_optimize
         try:
@@ -1064,7 +1065,7 @@ class TransferJobTests(TestCase):
             __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-folder-skip-video")
 
         self.assertEqual(job.status, "completed", job.error)
-        self.assertEqual(src.downloaded, ["a.jpg"])
+        self.assertEqual(src.downloaded, ["large.jpg"])
 
     def test_optimize_queue_processes_folders_one_at_a_time(self):
         events = []
