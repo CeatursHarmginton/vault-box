@@ -203,6 +203,32 @@ class ImageOptimizerTests(TestCase):
         with Image.open(out) as img:
             self.assertEqual(img.size, (1600, 1600))
 
+    def test_invalid_tiny_conversion_falls_back_to_original_file(self) -> None:
+        src = self.src_dir / "small.png"
+        Image.new("RGB", (20, 20), color="blue").save(src, "PNG")
+
+        old = image_optimizer.compress_image
+        def fake_compress(src_path, dest_path, q, scale=1.0):
+            dest_path.write_bytes(b"x" * 114)
+            return True
+        image_optimizer.compress_image = fake_compress
+        try:
+            results = optimize_directory(self.src_dir, self.dest_dir, {
+                "min_target_mb": 1.0,
+                "max_target_mb": 0.0,
+                "quality": 85,
+                "optimize_workers": 1,
+            }, MockJobState())
+        finally:
+            image_optimizer.compress_image = old
+
+        out = self.dest_dir / "small.png"
+        self.assertEqual(results[0]["name"], "small.png")
+        self.assertTrue(out.exists())
+        self.assertEqual(out.read_bytes(), src.read_bytes())
+        with Image.open(out) as img:
+            self.assertEqual(img.format, "PNG")
+
     def test_auto_size_processes_folder_images_small_to_large(self) -> None:
         for name, size in (("large.jpg", 30), ("small.jpg", 10), ("mid.jpg", 20)):
             (self.src_dir / name).write_bytes(b"x" * size)

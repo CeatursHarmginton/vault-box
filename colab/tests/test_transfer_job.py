@@ -1475,6 +1475,52 @@ class TransferJobTests(TestCase):
         self.assertEqual(calls[1]["Range"], "bytes=3-")
         self.assertEqual(sleeps, [])
 
+    def test_stream_download_rejects_provider_json_error_as_image(self):
+        body = b'{"errmsg":"need verify","request_id":9143768342077911970,"errno":400141}'
+
+        class Stream:
+            status_code = 200
+            headers = {"content-length": str(len(body))}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_bytes(self, size):
+                yield body
+
+        class Client:
+            def __init__(self, *args, **kwargs):
+                return None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def stream(self, method, url, headers):
+                return Stream()
+
+        old_client = base_mod.httpx.AsyncClient
+        base_mod.httpx.AsyncClient = Client
+        try:
+            with __import__("tempfile").TemporaryDirectory() as tmp:
+                dest = Path(tmp) / "bad.jpg"
+                with self.assertRaises(ProviderFailure) as ctx:
+                    asyncio.run(base_mod.stream_download("https://example.test/file", dest, JobState("json-error", {})))
+                self.assertEqual(ctx.exception.code, "DOWNLOAD_FAILED")
+                self.assertEqual(ctx.exception.details["errno"], 400141)
+                self.assertFalse(dest.exists())
+                self.assertFalse((Path(tmp) / "bad.jpg.part").exists())
+        finally:
+            base_mod.httpx.AsyncClient = old_client
+
     def test_folder_downloads_are_concurrent_and_bounded(self):
         class Provider(base_mod.BaseProvider):
             name = "parallel"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import json
 import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -151,6 +152,7 @@ async def stream_download(url: str, dest: Path, progress: JobState, *, headers: 
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".part")
     expected = 0
+    content_type = ""
     last_exc: Exception | None = None
     for attempt in range(5):
         done = part.stat().st_size if part.exists() else 0
@@ -169,6 +171,7 @@ async def stream_download(url: str, dest: Path, progress: JobState, *, headers: 
                         done = 0
                     total = done + int(resp.headers.get("content-length") or 0)
                     expected = total or expected
+                    content_type = resp.headers.get("content-type", content_type)
                     with part.open("ab" if done else "wb") as fh:
                         async for chunk in resp.aiter_bytes(CHUNK_SIZE):
                             progress.check_cancelled()
@@ -189,6 +192,10 @@ async def stream_download(url: str, dest: Path, progress: JobState, *, headers: 
                 await asyncio.sleep(min(2 ** attempt, 8))
     if expected and part.stat().st_size < expected and last_exc:
         raise last_exc
+    err = _download_error_payload(part, content_type, dest.suffix.lower() in IMAGE_EXTENSIONS)
+    if err:
+        part.unlink(missing_ok=True)
+        raise ProviderFailure("DOWNLOAD_FAILED", f"Provider returned error instead of file: {err.get('message')}", err)
     part.replace(dest)
     progress.files_downloaded += 1
     ctx = _DOWNLOAD_LOG_CONTEXT.get()
@@ -199,6 +206,26 @@ async def stream_download(url: str, dest: Path, progress: JobState, *, headers: 
     else:
         progress.log(f"[{progress.files_downloaded}/{progress.files_to_download}] Downloaded: {dest.name}")
     return dest
+
+def _download_error_payload(path: Path, content_type: str, strict: bool) -> dict[str, Any] | None:
+    if path.stat().st_size > 4096:
+        return None
+    raw = path.read_bytes().lstrip()
+    if not raw.startswith((b"{", b"[")):
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    errno = data.get("errno", data.get("errcode", data.get("error_code")))
+    message = data.get("errmsg") or data.get("error_description") or data.get("error") or data.get("message")
+    if not message and errno in (None, 0, "0"):
+        return None
+    if "json" not in content_type.lower() and not strict:
+        return None
+    return {"errno": errno, "message": str(message or "download error"), "body": data}
 
 def safe_name(name: str) -> str:
     clean = "".join(c for c in str(name or "file") if c not in '<>:"/\\|?*').strip().strip(".")

@@ -104,11 +104,17 @@ def copy_or_convert_image(src_path: Path, dest_path: Path, q: int) -> None:
     if not compress_image(src_path, dest_path, q):
         raise RuntimeError(f"Failed to convert image to JPEG: {src_path}")
 
+def copy_original_image(src_path: Path, dest_dir: Path) -> Path:
+    dest_path = dest_dir / src_path.name
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_path, dest_path)
+    return dest_path
+
 def _valid_optimized_output(src_path: Path, out_path: Path, scale: float) -> bool:
-    if not out_path.exists() or out_path.stat().st_size < 1024:
+    if not out_path.exists() or out_path.stat().st_size <= 0:
         return False
     if not PIL_AVAILABLE:
-        return True
+        return out_path.stat().st_size >= 1024
     try:
         with PILImage.open(src_path) as src, PILImage.open(out_path) as out:
             out.verify()
@@ -140,6 +146,8 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
     # 1. Skip if already within range
     if min_target <= size <= max_target:
         copy_or_convert_image(src_path, dest_path, quality)
+        if dest_path.suffix.lower() != src_path.suffix.lower() and not _valid_optimized_output(src_path, dest_path, 1.0):
+            dest_path = copy_original_image(src_path, dest_dir)
         return dest_path, quality, "Giữ nguyên"
         
     # 2. Upscale if too small (Real-ESRGAN placeholder or keep as-is)
@@ -153,11 +161,16 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
                     res = subprocess.run(cmd, capture_output=True)
                     if res.returncode == 0 and output_file.exists():
                         copy_or_convert_image(output_file, dest_path, quality)
+                        if not _valid_optimized_output(src_path, dest_path, float(outscale)):
+                            dest_path = copy_original_image(src_path, dest_dir)
+                            return dest_path, quality, "Giữ nguyên (Lỗi upscale)"
                         return dest_path, quality, "Thành công (Upscaled)"
                 except Exception as e:
                     logger.warning(f"Real-ESRGAN failed: {e}")
             
         copy_or_convert_image(src_path, dest_path, quality)
+        if dest_path.suffix.lower() != src_path.suffix.lower() and not _valid_optimized_output(src_path, dest_path, 1.0):
+            dest_path = copy_original_image(src_path, dest_dir)
         return dest_path, quality, "Giữ nguyên (Upscale tắt hoặc lỗi)"
 
     # 3. Compress if larger than max_target
@@ -173,6 +186,7 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
     best_temp = Path(best_temp_str)
     best_size = size  # Track best compressed size (start at original)
     best_q = q
+    invalid_output_seen = False
     
     try:
         while q >= 10:
@@ -181,6 +195,7 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
             temp_size = temp_path.stat().st_size
             if not _valid_optimized_output(src_path, temp_path, scale):
                 logger.warning("Skipping invalid optimized image: %s quality=%s size=%s", src_path.name, q, temp_size)
+                invalid_output_seen = True
                 if not auto_size:
                     break
                 q -= 5
@@ -204,7 +219,10 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
             final_q = best_q
             status = "Thành công (Compressed)"
         else:
-            copy_or_convert_image(src_path, dest_path, quality)
+            if invalid_output_seen:
+                dest_path = copy_original_image(src_path, dest_dir)
+            else:
+                copy_or_convert_image(src_path, dest_path, quality)
             status = "Giữ nguyên (Lỗi nén)"
     finally:
         temp_path.unlink(missing_ok=True)
