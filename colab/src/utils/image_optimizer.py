@@ -104,6 +104,19 @@ def copy_or_convert_image(src_path: Path, dest_path: Path, q: int) -> None:
     if not compress_image(src_path, dest_path, q):
         raise RuntimeError(f"Failed to convert image to JPEG: {src_path}")
 
+def _valid_optimized_output(src_path: Path, out_path: Path, scale: float) -> bool:
+    if not out_path.exists() or out_path.stat().st_size < 1024:
+        return False
+    if not PIL_AVAILABLE:
+        return True
+    try:
+        with PILImage.open(src_path) as src, PILImage.open(out_path) as out:
+            out.verify()
+            expected = (max(1, int(src.size[0] * scale)), max(1, int(src.size[1] * scale)))
+            return out.size == expected
+    except Exception:
+        return False
+
 def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any], adaptive_quality: int) -> tuple[Path, int, str]:
     """
     Optimizes a single image file based on size target.
@@ -166,6 +179,12 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
             if not compress_image(src_path, temp_path, q, scale):
                 break
             temp_size = temp_path.stat().st_size
+            if not _valid_optimized_output(src_path, temp_path, scale):
+                logger.warning("Skipping invalid optimized image: %s quality=%s size=%s", src_path.name, q, temp_size)
+                if not auto_size:
+                    break
+                q -= 5
+                continue
             
             # Track best compressed result (smallest)
             if temp_size < best_size:

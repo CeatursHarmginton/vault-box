@@ -176,3 +176,53 @@ class ImageOptimizerTests(TestCase):
         self.assertTrue(out.exists())
         with Image.open(out) as img:
             self.assertEqual(img.format, "JPEG")
+
+    def test_invalid_tiny_compressed_output_is_not_selected(self) -> None:
+        src = self.src_dir / "large.jpg"
+        Image.new("RGB", (1600, 1600), color="blue").save(src, "JPEG", quality=100)
+
+        old = image_optimizer.compress_image
+        def fake_compress(src_path, dest_path, q, scale=1.0):
+            dest_path.write_bytes(b"x" * 114)
+            return True
+        image_optimizer.compress_image = fake_compress
+        try:
+            results = optimize_directory(self.src_dir, self.dest_dir, {
+                "min_target_mb": 0.0,
+                "max_target_mb": 0.0,
+                "start_quality": 95,
+                "auto_size": True,
+                "optimize_workers": 1,
+            }, MockJobState())
+        finally:
+            image_optimizer.compress_image = old
+
+        out = self.dest_dir / "large.jpg"
+        self.assertEqual(results[0]["status"], "Giữ nguyên (Lỗi nén)")
+        self.assertGreater(out.stat().st_size, 114)
+        with Image.open(out) as img:
+            self.assertEqual(img.size, (1600, 1600))
+
+    def test_auto_size_processes_folder_images_small_to_large(self) -> None:
+        for name, size in (("large.jpg", 30), ("small.jpg", 10), ("mid.jpg", 20)):
+            (self.src_dir / name).write_bytes(b"x" * size)
+
+        seen: list[str] = []
+        old = image_optimizer.optimize_image_file
+        def fake_optimize(src_path, dest_dir, options, adaptive_quality):
+            seen.append(src_path.name)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            out = dest_dir / src_path.name
+            out.write_bytes(b"x" * 9)
+            return out, adaptive_quality, "ok"
+        image_optimizer.optimize_image_file = fake_optimize
+        try:
+            optimize_directory(self.src_dir, self.dest_dir, {
+                "max_target_mb": 0.0,
+                "auto_size": True,
+                "optimize_workers": 1,
+            }, MockJobState())
+        finally:
+            image_optimizer.optimize_image_file = old
+
+        self.assertEqual(seen, ["small.jpg", "mid.jpg", "large.jpg"])
