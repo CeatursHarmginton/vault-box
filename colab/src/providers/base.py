@@ -15,6 +15,57 @@ from ..utils.image_optimizer import IMAGE_EXTENSIONS
 
 _DOWNLOAD_LOG_CONTEXT = contextvars.ContextVar("download_log_context", default=None)
 
+def _loop_store(name: str) -> dict[Any, Any]:
+    """Scratch space attached to the running loop, so it dies with the job that owns the loop."""
+    loop = asyncio.get_running_loop()
+    store = getattr(loop, "_vaultbox_store", None)
+    if store is None:
+        store = {}
+        setattr(loop, "_vaultbox_store", store)
+    return store.setdefault(name, {})
+
+def owner_store(name: str, owner: Any) -> dict[str, Any]:
+    """Per-owner slot inside the loop store; keeps a strong ref so id(owner) cannot be recycled."""
+    store = _loop_store(name)
+    entry = store.get(id(owner))
+    if entry is None or entry[0] is not owner:
+        entry = (owner, {})
+        store[id(owner)] = entry
+    return entry[1]
+
+def dict_lock(locks: dict[Any, asyncio.Lock], key: Any) -> asyncio.Lock:
+    """One lock per key: unrelated keys never queue behind each other."""
+    lock = locks.get(key)
+    if lock is None:
+        lock = locks[key] = asyncio.Lock()
+    return lock
+
+def shared_client(key: str, **kwargs: Any) -> httpx.AsyncClient:
+    """One keep-alive client per (loop, key): every request after the first skips the TCP+TLS handshake."""
+    clients = _loop_store("http_clients")
+    client = clients.get(key)
+    if client is None or getattr(client, "is_closed", False):
+        client = httpx.AsyncClient(**kwargs)
+        clients[key] = client
+    return client
+
+def track_client(client: Any) -> Any:
+    """Register a client owned elsewhere so close_shared_clients() still releases its sockets."""
+    _loop_store("http_clients")[id(client)] = client
+    return client
+
+async def close_shared_clients() -> None:
+    clients = _loop_store("http_clients")
+    for key in list(clients):
+        client = clients.pop(key, None)
+        aclose = getattr(client, "aclose", None)
+        if aclose is None:
+            continue
+        try:
+            await aclose()
+        except Exception:
+            pass
+
 class ProviderFailure(RuntimeError):
     def __init__(self, code: str, message: str, details: dict[str, Any] | None = None) -> None:
         super().__init__(message)

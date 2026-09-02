@@ -7,9 +7,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..extract.extractor import extract_archives
-from ..config import FOLDER_DOWNLOAD_CONCURRENCY
+from ..config import FOLDER_DOWNLOAD_CONCURRENCY, UPLOAD_FILE_CONCURRENCY
 from ..providers import PROVIDERS
-from ..providers.base import ProviderFailure, safe_name
+from ..providers.base import ProviderFailure, close_shared_clients, safe_name
 from ..security import redact
 from ..utils.image_optimizer import VIDEO_EXTENSIONS
 from ..utils.temp_storage import cleanup_job, job_dirs
@@ -158,11 +158,16 @@ async def run_transfer(job: JobState) -> None:
         job.log(f"Failed: {exc}")
         job.set(status="failed", step="failed")
     finally:
-        if job.status == "completed" and (payload.get("options") or {}).get("cleanupAfterFinish", True):
-            cleanup_job(job.job_id)
-        # Drop provider credential refs after run.
-        payload.get("source", {}).pop("credentials", None)
-        payload.get("target", {}).pop("credentials", None)
+        # Nested finally: an await here can be interrupted by cancellation, and the credential
+        # scrubbing below must run either way.
+        try:
+            await close_shared_clients()
+        finally:
+            if job.status == "completed" and (payload.get("options") or {}).get("cleanupAfterFinish", True):
+                cleanup_job(job.job_id)
+            # Drop provider credential refs after run.
+            payload.get("source", {}).pop("credentials", None)
+            payload.get("target", {}).pop("credentials", None)
 
 
 def _upload_target(folder: dict[str, Any], relative_path: str, options: dict[str, Any]) -> dict[str, Any]:
@@ -268,12 +273,74 @@ async def _upload_outputs(job: JobState, target: dict[str, Any], options: dict[s
     job.files_to_upload += len(files)
     job._upload_log_done = 0
     job._upload_log_total = len(files)
-    for path in sorted(files):
-        rel = path.relative_to(upload_root).as_posix()
-        await _upload_path_with_retry(job, target, options, dst, path, rel, item)
+    workers = max(1, min(UPLOAD_FILE_CONCURRENCY, len(files)))
+    gate = _UploadGate()
+    sem = asyncio.Semaphore(workers)
+    job.log(f"Uploading {len(files)} file(s), {workers} in parallel")
 
-async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options: dict[str, Any], dst: Any, path: Path, rel: str, item: dict[str, Any]) -> None:
+    async def one(path: Path) -> None:
+        async with sem:
+            if gate.abort is not None:
+                return
+            rel = path.relative_to(upload_root).as_posix()
+            await _upload_path_with_retry(job, target, options, dst, path, rel, item, gate)
+
+    results = await asyncio.gather(*(one(p) for p in sorted(files)), return_exceptions=True)
+    if gate.abort is not None:
+        raise gate.abort
+    for outcome in results:
+        if isinstance(outcome, BaseException):
+            raise outcome
+
+class _UploadGate:
+    """Shared stop gate for the parallel uploaders of one batch.
+
+    On UPLOAD_FAILED every worker parks on `resume`; exactly one runs the recovery
+    (auto-replace fallback, or the wait for another target account) and bumps
+    `generation`, so workers that failed against the old account just retry
+    instead of each asking the user again.
+    """
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.resume = asyncio.Event()
+        self.resume.set()
+        self.generation = 0
+        self.abort: BaseException | None = None
+
+async def _recover_upload(job: JobState, target: dict[str, Any], options: dict[str, Any], exc: ProviderFailure, gate: _UploadGate | None, attempt_gen: int) -> bool:
+    """Run one recovery round. Returns True when the caller should retry the file."""
+    if gate is None:
+        if _fallback_auto_upload_new_to_replace(job, options, exc):
+            return True
+        await _wait_for_retry_account(job, target, exc)
+        return True
+    gate.resume.clear()
+    async with gate.lock:
+        if gate.abort is not None:
+            return False
+        if gate.generation != attempt_gen:
+            gate.resume.set()
+            return True  # recovered by another worker while this upload was in flight.
+        try:
+            if not _fallback_auto_upload_new_to_replace(job, options, exc):
+                await _wait_for_retry_account(job, target, exc)
+        except BaseException as err:
+            gate.abort = err
+            return False
+        finally:
+            gate.generation += 1
+            gate.resume.set()
+    return True
+
+async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options: dict[str, Any], dst: Any, path: Path, rel: str, item: dict[str, Any], gate: _UploadGate | None = None) -> None:
     while True:
+        attempt_gen = 0
+        if gate is not None:
+            await gate.resume.wait()
+            if gate.abort is not None:
+                return
+            attempt_gen = gate.generation
         folder = _item_target_folder(target.get("folder") or {}, item)
         target_ref = _upload_target(folder, rel, options)
         try:
@@ -284,16 +351,19 @@ async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options
             job.log(f"[{job._upload_log_done}/{getattr(job, '_upload_log_total', job.files_to_upload)}] Uploaded: {path.name}")
             return
         except ProviderFailure as exc:
-            if _fallback_auto_upload_new_to_replace(job, options, exc):
-                continue
-            if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
-                job.files_skipped += 1
-                job._upload_log_done = getattr(job, "_upload_log_done", 0) + 1
-                job.log(f"[{job._upload_log_done}/{getattr(job, '_upload_log_total', job.files_to_upload)}] Skipped (duplicate): {path.name}")
-                return
-            if exc.code != "UPLOAD_FAILED":
+            auto_replace = bool(options.get("_auto_confirm_upload_new")) and not options.get("replace")
+            if not auto_replace:
+                if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
+                    job.files_skipped += 1
+                    job._upload_log_done = getattr(job, "_upload_log_done", 0) + 1
+                    job.log(f"[{job._upload_log_done}/{getattr(job, '_upload_log_total', job.files_to_upload)}] Skipped (duplicate): {path.name}")
+                    return
+                if exc.code != "UPLOAD_FAILED":
+                    raise
+            if not await _recover_upload(job, target, options, exc, gate, attempt_gen):
+                if gate is not None and gate.abort is not None:
+                    return
                 raise
-            await _wait_for_retry_account(job, target, exc)
 
 async def _upload_one_with_retry(job: JobState, target: dict[str, Any], options: dict[str, Any], dst: Any, path: Path) -> dict[str, Any]:
     while True:
@@ -343,8 +413,10 @@ async def _wait_for_retry_account(job: JobState, target: dict[str, Any], exc: Pr
     job.confirm_action = None
     job.confirm_event.clear()
     job.set(status="waiting_target_account", step="uploading")
-    while not job.confirm_event.wait(timeout=1.0):
+    # Poll instead of Event.wait(): this coroutine shares its loop with the other uploaders.
+    while not job.confirm_event.is_set():
         job.check_cancelled()
+        await asyncio.sleep(0.05)
     if job.confirm_action == "cancel":
         raise JobCancelled()
     if job.confirm_action != "retry_upload":

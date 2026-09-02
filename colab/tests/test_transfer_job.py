@@ -20,6 +20,7 @@ from src.providers.base import ProviderFailure
 from src.providers.pikpak import PikPakProvider
 from src.providers import pikpak as pikpak_mod
 from src.providers.terabox import TeraBoxProvider, TeraBoxSession
+from src.providers import terabox as terabox_mod
 from src.providers import drive as drive_mod
 from src.providers.drive import DriveProvider
 
@@ -353,12 +354,22 @@ def test_drive_mount_source_id_without_token_fails_with_path_hint(tmp_path, monk
 
 def test_provider_folder_locks_are_loop_local():
     async def lock(provider):
-        return provider._lock()
+        return base_mod.dict_lock(provider._folder_locks(provider), ("root", "a"))
 
     for provider in (DriveProvider(), TeraBoxProvider()):
         first = asyncio.run(lock(provider))
         second = asyncio.run(lock(provider))
         assert first is not second
+
+def test_provider_folder_locks_are_per_key():
+    async def locks(provider):
+        store = provider._folder_locks(provider)
+        return base_mod.dict_lock(store, ("root", "a")), base_mod.dict_lock(store, ("root", "b")), base_mod.dict_lock(store, ("root", "a"))
+
+    for provider in (DriveProvider(), TeraBoxProvider()):
+        first, other, again = asyncio.run(locks(provider))
+        assert first is not other
+        assert first is again
 
 def test_drive_api_mode_validate_does_not_require_mount(monkeypatch, tmp_path):
     monkeypatch.setattr(drive_mod, "DRIVE_MOUNT", tmp_path / "missing")
@@ -457,6 +468,7 @@ def test_drive_api_upload_uses_resumable_endpoint(monkeypatch, tmp_path):
             return DoneResponse()
 
     monkeypatch.setattr(drive_mod.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(drive_mod, "API_MULTIPART_MAX", 1)
     path = tmp_path / "a.txt"
     path.write_text("ok")
 
@@ -464,6 +476,51 @@ def test_drive_api_upload_uses_resumable_endpoint(monkeypatch, tmp_path):
 
     assert out["id"] == "file1"
     assert calls == [("POST", f"{drive_mod.DRIVE_UPLOAD_API}/files"), ("PUT", "https://upload.test/session")]
+
+def test_drive_api_upload_uses_multipart_for_small_files(monkeypatch, tmp_path):
+    calls = []
+    seen = {}
+
+    class Response:
+        status_code = 200
+        headers = {}
+        text = ""
+
+        def json(self):
+            return {"id": "file1", "name": "a.txt"}
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            calls.append((method, url, (kwargs.get("params") or {}).get("uploadType")))
+            seen["body"] = kwargs["content"]
+            seen["type"] = (kwargs.get("headers") or {}).get("Content-Type", "")
+            return Response()
+
+        async def put(self, url, **kwargs):
+            calls.append(("PUT", url, None))
+            return Response()
+
+    monkeypatch.setattr(drive_mod.httpx, "AsyncClient", Client)
+    path = tmp_path / "a.txt"
+    path.write_text("ok")
+
+    out = asyncio.run(DriveProvider().upload_file({"access_token": "A", "mount": False}, path, {"id": "root"}, JobState("drive-api-small", {})))
+
+    assert out["id"] == "file1"
+    assert calls == [("POST", f"{drive_mod.DRIVE_UPLOAD_API}/files", "multipart")]
+    assert seen["type"].startswith("multipart/related; boundary=")
+    assert isinstance(seen["body"], bytes)
+    assert b'"parents": ["root"]' in seen["body"]
+    assert seen["body"].endswith(b"\r\n\r\nok\r\n--" + seen["type"].split("boundary=")[1].encode() + b"--\r\n")
 
 def test_drive_api_upload_preserves_relative_parent(monkeypatch, tmp_path):
     seen = {}
@@ -502,6 +559,7 @@ def test_drive_api_upload_preserves_relative_parent(monkeypatch, tmp_path):
             return Response({"id": "file1", "name": "image1.jpg"})
 
     monkeypatch.setattr(drive_mod.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(drive_mod, "API_MULTIPART_MAX", 1)
     path = tmp_path / "image1.jpg"
     path.write_text("ok")
 
@@ -1540,6 +1598,53 @@ class TransferJobTests(TestCase):
         self.assertEqual(out["uploaded"], 3)
         self.assertEqual(out["skipped"], 1)
 
+    def test_optimized_output_uploads_are_concurrent_and_recover_once(self):
+        events = []
+        waits = []
+
+        class Provider:
+            active = 0
+            max_active = 0
+
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                try:
+                    events.append((credentials.get("account"), local_path.name))
+                    await asyncio.sleep(0.01)
+                    if credentials.get("account") != "b":
+                        raise ProviderFailure("UPLOAD_FAILED", "quota")
+                    return {"ok": True}
+                finally:
+                    self.active -= 1
+
+        async def fake_wait(job, target, exc):
+            waits.append(exc.message)
+            await asyncio.sleep(0.01)
+            target.clear()
+            target.update({"credentials": {"account": "b"}, "folder": {}})
+
+        old_wait = transfer_job_mod._wait_for_retry_account
+        old_concurrency = transfer_job_mod.UPLOAD_FILE_CONCURRENCY
+        transfer_job_mod._wait_for_retry_account = fake_wait
+        transfer_job_mod.UPLOAD_FILE_CONCURRENCY = 2
+        try:
+            with __import__("tempfile").TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for name in ("a.jpg", "b.jpg", "c.jpg", "d.jpg"):
+                    (root / name).write_bytes(b"x")
+                provider = Provider()
+                job = JobState("optimized-parallel-retry", {})
+                asyncio.run(transfer_job_mod._upload_outputs(job, {"credentials": {"account": "a"}, "folder": {}}, {}, provider, root, {"type": "folder"}))
+        finally:
+            transfer_job_mod._wait_for_retry_account = old_wait
+            transfer_job_mod.UPLOAD_FILE_CONCURRENCY = old_concurrency
+
+        self.assertEqual(provider.max_active, 2)
+        self.assertEqual(waits, ["quota"])
+        self.assertEqual(job.files_uploaded, 4)
+        self.assertEqual([event for event in events if event[0] == "a"], [("a", "a.jpg"), ("a", "b.jpg")])
+
     def test_terabox_upload_falls_back_to_lower_concurrency(self):
         class Provider(TeraBoxProvider):
             def __init__(self):
@@ -1573,16 +1678,93 @@ class TransferJobTests(TestCase):
         try:
             with __import__("tempfile").TemporaryDirectory() as tmp:
                 path = Path(tmp) / "a.bin"
-                path.write_bytes(b"x" * 9)
+                path.write_bytes(b"x" * (terabox_mod.PART * 2 + 1))
                 provider = Provider()
                 job = JobState("upload", {})
                 asyncio.run(provider.upload_file({"cookies": {"ndus": "x"}}, path, {"id": "/"}, job))
+                single = Provider()
+                single_path = Path(tmp) / "b.bin"
+                single_path.write_bytes(b"x" * 9)
+                with self.assertRaises(ProviderFailure):
+                    asyncio.run(single.upload_file({"cookies": {"ndus": "x"}}, single_path, {"id": "/"}, JobState("upload-single", {})))
         finally:
             TeraBoxSession.ready = old_ready
             TeraBoxSession.request_json = old_request_json
 
         self.assertEqual(provider.concurrency[:2], [32, 16])
         self.assertEqual(job.progress.upload, 100)
+        # One part cannot be split further: retrying at lower concurrency would repeat the same request.
+        self.assertEqual(single.concurrency, [32])
+
+    def test_terabox_precreate_rate_limit_raises_rate_limited(self):
+        class Response:
+            status_code = 200
+            text = ""
+            cookies = {}
+
+            def json(self):
+                return {"errno": 31034}
+
+        class Session:
+            base = "https://www.terabox.com"
+            jstoken = "j"
+            cookies = {}
+
+            def params(self, **extra):
+                return extra
+
+            def headers(self):
+                return {}
+
+            def client(self):
+                return self
+
+            async def post(self, *args, **kwargs):
+                return Response()
+
+        with self.assertRaises(ProviderFailure) as ctx:
+            asyncio.run(TeraBoxProvider()._precreate_upload(Session(), "/a.bin", "/", 1, {"chunks": ["x"], "file": "f", "slice": "s", "crc32": 1}))
+
+        self.assertEqual(ctx.exception.code, "PROVIDER_RATE_LIMITED")
+
+    def test_terabox_one_off_sessions_are_not_tracked(self):
+        tracked = []
+        closed = []
+
+        class Response:
+            status_code = 200
+            text = ""
+            cookies = {}
+
+            def json(self):
+                return {"data": {}, "list": []}
+
+        class Client:
+            is_closed = False
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def request(self, method, url, **kwargs):
+                return Response()
+
+            async def aclose(self):
+                self.is_closed = True
+                closed.append(True)
+
+        old_client = terabox_mod.httpx.AsyncClient
+        old_track = terabox_mod.track_client
+        terabox_mod.httpx.AsyncClient = Client
+        terabox_mod.track_client = lambda client: tracked.append(client) or client
+        try:
+            out = asyncio.run(TeraBoxProvider().list_files({"cookies": {"ndus": "x"}, "jstoken": "j", "bdstoken": "b"}, "/"))
+        finally:
+            terabox_mod.httpx.AsyncClient = old_client
+            terabox_mod.track_client = old_track
+
+        self.assertEqual(out["items"], [])
+        self.assertEqual(tracked, [])
+        self.assertEqual(closed, [True])
 
     def test_terabox_reuses_existing_results_folder(self):
         class Session:

@@ -66,10 +66,11 @@ class JobState:
 
     def add_bytes(self, n: int, total: int = 0, phase: str = "download", total_key: str | None = None) -> None:
         if phase != self._phase:
+            # Phases interleave across optimize batches (download A, upload A, download B, ...).
+            # Resume this phase's own running totals so the bar never restarts per batch.
             self._phase = phase
-            self._phase_done = 0
-            self._phase_total = 0
-            self._phase_total_keys.clear()
+            self._phase_done = self._phase_done_by_name.get(phase, 0)
+            self._phase_total = self._phase_total_by_name.get(phase, 0)
         if total_key and total:
             key = (phase, total_key)
             if key not in self._phase_total_keys:
@@ -80,7 +81,7 @@ class JobState:
             self._phase_total = total
         self.bytes_done += n
         self._phase_done += n
-        self._phase_done_by_name[phase] = self._phase_done_by_name.get(phase, 0) + n
+        self._phase_done_by_name[phase] = self._phase_done
         if self._phase_total:
             self.bytes_total = self._phase_total
             setattr(self.progress, phase, min(100, self._phase_done / self._phase_total * 100))
