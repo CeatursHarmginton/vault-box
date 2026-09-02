@@ -110,7 +110,17 @@ async def run_transfer(job: JobState) -> None:
             
             # Only ask for confirmation if there are actual optimized image results
             if job.optimized_files:
-                action = _wait_for_confirmation(job, len(job.optimized_files))
+                conf_mode = options.get("confirm_action") or options.get("confirmation_mode")
+                if conf_mode == "replace":
+                    action = "replace"
+                    job.log("Confirmation strategy: replace original files directly.")
+                elif conf_mode in ("upload_new", "auto"):
+                    action = "upload_new"
+                    options["_auto_confirm_upload_new"] = True
+                    job.log("Confirmation strategy: auto upload as new (fallback to replace if failed).")
+                else:
+                    action = _wait_for_confirmation(job, len(job.optimized_files))
+
                 if action == "replace":
                     options["replace"] = True
                 elif action == "upload_new":
@@ -228,7 +238,16 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
             continue
 
         if batch_results and action is None:
-            action = _wait_for_confirmation(job, len(batch_results))
+            conf_mode = options.get("confirm_action") or options.get("confirmation_mode")
+            if conf_mode == "replace":
+                action = "replace"
+                job.log("Confirmation strategy: replace original files directly.")
+            elif conf_mode in ("upload_new", "auto"):
+                action = "upload_new"
+                options["_auto_confirm_upload_new"] = True
+                job.log("Confirmation strategy: auto upload as new (fallback to replace if failed).")
+            else:
+                action = _wait_for_confirmation(job, len(batch_results))
         action = action or ("replace" if options.get("replace") else "upload_new")
         options["replace"] = action == "replace"
         options.pop("upload_prefix", None)

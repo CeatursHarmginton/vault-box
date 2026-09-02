@@ -1946,3 +1946,69 @@ class TransferJobPathSafetyTests(TestCase):
         self.assertEqual(job.status, "failed")
         self.assertEqual(job.error["code"], "DOWNLOAD_FAILED")
         self.assertEqual(dst.calls, [])
+
+    def test_confirmation_strategy_replace_directly(self):
+        class OneFileSource:
+            async def download_file(self, credentials, file_ref, local_path: Path, progress: JobState):
+                path = local_path / file_ref["name"]
+                path.write_bytes(b"image data")
+                return path
+
+        dst = UploadRecorder()
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            out = output_dir / "pic.jpg"
+            out.write_bytes(b"opt data")
+            return [{"name": "pic.jpg", "original_size": 10, "optimized_size": 8, "status": "ok"}]
+
+        PROVIDERS.update({"fake-source": OneFileSource(), "fake-dst": dst})
+        image_optimizer.optimize_directory = fake_optimize
+        try:
+            job = JobState("opt-strategy-replace", {
+                "source": {"provider": "fake-source", "items": [{"type": "file", "name": "pic.jpg", "id": "f1"}]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True, "confirm_action": "replace"},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-strategy-replace")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertTrue(job.payload["options"].get("replace"))
+
+    def test_confirmation_strategy_auto_upload_new(self):
+        class OneFileSource:
+            async def download_file(self, credentials, file_ref, local_path: Path, progress: JobState):
+                path = local_path / file_ref["name"]
+                path.write_bytes(b"image data")
+                return path
+
+        dst = UploadRecorder()
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            out = output_dir / "pic.jpg"
+            out.write_bytes(b"opt data")
+            return [{"name": "pic.jpg", "original_size": 10, "optimized_size": 8, "status": "ok"}]
+
+        PROVIDERS.update({"fake-source": OneFileSource(), "fake-dst": dst})
+        image_optimizer.optimize_directory = fake_optimize
+        try:
+            job = JobState("opt-strategy-upload-new", {
+                "source": {"provider": "fake-source", "items": [{"type": "file", "name": "pic.jpg", "id": "f1"}]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True, "confirm_action": "upload_new"},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-strategy-upload-new")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(job.payload["options"].get("upload_prefix"), "results")
