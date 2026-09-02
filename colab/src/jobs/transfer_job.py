@@ -36,7 +36,8 @@ async def run_transfer(job: JobState) -> None:
         job.log(f"Job start: {source.get('provider')} -> {target.get('provider')}")
         job.log(f"Accounts: source={source.get('accountId') or source.get('account_id') or '-'} target={target.get('accountId') or target.get('account_id') or '-'}")
 
-        if options.get("optimize_image") and len(source.get("items") or []) > 1:
+        has_folder_batch = any((item.get("type") == "folder" or item.get("is_folder")) for item in (source.get("items") or []))
+        if options.get("optimize_image") and len(source.get("items") or []) > 1 and has_folder_batch:
             await _run_optimized_batches(job, dirs, source, target, options, src, dst)
             job.log(f"Done: Downloaded {job.files_downloaded}/{job.files_to_download} file(s), Uploaded {job.files_uploaded}/{job.files_to_upload} file(s) (skipped {job.files_skipped} file(s))")
             job.set(status="completed", step="completed")

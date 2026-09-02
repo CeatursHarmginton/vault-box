@@ -836,6 +836,51 @@ class UploadRecorder:
 
 
 class TransferJobTests(TestCase):
+    def test_optimize_multiple_files_uses_one_optimize_pass(self):
+        class Source:
+            def __init__(self):
+                self.downloaded = []
+
+            async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
+                self.downloaded.append(file_ref["name"])
+                path = local_dir / file_ref["name"]
+                path.write_bytes(b"x")
+                return path
+
+        src = Source()
+        dst = UploadRecorder()
+        optimize_calls = []
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            optimize_calls.append(sorted(p.name for p in input_dir.glob("*.jpg")))
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for name in optimize_calls[-1]:
+                (output_dir / name).write_bytes(b"x")
+            return [{"name": name, "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95} for name in optimize_calls[-1]]
+        PROVIDERS.update({"fake-source": src, "fake-dst": dst})
+        image_optimizer.optimize_directory = fake_optimize
+        try:
+            job = JobState("opt-many-files-one-pass", {
+                "source": {"provider": "fake-source", "items": [
+                    {"type": "file", "id": "a", "name": "a.jpg"},
+                    {"type": "file", "id": "b", "name": "b.jpg"},
+                    {"type": "file", "id": "c", "name": "c.jpg"},
+                ]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True, "confirm_action": "upload_new"},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-many-files-one-pass")
+
+        self.assertEqual(src.downloaded, ["a.jpg", "b.jpg", "c.jpg"])
+        self.assertEqual(optimize_calls, [["a.jpg", "b.jpg", "c.jpg"]])
+        self.assertEqual(job.status, "completed", job.error)
+
     def test_folder_source_uploads_tree_even_when_one_file(self):
         dst = UploadRecorder()
         old = dict(PROVIDERS)
