@@ -92,6 +92,65 @@ def test_links_provider_resolves_mediafire_before_aria2(tmp_path, monkeypatch):
     assert seen["name"] == "real file.rar"
     assert out.name == "real file.rar"
 
+def test_links_provider_treats_gofile_direct_download_as_direct(tmp_path, monkeypatch):
+    provider = LinksProvider()
+    seen = {}
+
+    async def no_deps():
+        return None
+
+    async def fake_aria2(url, dest_dir, name, progress):
+        seen["url"] = url
+        out = dest_dir / (name or "file.rar")
+        out.write_text("ok")
+        return [out]
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr(provider, "_download_aria2", fake_aria2)
+
+    url = "https://store-na-phx-5.gofile.io/download/web/39d1667c/file.rar"
+    out = asyncio.run(provider.download_file({}, {"id": url, "name": "file.rar"}, tmp_path, JobState("gofile-direct", {})))
+
+    assert seen["url"] == url
+    assert out.name == "file.rar"
+
+def test_links_provider_rejects_gofile_page_with_direct_link_hint(tmp_path, monkeypatch):
+    provider = LinksProvider()
+
+    async def no_deps():
+        return None
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+
+    try:
+        asyncio.run(provider.download_file({}, {"id": "https://gofile.io/d/abc123", "name": "abc123"}, tmp_path, JobState("gofile-page", {})))
+    except ProviderFailure as exc:
+        assert exc.code == "SOURCE_FILE_NOT_FOUND"
+        assert "store-*.gofile.io/download/web/" in exc.message
+    else:
+        raise AssertionError("expected ProviderFailure")
+
+def test_links_provider_routes_magnet_and_torrent_to_aria2_torrent(tmp_path, monkeypatch):
+    provider = LinksProvider()
+    seen = []
+
+    async def no_deps():
+        return None
+
+    async def fake_torrent(url, dest_dir, progress):
+        seen.append(url)
+        out = dest_dir / f"file{len(seen)}.bin"
+        out.write_text("ok")
+        return [out]
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr(provider, "_download_torrent", fake_torrent)
+
+    asyncio.run(provider.download_file({}, {"id": "magnet:?xt=urn:btih:abc", "name": "magnet"}, tmp_path, JobState("magnet", {})))
+    asyncio.run(provider.download_file({}, {"id": "https://example.com/archive.torrent", "name": "archive.torrent"}, tmp_path, JobState("torrent", {})))
+
+    assert seen == ["magnet:?xt=urn:btih:abc", "https://example.com/archive.torrent"]
+
 def test_links_source_uploads_all_landed_files(tmp_path, monkeypatch):
     dirs = {"input": tmp_path / "input", "output": tmp_path / "output"}
     dirs["input"].mkdir()

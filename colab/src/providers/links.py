@@ -15,6 +15,8 @@ import httpx
 from ..providers.base import BaseProvider, ProviderFailure, safe_name
 from ..jobs.progress import JobState
 
+BT_TRACKERS = "udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,udp://tracker.openbittorrent.com:6969/announce,udp://exodus.desync.com:6969/announce"
+
 class LinksProvider(BaseProvider):
     """Provider for downloading files from user-provided URLs."""
     
@@ -47,6 +49,10 @@ class LinksProvider(BaseProvider):
         url_lower = url.lower()
         if url_lower.startswith("magnet:?xt=") or url_lower.endswith(".torrent"):
             return "torrent"
+
+        parsed = urlparse(url_lower)
+        if parsed.netloc.endswith("gofile.io"):
+            return "direct" if parsed.path.startswith("/download/web/") else "gofile_page"
             
         if "mediafire.com" in url_lower:
             return "mediafire"
@@ -54,7 +60,7 @@ class LinksProvider(BaseProvider):
         ytdlp_domains = [
             "youtube", "youtu.be", "tiktok", "bilibili", "vimeo", 
             "dailymotion", "twitch", "mega.nz", 
-            "pixeldrain.com", "gofile.io", "1fichier.com"
+            "pixeldrain.com", "1fichier.com"
         ]
         
         if url_lower.endswith(".m3u8") or url_lower.endswith(".mpd"):
@@ -124,12 +130,18 @@ class LinksProvider(BaseProvider):
             "aria2c", 
             f"--dir={dest_dir}",
             "--seed-time=0",
-            "--bt-stop-timeout=120",
+            "--bt-stop-timeout=300",
             "--bt-max-peers=80",
+            "--enable-dht=true",
+            "--enable-peer-exchange=true",
+            f"--bt-tracker={BT_TRACKERS}",
             "--summary-interval=1",
             "--console-log-level=warn",
             "--auto-file-renaming=true",
-            "--allow-overwrite=true"
+            "--allow-overwrite=true",
+            "--max-tries=5",
+            "--retry-wait=5",
+            "--timeout=60"
         ]
         cmd.append(url)
         
@@ -144,12 +156,15 @@ class LinksProvider(BaseProvider):
         )
 
         last_done = 0
+        output_tail: list[str] = []
         if process.stdout:
             while True:
                 line_bytes = await process.stdout.readline()
                 if not line_bytes:
                     break
                 line = line_bytes.decode('utf-8', errors='ignore').strip()
+                if line:
+                    output_tail = (output_tail + [line])[-3:]
                 progress.check_cancelled()
                 parsed = self._parse_aria2_progress(line)
                 if parsed:
@@ -161,7 +176,8 @@ class LinksProvider(BaseProvider):
 
         await process.wait()
         if process.returncode != 0:
-            raise ProviderFailure("DOWNLOAD_FAILED", f"aria2c exited with code {process.returncode}")
+            detail = f": {' | '.join(output_tail)}" if output_tail else ""
+            raise ProviderFailure("DOWNLOAD_FAILED", f"aria2c exited with code {process.returncode}{detail}")
 
         after = set(dest_dir.iterdir()) if dest_dir.exists() else set()
         new_files = [p for p in (after - before) if p.is_file() and not p.name.endswith(".aria2")]
@@ -278,6 +294,8 @@ class LinksProvider(BaseProvider):
 
         if link_type == "torrent":
             downloaded = await self._download_torrent(url, dest_dir, progress)
+        elif link_type == "gofile_page":
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Gofile page links are not direct downloads. Click Download in browser, stop it, copy the store-*.gofile.io/download/web/... URL, then paste that link.")
         elif link_type == "mediafire":
             downloaded = await self._download_mediafire(url, dest_dir, name, progress)
         elif link_type == "ytdlp":
