@@ -36,8 +36,10 @@ async def run_transfer(job: JobState) -> None:
         job.log(f"Job start: {source.get('provider')} -> {target.get('provider')}")
         job.log(f"Accounts: source={source.get('accountId') or source.get('account_id') or '-'} target={target.get('accountId') or target.get('account_id') or '-'}")
 
-        has_folder_batch = any((item.get("type") == "folder" or item.get("is_folder")) for item in (source.get("items") or []))
-        if options.get("optimize_image") and len(source.get("items") or []) > 1 and has_folder_batch:
+        items = source.get("items") or []
+        has_folder_batch = any((item.get("type") == "folder" or item.get("is_folder")) for item in items)
+        has_mixed_source_scope = len({_item_scope(source, item) for item in items}) > 1
+        if options.get("optimize_image") and len(items) > 1 and (has_folder_batch or has_mixed_source_scope):
             await _run_optimized_batches(job, dirs, source, target, options, src, dst)
             job.log(f"Done: Downloaded {job.files_downloaded}/{job.files_to_download} file(s), Uploaded {job.files_uploaded}/{job.files_to_upload} file(s) (skipped {job.files_skipped} file(s))")
             _log_skip_summary(job)
@@ -315,7 +317,8 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
             if folder_root:
                 upload_root = folder_root
         job.set(status="running", step="uploading")
-        await _upload_outputs_with_retry(job, target, options, dst, upload_root, item)
+        item_target, item_dst = _item_upload_target(source, target, dst, item)
+        await _upload_outputs_with_retry(job, item_target, options, item_dst, upload_root, item)
         shutil.rmtree(batch_input, ignore_errors=True)
         shutil.rmtree(batch_output.parent, ignore_errors=True)
         if not item_failed:
@@ -340,21 +343,43 @@ async def _download_batch_item(job: JobState, source: dict[str, Any], src: Any, 
         progress=job, label=_item_name(item),
     )]
 
+def _item_scope(source: dict[str, Any], item: dict[str, Any]) -> tuple[str, str]:
+    provider = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
+    account = str(item.get("accountId") or item.get("account_id") or (item.get("meta") or {}).get("accountId") or (item.get("meta") or {}).get("account_id") or source.get("accountId") or source.get("account_id") or "")
+    return provider, account
+
+def _item_upload_target(source: dict[str, Any], target: dict[str, Any], dst: Any, item: dict[str, Any]) -> tuple[dict[str, Any], Any]:
+    provider, account = _item_scope(source, item)
+    source_provider, source_account = _item_scope({}, source)
+    target_provider = str(target.get("provider") or "").lower()
+    target_account = str(target.get("accountId") or target.get("account_id") or "")
+    if target_provider != source_provider or target_account != source_account:
+        return target, dst
+    if provider == target_provider and account == target_account:
+        return target, dst
+    return {
+        **target,
+        "provider": provider,
+        "accountId": account,
+        "account_id": account,
+        "credentials": item.get("credentials") or target.get("credentials") or {},
+    }, PROVIDERS.get(provider, dst)
+
 def _mark_item_skipped(job: JobState, source: dict[str, Any], item: dict[str, Any], reason: str) -> None:
     """Park a queue item: skipped this run, still in the queue for the next one."""
     ref = _queue_item_ref(source, item)
-    key = (str(ref.get("provider") or ""), str(ref.get("id") or ""))
-    if any((str(f.get("provider") or ""), str(f.get("id") or "")) == key for f in job.failed_items):
+    key = (str(ref.get("provider") or ""), str(ref.get("accountId") or ref.get("account_id") or ""), str(ref.get("id") or ""))
+    if any((str(f.get("provider") or ""), str(f.get("accountId") or f.get("account_id") or ""), str(f.get("id") or "")) == key for f in job.failed_items):
         return
     job.failed_items.append({**ref, "name": _item_name(item), "reason": reason})
     job.log(f"[SKIP] Kept in queue, moving to the next item: {_item_name(item)} ({reason})")
 
 def _mark_remaining_items_completed(job: JobState, source: dict[str, Any]) -> None:
     """Name every item that was not skipped, so the queue drops exactly those."""
-    seen = {(str(entry.get("provider") or ""), str(entry.get("id") or "")) for entry in (*job.failed_items, *job.completed_items)}
+    seen = {(str(entry.get("provider") or ""), str(entry.get("accountId") or entry.get("account_id") or ""), str(entry.get("id") or "")) for entry in (*job.failed_items, *job.completed_items)}
     for item in source.get("items") or []:
         ref = _queue_item_ref(source, item)
-        key = (str(ref.get("provider") or ""), str(ref.get("id") or ""))
+        key = (str(ref.get("provider") or ""), str(ref.get("accountId") or ref.get("account_id") or ""), str(ref.get("id") or ""))
         if key not in seen:
             job.completed_items.append(ref)
             seen.add(key)
@@ -573,11 +598,16 @@ def _item_name(item: dict[str, Any]) -> str:
     return safe_name(PurePosixPath(raw_name).name or raw_name)
 
 def _queue_item_ref(source: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
-    return {
+    account = item.get("accountId") or item.get("account_id") or (item.get("meta") or {}).get("accountId") or (item.get("meta") or {}).get("account_id") or source.get("accountId") or source.get("account_id")
+    ref = {
         "provider": item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider"),
         "id": item.get("id") or item.get("path"),
         "path": item.get("path") or item.get("id"),
     }
+    if account:
+        ref["accountId"] = account
+        ref["account_id"] = account
+    return ref
 
 def _is_video_item(item: dict[str, Any]) -> bool:
     return Path(str(item.get("name") or item.get("path") or item.get("id") or "")).suffix.lower() in VIDEO_EXTENSIONS

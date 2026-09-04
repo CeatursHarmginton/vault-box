@@ -1237,6 +1237,56 @@ class TransferJobTests(TestCase):
         self.assertEqual([r["relative_path"] for r in dst.target_refs], ["results/A (optimized)/a.jpg", "results/B (optimized)/a.jpg"])
         self.assertEqual(len([line for line in job.logs if "Waiting for confirmation" in line]), 1)
 
+    def test_optimize_queue_processes_mixed_provider_accounts_in_one_job(self):
+        class Provider:
+            def __init__(self):
+                self.downloads = []
+                self.uploads = []
+
+            async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
+                self.downloads.append((credentials.get("account"), file_ref["name"]))
+                path = local_dir / file_ref["name"]
+                path.write_bytes(b"x")
+                return path
+
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                self.uploads.append((credentials.get("account"), local_path.name, target_ref))
+                return {"ok": True}
+
+        p1 = Provider()
+        p2 = Provider()
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            src = next(input_dir.rglob("*.jpg"))
+            out = output_dir / src.name
+            out.write_bytes(b"x")
+            return [{"name": src.name, "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95}]
+        PROVIDERS.update({"p1": p1, "p2": p2})
+        image_optimizer.optimize_directory = fake_optimize
+        try:
+            job = JobState("opt-mixed-scope", {
+                "source": {"provider": "p1", "accountId": "a", "items": [
+                    {"type": "file", "name": "a.jpg", "id": "/a/a.jpg", "path": "/a/a.jpg", "provider": "p1", "accountId": "a", "credentials": {"account": "a"}},
+                    {"type": "file", "name": "b.jpg", "id": "/b/b.jpg", "path": "/b/b.jpg", "provider": "p2", "accountId": "b", "credentials": {"account": "b"}},
+                ]},
+                "target": {"provider": "p1", "accountId": "a", "folder": {"id": "/", "path": "/"}, "credentials": {"account": "a"}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True, "confirm_action": "upload_new"},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-mixed-scope")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(p1.downloads, [("a", "a.jpg")])
+        self.assertEqual(p2.downloads, [("b", "b.jpg")])
+        self.assertEqual([u[0] for u in p1.uploads], ["a"])
+        self.assertEqual([u[0] for u in p2.uploads], ["b"])
+        self.assertEqual([u[2]["id"] for u in [*p1.uploads, *p2.uploads]], ["/a", "/b"])
+
     def test_optimized_upload_failure_waits_for_retry_account(self):
         class Source:
             async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
