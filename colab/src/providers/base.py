@@ -86,6 +86,7 @@ DOWNLOAD_RETRY_DELAY = 20.0
 # Failures where the bytes are probably still fetchable later: retry, then skip the item.
 RETRYABLE_DOWNLOAD_CODES = {"DOWNLOAD_FAILED", "PROVIDER_NEEDS_VERIFY", "PROVIDER_RATE_LIMITED"}
 SKIPPABLE_DOWNLOAD_CODES = RETRYABLE_DOWNLOAD_CODES | {"SOURCE_FILE_NOT_FOUND"}
+ARCHIVE_DOWNLOAD_EXTENSIONS = (".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".iso")
 
 def is_verify_error(err: dict[str, Any] | None) -> bool:
     if not err:
@@ -344,7 +345,11 @@ def _skip_optimize_item(item: dict[str, Any], progress: JobState) -> bool:
         return False
     options = progress.payload.get("options") or {}
     name = str(item.get("name") or item.get("server_filename") or item.get("path") or item.get("id") or "")
-    if Path(name).suffix.lower() not in IMAGE_EXTENSIONS:
+    lower_name = name.lower()
+    suffix = Path(name).suffix.lower()
+    if suffix not in IMAGE_EXTENSIONS:
+        if options.get("extract") and (lower_name.endswith(ARCHIVE_DOWNLOAD_EXTENSIONS) or (len(suffix) == 4 and suffix[1:].isdigit())):
+            return False
         return True
     size = int(item.get("size") or item.get("file_size") or item.get("bytes") or 0)
     if not size:

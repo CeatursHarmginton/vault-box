@@ -263,6 +263,33 @@ def test_extract_without_archives_stages_input_files(tmp_path, monkeypatch):
 
     assert [p.relative_to(output_dir).as_posix() for p in out] == ["folder/note.txt"]
 
+def test_optimize_extract_folder_download_keeps_archive_parts(tmp_path):
+    class Provider(base_mod.BaseProvider):
+        async def validate_credentials(self, credentials):
+            return {"ok": True}
+
+        async def list_files(self, credentials, path_or_id):
+            return {"items": [
+                {"type": "file", "id": "a1", "name": "set.part1.rar"},
+                {"type": "file", "id": "a2", "name": "set.part2.rar"},
+                {"type": "file", "id": "note", "name": "note.txt"},
+            ]}
+
+        async def download_file(self, credentials, file_ref, local_path: Path, progress: JobState):
+            local_path.write_text("x")
+            return local_path
+
+        async def upload_file(self, credentials, local_path, target_ref, progress):
+            return {"ok": True}
+
+    job = JobState("archive-parts", {"options": {"optimize_image": True, "extract": True}})
+
+    out = asyncio.run(Provider().download_folder({}, {"id": "/", "name": "root"}, tmp_path, job))
+
+    assert {p.name for p in out} == {"set.part1.rar", "set.part2.rar"}
+    assert any("note.txt" in line and "ignored by image optimizer" in line for line in job.logs)
+    assert not any("set.part" in line and "ignored by image optimizer" in line for line in job.logs)
+
 def test_optimize_queue_unzip_fallback_uploads_archive_and_passwords(monkeypatch):
     class Source:
         async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
