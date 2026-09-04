@@ -115,17 +115,17 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
     archive_originals = {p for archive in found for p in _archive_originals(archive)}
     keep_originals: list[Path] = []
 
-    pw_candidates: list[str | None] = []
+    pw_candidates: list[str | None] = [None]
     if isinstance(password, list):
         for pw in password:
             val = str(pw).strip() if pw is not None else ""
             if val and val not in pw_candidates:
                 pw_candidates.append(val)
     elif isinstance(password, str) and password.strip():
-        pw_candidates.append(password.strip())
-    if None not in pw_candidates:
-        pw_candidates.append(None)
-    progress.log(f"Archive password candidates: {len(pw_candidates) - 1}; trying passwords first, then no-password fallback")
+        val = password.strip()
+        if val not in pw_candidates:
+            pw_candidates.append(val)
+    progress.log(f"Archive password candidates: {len(pw_candidates) - 1}; trying no-password first, then password candidates")
     progress.log(f"Archive tools: 7z=yes unrar={'yes' if shutil.which('unrar') else 'no'}")
 
     for i, archive in enumerate(found, 1):
@@ -143,7 +143,7 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
             for tool in tools:
                 progress.log(f"Trying {tool}: {archive.name}")
                 for attempt, pw in enumerate(pw_candidates, 1):
-                    progress.log(f"Trying {tool} password #{attempt}" if pw else f"Trying {tool} without password")
+                    progress.log(f"Trying {tool} with password #{attempt - 1}" if pw else f"Trying {tool} without password")
                     proc = await asyncio.create_subprocess_exec(*_extract_cmd(tool, archive, extract_dir, pw), stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
                     out, _ = await proc.communicate()
                     text = out.decode(errors="ignore")
