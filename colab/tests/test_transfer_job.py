@@ -151,6 +151,41 @@ def test_links_provider_routes_magnet_and_torrent_to_aria2_torrent(tmp_path, mon
 
     assert seen == ["magnet:?xt=urn:btih:abc", "https://example.com/archive.torrent"]
 
+def test_links_provider_reads_aria2_carriage_return_progress(tmp_path, monkeypatch):
+    provider = LinksProvider()
+    out = tmp_path / "done.bin"
+    out.write_text("ok")
+
+    class Stdout:
+        def __init__(self):
+            self.chunks = [
+                b"[#abc 1MiB/4MiB(25%) CN:1 DL:1MiB]\r",
+                b"[#abc 3MiB/4MiB(75%) CN:1 DL:2MiB]\r",
+                b"",
+            ]
+
+        async def read(self, _size):
+            return self.chunks.pop(0)
+
+    class Proc:
+        stdout = Stdout()
+        returncode = 0
+
+        async def wait(self):
+            return None
+
+    async def fake_exec(*args, **kwargs):
+        return Proc()
+
+    monkeypatch.setattr("src.providers.links.asyncio.create_subprocess_exec", fake_exec)
+    job = JobState("aria2-cr", {})
+
+    asyncio.run(provider._run_aria2_cmd(["aria2c", "magnet:?xt=urn:btih:abc"], tmp_path, job))
+
+    assert job.progress.download == 75
+    assert job.bytes_done == 3 * 1024 * 1024
+    assert job.bytes_total == 4 * 1024 * 1024
+
 def test_links_source_uploads_all_landed_files(tmp_path, monkeypatch):
     dirs = {"input": tmp_path / "input", "output": tmp_path / "output"}
     dirs["input"].mkdir()

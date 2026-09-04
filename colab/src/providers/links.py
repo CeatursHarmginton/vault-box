@@ -126,6 +126,7 @@ class LinksProvider(BaseProvider):
         return await self._run_aria2_cmd(cmd, dest_dir, progress)
 
     async def _download_torrent(self, url: str, dest_dir: Path, progress: JobState) -> list[Path]:
+        progress.log("Starting aria2c torrent download")
         cmd = [
             "aria2c", 
             f"--dir={dest_dir}",
@@ -159,20 +160,21 @@ class LinksProvider(BaseProvider):
         output_tail: list[str] = []
         if process.stdout:
             while True:
-                line_bytes = await process.stdout.readline()
-                if not line_bytes:
+                chunk = await process.stdout.read(1024)
+                if not chunk:
                     break
-                line = line_bytes.decode('utf-8', errors='ignore').strip()
-                if line:
-                    output_tail = (output_tail + [line])[-3:]
-                progress.check_cancelled()
-                parsed = self._parse_aria2_progress(line)
-                if parsed:
-                    done, total = parsed
-                    diff = done - last_done
-                    if diff > 0:
-                        progress.add_bytes(diff, total)
-                    last_done = done
+                for line in chunk.decode('utf-8', errors='ignore').replace("\r", "\n").splitlines():
+                    line = line.strip()
+                    if line:
+                        output_tail = (output_tail + [line])[-3:]
+                    progress.check_cancelled()
+                    parsed = self._parse_aria2_progress(line)
+                    if parsed:
+                        done, total = parsed
+                        diff = done - last_done
+                        if diff > 0:
+                            progress.add_bytes(diff, total)
+                        last_done = done
 
         await process.wait()
         if process.returncode != 0:

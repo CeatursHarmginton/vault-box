@@ -589,7 +589,8 @@ def _validate_downloads(downloaded: list[Path], root: Path) -> None:
 
 def _item_target_folder(folder: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
     item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
-    raw = str(item.get("path") or item.get("id") or "")
+    relay = item.get("relay") if isinstance(item.get("relay"), dict) else {}
+    raw = str(relay.get("sourcePath") or relay.get("sourceId") or item.get("path") or item.get("id") or "")
     if item_type == "folder" and raw:
         return {**folder, "id": raw, "path": raw}
     if raw:
@@ -604,10 +605,12 @@ def _item_name(item: dict[str, Any]) -> str:
 
 def _queue_item_ref(source: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
     account = item.get("accountId") or item.get("account_id") or (item.get("meta") or {}).get("accountId") or (item.get("meta") or {}).get("account_id") or source.get("accountId") or source.get("account_id")
+    relay = item.get("relay") if isinstance(item.get("relay"), dict) else {}
+    original = relay.get("sourcePath") or relay.get("sourceId")
     ref = {
         "provider": item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider"),
-        "id": item.get("id") or item.get("path"),
-        "path": item.get("path") or item.get("id"),
+        "id": original or item.get("id") or item.get("path"),
+        "path": original or item.get("path") or item.get("id"),
     }
     if account:
         ref["accountId"] = account
