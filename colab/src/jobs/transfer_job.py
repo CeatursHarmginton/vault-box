@@ -63,9 +63,12 @@ async def run_transfer(job: JobState) -> None:
         async def download_one(item: dict[str, Any]) -> list[Path]:
             async with sem:
                 job.check_cancelled()
+                item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
+                item_src = PROVIDERS.get(item_prov, src)
+                item_creds = item.get("credentials") or source.get("credentials") or {}
                 try:
                     return [await download_with_retry(
-                        lambda: src.download_file(source.get("credentials") or {}, item, dirs["input"], job),
+                        lambda: item_src.download_file(item_creds, item, dirs["input"], job),
                         progress=job, label=_item_name(item),
                     )]
                 except ProviderFailure as exc:
@@ -83,8 +86,11 @@ async def run_transfer(job: JobState) -> None:
                 folder_dir = dirs["input"] / safe_name(PurePosixPath(raw_name).name or raw_name)
                 folder_dir.mkdir(parents=True, exist_ok=True)
                 failed_before = job.files_failed
+                item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
+                item_src = PROVIDERS.get(item_prov, src)
+                item_creds = item.get("credentials") or source.get("credentials") or {}
                 try:
-                    downloaded.extend(await src.download_folder(source.get("credentials") or {}, item, folder_dir, job))
+                    downloaded.extend(await item_src.download_folder(item_creds, item, folder_dir, job))
                 except ProviderFailure as exc:
                     if not is_skippable_download_failure(exc):
                         raise
@@ -320,14 +326,17 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
 
 async def _download_batch_item(job: JobState, source: dict[str, Any], src: Any, item: dict[str, Any], batch_input: Path) -> list[Path]:
     item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
+    item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
+    item_src = PROVIDERS.get(item_prov, src)
+    item_creds = item.get("credentials") or source.get("credentials") or {}
     if item_type == "folder":
         raw_name = str(item.get("name") or item.get("path") or item.get("id") or "folder").replace("\\", "/")
         folder_dir = batch_input / safe_name(PurePosixPath(raw_name).name or raw_name)
         folder_dir.mkdir(parents=True, exist_ok=True)
-        return await src.download_folder(source.get("credentials") or {}, item, folder_dir, job)
+        return await item_src.download_folder(item_creds, item, folder_dir, job)
     job.files_to_download += 1
     return [await download_with_retry(
-        lambda: src.download_file(source.get("credentials") or {}, item, batch_input, job),
+        lambda: item_src.download_file(item_creds, item, batch_input, job),
         progress=job, label=_item_name(item),
     )]
 
