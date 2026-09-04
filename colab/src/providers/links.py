@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import html
 import os
 import re
 import shutil
@@ -7,6 +8,9 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
+
+import httpx
 
 from ..providers.base import BaseProvider, ProviderFailure, safe_name
 from ..jobs.progress import JobState
@@ -44,9 +48,12 @@ class LinksProvider(BaseProvider):
         if url_lower.startswith("magnet:?xt=") or url_lower.endswith(".torrent"):
             return "torrent"
             
+        if "mediafire.com" in url_lower:
+            return "mediafire"
+
         ytdlp_domains = [
             "youtube", "youtu.be", "tiktok", "bilibili", "vimeo", 
-            "dailymotion", "twitch", "mediafire.com", "mega.nz", 
+            "dailymotion", "twitch", "mega.nz", 
             "pixeldrain.com", "gofile.io", "1fichier.com"
         ]
         
@@ -223,6 +230,29 @@ class LinksProvider(BaseProvider):
             progress.log(f"gdown failed, falling back to yt-dlp: {e}")
             return await self._download_ytdlp(url, dest_dir, name, progress)
 
+    async def _resolve_mediafire_url(self, url: str) -> str:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+        text = resp.text
+        patterns = (
+            r'href=["\']([^"\']+)["\'][^>]*id=["\']downloadButton["\']',
+            r'id=["\']downloadButton["\'][^>]*href=["\']([^"\']+)["\']',
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, re.I | re.S)
+            if match:
+                return html.unescape(match.group(1))
+        raise ProviderFailure("DOWNLOAD_FAILED", "MediaFire download link not found")
+
+    async def _download_mediafire(self, url: str, dest_dir: Path, name: str | None, progress: JobState) -> list[Path]:
+        direct = await self._resolve_mediafire_url(url)
+        if not name or name == "file":
+            parsed_name = unquote(Path(urlparse(direct).path).name).replace("+", " ")
+            name = safe_name(parsed_name) if parsed_name else None
+        progress.log("Resolved MediaFire direct download URL")
+        return await self._download_aria2(direct, dest_dir, name, progress)
+
     async def validate_credentials(self, credentials: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True}
 
@@ -248,6 +278,8 @@ class LinksProvider(BaseProvider):
 
         if link_type == "torrent":
             downloaded = await self._download_torrent(url, dest_dir, progress)
+        elif link_type == "mediafire":
+            downloaded = await self._download_mediafire(url, dest_dir, name, progress)
         elif link_type == "ytdlp":
             downloaded = await self._download_ytdlp(url, dest_dir, name, progress)
         elif link_type == "gdrive":

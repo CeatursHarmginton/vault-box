@@ -49,6 +49,49 @@ def test_links_provider_downloads_inside_directory_path(tmp_path, monkeypatch):
     assert out == tmp_path / "a.bin"
     assert out.read_text() == "ok"
 
+def test_links_provider_resolves_mediafire_before_aria2(tmp_path, monkeypatch):
+    provider = LinksProvider()
+    seen = {}
+
+    class Response:
+        text = '<a href="https://download1.mediafire.com/key/fileid/real%20file.rar" id="downloadButton">Download</a>'
+
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url):
+            seen["page"] = url
+            return Response()
+
+    async def no_deps():
+        return None
+
+    async def fake_aria2(url, dest_dir, name, progress):
+        seen.update({"url": url, "name": name})
+        out = dest_dir / name
+        out.write_text("ok")
+        return [out]
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr("src.providers.links.httpx.AsyncClient", Client)
+    monkeypatch.setattr(provider, "_download_aria2", fake_aria2)
+
+    out = asyncio.run(provider.download_file({}, {"id": "https://www.mediafire.com/file/id/name.rar/file", "name": "file"}, tmp_path, JobState("mediafire", {})))
+
+    assert seen["url"].startswith("https://download1.mediafire.com/")
+    assert seen["name"] == "real file.rar"
+    assert out.name == "real file.rar"
+
 def test_links_source_uploads_all_landed_files(tmp_path, monkeypatch):
     dirs = {"input": tmp_path / "input", "output": tmp_path / "output"}
     dirs["input"].mkdir()
