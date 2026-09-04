@@ -114,13 +114,14 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
     archive_originals = {p for archive in found for p in _archive_originals(archive)}
     keep_originals: list[Path] = []
 
-    pw_candidates: list[str | None] = [None]
+    pw_candidates: list[str | None] = []
     if isinstance(password, list):
         for pw in password:
             if pw and pw not in pw_candidates:
                 pw_candidates.append(pw)
     elif isinstance(password, str) and password:
         pw_candidates.append(password)
+    pw_candidates.append(None)
 
     for i, archive in enumerate(found, 1):
         progress.check_cancelled()

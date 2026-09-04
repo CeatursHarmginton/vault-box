@@ -327,9 +327,9 @@ def test_rar_extract_prefers_unrar(tmp_path, monkeypatch):
     asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, JobState("rar-unrar", {}), ["ok"]))
 
     assert calls[0][0] == "unrar"
-    assert "-p-" in calls[0]
+    assert "-pok" in calls[0]
 
-def test_extract_tries_no_password_before_candidates(tmp_path, monkeypatch):
+def test_extract_tries_password_candidates_before_no_password(tmp_path, monkeypatch):
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"
     input_dir.mkdir()
@@ -346,7 +346,7 @@ def test_extract_tries_no_password_before_candidates(tmp_path, monkeypatch):
     async def fake_exec(*args, **kwargs):
         calls.append(args)
         out_arg = next(arg for arg in args if str(arg).startswith("-o"))
-        if not any(str(arg).startswith("-p") for arg in args):
+        if "-ppw1" not in args:
             return Proc(2)
         Path(str(out_arg)[2:]).mkdir(parents=True, exist_ok=True)
         (Path(str(out_arg)[2:]) / "ok.jpg").write_text("ok")
@@ -358,8 +358,7 @@ def test_extract_tries_no_password_before_candidates(tmp_path, monkeypatch):
     job = JobState("pw-order", {})
     asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, job, ["pw1", "pw2"]))
 
-    assert not any(str(arg).startswith("-p") for arg in calls[0])
-    assert "-ppw1" in calls[1]
+    assert "-ppw1" in calls[0]
     assert all("Archive password candidates" not in line for line in job.logs)
 
 def test_extract_mixed_success_and_fallback_are_staged_together(tmp_path, monkeypatch):
