@@ -276,6 +276,37 @@ class PikPakProvider(BaseProvider):
             await asyncio.sleep(poll)
         raise ProviderFailure("UPLOAD_FAILED", "PikPak upload file did not become visible", {"file": last, "file_id": file_id})
 
+    async def _file_info(self, s: PikPakSession, file_id: str) -> dict[str, Any]:
+        try:
+            return await s.req("GET", f"{API}/drive/v1/files/{file_id}")
+        except ProviderFailure:
+            s.captcha = await s.captcha_init(f"GET:/drive/v1/files/{file_id}")
+            try:
+                return await s.req("GET", f"{API}/drive/v1/files/{file_id}")
+            finally:
+                s.captcha = ""
+
+    async def _batch(self, s: PikPakSession, op: str, ids: list[str], body: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = {"ids": ids, **(body or {})}
+        last: Exception | None = None
+        for action in ("", f"POST:{API}/drive/v1/files:{op}", f"POST:/drive/v1/files:{op}"):
+            try:
+                if action:
+                    s.captcha = await s.captcha_init(action)
+                return await s.req("POST", f"{API}/drive/v1/files:{op}", json=payload)
+            except Exception as exc:
+                last = exc
+            finally:
+                s.captcha = ""
+        raise last or ProviderFailure("UPLOAD_FAILED", f"PikPak {op} failed")
+
+    async def _verify_missing(self, s: PikPakSession, file_id: str) -> None:
+        try:
+            await self._file_info(s, file_id)
+        except Exception:
+            return
+        raise ProviderFailure("UPLOAD_FAILED", "PikPak delete verification failed")
+
     async def upload_file(self, credentials: dict[str, Any], local_path: Path, target_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:
         s = PikPakSession(credentials)
         name = Path(target_ref.get("relative_path") or local_path.name).name
@@ -340,3 +371,38 @@ class PikPakProvider(BaseProvider):
                 raise ProviderFailure("UPLOAD_FAILED", done.text[:500])
         task = await self._wait_upload_task(s, task_id, progress)
         return {"file": create.get("file"), "task": task, "upload": {"size": size, "parts": len(parts)}}
+
+    async def replace_file(self, credentials: dict[str, Any], local_path: Path, source_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:
+        s = PikPakSession(credentials)
+        source_id = str(source_ref.get("id") or source_ref.get("path") or "")
+        if not source_id:
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "PikPak source file id missing")
+        old = await self._file_info(s, source_id)
+        if old.get("kind") == "drive#folder":
+            raise ProviderFailure("UPLOAD_FAILED", "Cannot replace a folder")
+        parent_id = str(old.get("parent_id") or "")
+        name = str(source_ref.get("name") or old.get("name") or local_path.name)
+        temp_id = await self._create_folder(s, parent_id, f".vaultbox-replace-{int(time.time() * 1000)}")
+        uploaded_id = ""
+        try:
+            uploaded = await self.upload_file(credentials, local_path, {"id": temp_id, "relative_path": name}, progress)
+            uploaded_id = _file_id(uploaded)
+            info = await self._wait_file_complete(s, uploaded_id, progress)
+            if info.get("name") != name or str(info.get("parent_id") or "") != temp_id or int(info.get("size") or 0) != local_path.stat().st_size:
+                raise ProviderFailure("UPLOAD_FAILED", "PikPak temporary upload verification failed", {"file": info})
+            await self._batch(s, "batchDelete", [source_id])
+            await self._verify_missing(s, source_id)
+            await self._batch(s, "batchMove", [uploaded_id], {"to": {"parent_id": parent_id}})
+            moved = await self._file_info(s, uploaded_id)
+            if str(moved.get("parent_id") or "") != parent_id:
+                raise ProviderFailure("UPLOAD_FAILED", "PikPak move verification failed", {"file": moved})
+            await self._batch(s, "batchDelete", [temp_id])
+            await self._verify_missing(s, temp_id)
+            return {"file": moved, "old_id": source_id, "final_id": uploaded_id}
+        except Exception:
+            if temp_id and not uploaded_id:
+                try:
+                    await self._batch(s, "batchDelete", [temp_id])
+                except Exception:
+                    pass
+            raise

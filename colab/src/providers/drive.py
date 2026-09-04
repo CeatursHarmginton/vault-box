@@ -271,6 +271,67 @@ class DriveProvider(BaseProvider):
                 offset = next_offset
         raise ProviderFailure("UPLOAD_FAILED", "Drive upload ended early")
 
+    async def replace_file(self, credentials: dict[str, Any], local_path: Path, source_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:
+        fid = str(source_ref.get("id") or source_ref.get("path") or "")
+        if self._use_mount(credentials) and self._mount_ref(source_ref):
+            self._require_mount()
+            dest = self._mount_path(source_ref)
+            if not dest.is_file():
+                raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Drive mounted file path not found")
+            progress.set(step="uploading", current_file=dest.name)
+            await asyncio.to_thread(shutil.copy2, local_path, dest)
+            size = local_path.stat().st_size
+            progress.add_bytes(size, size, "upload", str(local_path))
+            return {"id": dest.relative_to(DRIVE_MOUNT).as_posix(), "name": dest.name, "path": dest.relative_to(DRIVE_MOUNT).as_posix()}
+        if self._web_session(credentials):
+            raise ProviderFailure("UPLOAD_FAILED", "Drive web-session replace is not supported in Colab")
+        if not fid:
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Drive file id missing")
+        meta = (await self._request(credentials, "GET", f"{DRIVE_API}/files/{fid}", params={"fields": FIELDS, "supportsAllDrives": "true"})).json()
+        if str(meta.get("mimeType") or "").startswith("application/vnd.google-apps."):
+            raise ProviderFailure("UPLOAD_FAILED", "Drive Workspace files cannot be overwritten with binary upload")
+        name = str(source_ref.get("name") or meta.get("name") or local_path.name)
+        size = local_path.stat().st_size
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        progress.set(step="uploading", current_file=name)
+        if size <= API_MULTIPART_MAX:
+            boundary = f"vaultbox-drive-{int(time.time() * 1000)}"
+            body = _multipart_body(boundary, json.dumps({"name": name}, ensure_ascii=False), mime, await asyncio.to_thread(local_path.read_bytes))
+            resp = await self._request(credentials, "PATCH", f"{DRIVE_UPLOAD_API}/files/{fid}", params={"uploadType": "multipart", "fields": FIELDS, "supportsAllDrives": "true"}, headers={"Content-Type": f"multipart/related; boundary={boundary}"}, content=body)
+            progress.add_bytes(size, size, "upload", str(local_path))
+            out = resp.json()
+            if out.get("id") != fid or int(out.get("size") or 0) != size:
+                raise ProviderFailure("UPLOAD_FAILED", "Drive overwrite verification failed")
+            return out
+        init = await self._request(credentials, "PATCH", f"{DRIVE_UPLOAD_API}/files/{fid}", params={"uploadType": "resumable", "fields": FIELDS, "supportsAllDrives": "true"}, headers={
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": mime,
+            "X-Upload-Content-Length": str(size),
+        }, content=json.dumps({"name": name}))
+        session = init.headers.get("Location")
+        if not session:
+            raise ProviderFailure("UPLOAD_FAILED", "Drive resumable session missing")
+        offset = 0
+        with local_path.open("rb") as fh:
+            while offset < size:
+                progress.check_cancelled()
+                data = await asyncio.to_thread(_read_at, fh, offset, min(CHUNK, size - offset))
+                end = offset + len(data) - 1
+                resp = await self._client().put(session, headers=self._headers(credentials, {"Content-Length": str(len(data)), "Content-Range": f"bytes {offset}-{end}/{size}"}), content=data)
+                if resp.status_code in (200, 201):
+                    progress.add_bytes(len(data), size, "upload", str(local_path))
+                    out = resp.json()
+                    if out.get("id") != fid or int(out.get("size") or 0) != size:
+                        raise ProviderFailure("UPLOAD_FAILED", "Drive overwrite verification failed")
+                    return out
+                if resp.status_code != 308:
+                    raise ProviderFailure("UPLOAD_FAILED", resp.text[:500], {"status": resp.status_code})
+                rng = resp.headers.get("Range", "")
+                next_offset = int(rng.rsplit("-", 1)[1]) + 1 if "-" in rng else end + 1
+                progress.add_bytes(max(0, next_offset - offset), size, "upload", str(local_path))
+                offset = next_offset
+        raise ProviderFailure("UPLOAD_FAILED", "Drive overwrite ended early")
+
     async def _api_ensure_relative_parent(self, credentials: dict[str, Any], parent: str, relative_path: str) -> str:
         cache = self._folder_cache(credentials)
         locks = self._folder_locks(credentials)

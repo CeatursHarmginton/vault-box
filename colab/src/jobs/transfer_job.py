@@ -480,8 +480,12 @@ async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options
             attempt_gen = gate.generation
         folder = _item_target_folder(target.get("folder") or {}, item)
         target_ref = _upload_target(folder, rel, options)
+        item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
         try:
-            await dst.upload_file(target.get("credentials") or {}, path, target_ref, job)
+            if options.get("replace") and item_type != "folder" and hasattr(dst, "replace_file"):
+                await dst.replace_file(target.get("credentials") or {}, path, item, job)
+            else:
+                await dst.upload_file(target.get("credentials") or {}, path, target_ref, job)
             job.files_uploaded += 1
             job.error = None
             job._upload_log_done = getattr(job, "_upload_log_done", 0) + 1
@@ -505,7 +509,8 @@ async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options
 async def _upload_one_with_retry(job: JobState, target: dict[str, Any], options: dict[str, Any], dst: Any, path: Path) -> dict[str, Any]:
     while True:
         try:
-            result = await dst.upload_file(target.get("credentials") or {}, path, _upload_target(target.get("folder") or {}, path.name, options), job)
+            source = (job.payload.get("source") or {}).get("items") or []
+            result = await (dst.replace_file(target.get("credentials") or {}, path, source[0], job) if options.get("replace") and source and hasattr(dst, "replace_file") else dst.upload_file(target.get("credentials") or {}, path, _upload_target(target.get("folder") or {}, path.name, options), job))
             job.files_uploaded = 1
             job.error = None
             job.log(f"[1/1] Uploaded: {path.name}")
