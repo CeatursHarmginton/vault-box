@@ -122,6 +122,8 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
     elif isinstance(password, str) and password:
         pw_candidates.append(password)
     pw_candidates.append(None)
+    progress.log(f"Archive password candidates: {len(pw_candidates) - 1}; trying passwords first, then no-password fallback")
+    progress.log(f"Archive tools: 7z=yes unrar={'yes' if shutil.which('unrar') else 'no'}")
 
     for i, archive in enumerate(found, 1):
         progress.check_cancelled()
@@ -137,7 +139,8 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
             tools = (["unrar"] if _is_rar(archive) and shutil.which("unrar") else []) + ["7z"]
             for tool in tools:
                 progress.log(f"Trying {tool}: {archive.name}")
-                for pw in pw_candidates:
+                for attempt, pw in enumerate(pw_candidates, 1):
+                    progress.log(f"Trying {tool} password #{attempt}" if pw else f"Trying {tool} without password")
                     proc = await asyncio.create_subprocess_exec(*_extract_cmd(tool, archive, extract_dir, pw), stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
                     out, _ = await proc.communicate()
                     text = out.decode(errors="ignore")

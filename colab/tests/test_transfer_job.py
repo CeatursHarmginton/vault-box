@@ -359,7 +359,8 @@ def test_extract_tries_password_candidates_before_no_password(tmp_path, monkeypa
     asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, job, ["pw1", "pw2"]))
 
     assert "-ppw1" in calls[0]
-    assert all("Archive password candidates" not in line for line in job.logs)
+    assert "Archive password candidates: 2; trying passwords first, then no-password fallback" in job.logs
+    assert "Trying 7z password #1" in job.logs
 
 def test_extract_mixed_success_and_fallback_are_staged_together(tmp_path, monkeypatch):
     input_dir = tmp_path / "input"
