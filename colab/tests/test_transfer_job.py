@@ -23,11 +23,68 @@ from src.providers.terabox import TeraBoxProvider, TeraBoxSession
 from src.providers import terabox as terabox_mod
 from src.providers import drive as drive_mod
 from src.providers.drive import DriveProvider
+from src.providers.links import LinksProvider
 
 def test_colab_download_concurrency_default_is_cdn_friendly():
     from src.config import FOLDER_DOWNLOAD_CONCURRENCY
 
     assert FOLDER_DOWNLOAD_CONCURRENCY == 12
+
+def test_links_provider_downloads_inside_directory_path(tmp_path, monkeypatch):
+    provider = LinksProvider()
+
+    async def no_deps():
+        return None
+
+    async def fake_download(url, dest_dir, name, progress):
+        out = dest_dir / (name or "file.bin")
+        out.write_text("ok")
+        return [out]
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr(provider, "_download_aria2", fake_download)
+
+    out = asyncio.run(provider.download_file({}, {"id": "https://example.com/a.bin", "name": "a.bin"}, tmp_path, JobState("links-dir", {})))
+
+    assert out == tmp_path / "a.bin"
+    assert out.read_text() == "ok"
+
+def test_links_source_uploads_all_landed_files(tmp_path, monkeypatch):
+    dirs = {"input": tmp_path / "input", "output": tmp_path / "output"}
+    dirs["input"].mkdir()
+    dirs["output"].mkdir()
+    uploaded = []
+
+    class LinkSource:
+        async def download_file(self, credentials, item, local_path, progress):
+            (local_path / "one.txt").write_text("1")
+            (local_path / "nested").mkdir(exist_ok=True)
+            (local_path / "nested" / "two.txt").write_text("2")
+            progress.files_downloaded += 1
+            return local_path / "one.txt"
+
+    class Target:
+        async def upload_folder(self, credentials, local_dir, target_ref, progress):
+            uploaded.extend(p.relative_to(local_dir).as_posix() for p in local_dir.rglob("*") if p.is_file())
+            progress.files_to_upload = len(uploaded)
+            progress.files_uploaded = len(uploaded)
+            return {"ok": True}
+
+    monkeypatch.setattr(transfer_job_mod, "job_dirs", lambda job_id: dirs)
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "links", LinkSource())
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "drive", Target())
+
+    payload = {
+        "source": {"provider": "links", "items": [{"id": "https://example.com/archive.torrent", "type": "file"}]},
+        "target": {"provider": "drive", "credentials": {}, "folder": {}},
+        "options": {"cleanupAfterFinish": False},
+    }
+    job = JobState("links-all", payload)
+
+    asyncio.run(run_transfer(job))
+
+    assert job.status == "completed"
+    assert set(uploaded) == {"nested/two.txt", "one.txt"}
 
 def test_archive_detection_supports_common_and_split_formats(tmp_path):
     names = [

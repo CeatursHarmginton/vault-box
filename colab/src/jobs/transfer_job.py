@@ -102,8 +102,13 @@ async def run_transfer(job: JobState) -> None:
                     _mark_item_skipped(job, source, item, f"{job.files_failed - failed_before} file(s) unavailable after retries")
             else:
                 continue
-        for batch in await asyncio.gather(*(download_one(item) for item in file_items)):
-            downloaded.extend(batch)
+        if str(source.get("provider") or "").lower() == "links":
+            for item in file_items:
+                downloaded.extend(await download_one(item))
+            downloaded = [p for p in sorted(dirs["input"].rglob("*")) if p.is_file() and not p.name.endswith(".aria2")]
+        else:
+            for batch in await asyncio.gather(*(download_one(item) for item in file_items)):
+                downloaded.extend(batch)
         if not downloaded and options.get("optimize_image") and job.files_skipped:
             job.log("No image files found for optimization.")
             _mark_remaining_items_completed(job, source)
