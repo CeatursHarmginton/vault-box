@@ -82,7 +82,7 @@ VERIFY_ERRNOS = {-19, 9013, 9019, 400141, 4000020, 4000023, 450016}
 VERIFY_HINTS = ("need verify", "verify", "captcha", "risk control", "token expired")
 VERIFY_ROUNDS = 3
 DOWNLOAD_RETRIES = 3
-DOWNLOAD_RETRY_DELAY = 20.0
+DOWNLOAD_RETRY_DELAY = 10.0
 # Failures where the bytes are probably still fetchable later: retry, then skip the item.
 RETRYABLE_DOWNLOAD_CODES = {"DOWNLOAD_FAILED", "PROVIDER_NEEDS_VERIFY", "PROVIDER_RATE_LIMITED"}
 SKIPPABLE_DOWNLOAD_CODES = RETRYABLE_DOWNLOAD_CODES | {"SOURCE_FILE_NOT_FOUND"}
@@ -104,6 +104,9 @@ def is_retryable_download_failure(exc: BaseException) -> bool:
 
 def is_skippable_download_failure(exc: BaseException) -> bool:
     return isinstance(exc, ProviderFailure) and exc.code in SKIPPABLE_DOWNLOAD_CODES
+
+def retry_delay_for(exc: ProviderFailure, delay: float = DOWNLOAD_RETRY_DELAY) -> float:
+    return delay if exc.code in {"PROVIDER_NEEDS_VERIFY", "PROVIDER_RATE_LIMITED"} else 0.0
 
 async def sleep_cancellable(seconds: float, progress: JobState) -> None:
     """Wait in 0.5s slices so a cancel during the retry backoff lands promptly."""
@@ -139,8 +142,10 @@ async def download_with_retry(
             last = exc
             if attempt >= retries:
                 break
-            progress.log(f"[RETRY {attempt + 1}/{retries}] Download failed ({exc.message}); retrying {label} in {int(delay)}s")
-            await sleep_cancellable(delay, progress)
+            wait = retry_delay_for(exc, delay)
+            suffix = f"in {int(wait)}s" if wait else "now"
+            progress.log(f"[RETRY {attempt + 1}/{retries}] Download failed ({exc.message}); retrying {label} {suffix}")
+            await sleep_cancellable(wait, progress)
     raise last or ProviderFailure("DOWNLOAD_FAILED", f"Download failed: {label}")
 
 class BaseProvider(ABC):

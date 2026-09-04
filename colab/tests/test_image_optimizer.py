@@ -323,3 +323,113 @@ class ImageOptimizerTests(TestCase):
         self.assertEqual(results, [])
         self.assertTrue((nested_out / "keep.txt").exists())
         self.assertFalse((nested_out / "optimized").exists())
+
+    def test_image_optimization_metadata_tagging_and_detection(self) -> None:
+        # 1. Test untagged image
+        untagged_jpg = self.src_dir / "untagged.jpg"
+        Image.new("RGB", (100, 100), color="blue").save(untagged_jpg, "JPEG")
+        self.assertFalse(image_optimizer.is_image_already_optimized(untagged_jpg))
+
+        # 2. Compress and verify tag is automatically embedded
+        compressed_jpg = self.dest_dir / "compressed.jpg"
+        ok = image_optimizer.compress_image(untagged_jpg, compressed_jpg, 85)
+        self.assertTrue(ok)
+        self.assertTrue(image_optimizer.is_image_already_optimized(compressed_jpg))
+
+        # 3. Test PNG embedding and detection
+        png_path = self.src_dir / "test.png"
+        Image.new("RGBA", (50, 50), color="green").save(png_path, "PNG")
+        self.assertFalse(image_optimizer.is_image_already_optimized(png_path))
+        image_optimizer.embed_optimization_metadata(png_path)
+        self.assertTrue(image_optimizer.is_image_already_optimized(png_path))
+
+        # 4. Test WebP embedding and detection
+        webp_path = self.src_dir / "test.webp"
+        Image.new("RGB", (50, 50), color="red").save(webp_path, "WEBP")
+        self.assertFalse(image_optimizer.is_image_already_optimized(webp_path))
+        image_optimizer.embed_optimization_metadata(webp_path)
+        self.assertTrue(image_optimizer.is_image_already_optimized(webp_path))
+
+    def test_compress_uses_pil_before_vips_cli_to_avoid_double_encode(self) -> None:
+        src = self.src_dir / "source.jpg"
+        out = self.dest_dir / "out.jpg"
+        Image.new("RGB", (100, 100), color="blue").save(src, "JPEG", quality=100)
+
+        old_pyvips = image_optimizer.PYVIPS_AVAILABLE
+        old_vips_cli = image_optimizer.VIPS_CLI_AVAILABLE
+        old_run = image_optimizer.subprocess.run
+        image_optimizer.PYVIPS_AVAILABLE = False
+        image_optimizer.VIPS_CLI_AVAILABLE = True
+        def fail_run(*args, **kwargs):
+            raise AssertionError("vips CLI should not run when PIL can write metadata")
+        image_optimizer.subprocess.run = fail_run
+        try:
+            self.assertTrue(image_optimizer.compress_image(src, out, 85))
+        finally:
+            image_optimizer.subprocess.run = old_run
+            image_optimizer.PYVIPS_AVAILABLE = old_pyvips
+            image_optimizer.VIPS_CLI_AVAILABLE = old_vips_cli
+
+        self.assertTrue(image_optimizer.is_image_already_optimized(out))
+
+    def test_optimize_directory_skips_already_optimized_images(self) -> None:
+        from PIL import ImageDraw
+        # Create an image with pattern, optimize it in dest_dir
+        src_img = self.src_dir / "photo.jpg"
+        im = Image.new("RGB", (800, 800), color="purple")
+        draw = ImageDraw.Draw(im)
+        for i in range(0, 800, 10):
+            draw.line([(0, i), (800, 800 - i)], fill=(i % 255, (i * 2) % 255, (i * 3) % 255), width=2)
+        im.save(src_img, "JPEG", quality=100)
+
+        options = {
+            "min_target_mb": 0.01,
+            "max_target_mb": 0.2, # ~200 KB target to force compression
+            "start_quality": 95,
+            "quality": 85,
+            "auto_size": True,
+            "optimize_workers": 1,
+        }
+
+        # First run: should optimize and tag
+        results1 = optimize_directory(self.src_dir, self.dest_dir, options, MockJobState())
+        self.assertEqual(len(results1), 1)
+        self.assertEqual(results1[0]["name"], "photo.jpg")
+        optimized_file = self.dest_dir / "photo.jpg"
+        self.assertTrue(image_optimizer.is_image_already_optimized(optimized_file))
+
+        # Second run: put already optimized file as input in a new folder
+        src2_dir = Path(self.temp_dir) / "src2"
+        dest2_dir = Path(self.temp_dir) / "dest2"
+        src2_dir.mkdir()
+        dest2_dir.mkdir()
+        shutil.copy2(optimized_file, src2_dir / "photo.jpg")
+
+        # Second run without force: should skip even if size > max_target_mb
+        skip_options = {"min_target_mb": 0.01, "max_target_mb": 0.05, "optimize_workers": 1}
+        results2 = optimize_directory(src2_dir, dest2_dir, skip_options, MockJobState())
+        self.assertEqual(results2, []) # Skipped from batch processing to passthrough
+        self.assertTrue((dest2_dir / "photo.jpg").exists())
+
+        # Second run WITH force_reoptimize: should re-optimize
+        force_options = {**skip_options, "force_reoptimize": True}
+        dest3_dir = Path(self.temp_dir) / "dest3"
+        dest3_dir.mkdir()
+        results3 = optimize_directory(src2_dir, dest3_dir, force_options, MockJobState())
+        self.assertEqual(len(results3), 1)
+        self.assertEqual(results3[0]["name"], "photo.jpg")
+        self.assertTrue((dest3_dir / "photo.jpg").exists())
+
+    def test_optimize_image_file_returns_already_optimized_status(self) -> None:
+        tagged_img = self.src_dir / "already_done.jpg"
+        Image.new("RGB", (1000, 1000), color="yellow").save(tagged_img, "JPEG")
+        image_optimizer.embed_optimization_metadata(tagged_img)
+
+        out_path, q, status = image_optimizer.optimize_image_file(
+            tagged_img,
+            self.dest_dir,
+            {"max_target_mb": 0.001, "force_reoptimize": False},
+            95,
+        )
+        self.assertEqual(status, "Giữ nguyên (Đã tối ưu)")
+        self.assertTrue(out_path.exists())

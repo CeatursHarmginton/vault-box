@@ -1901,7 +1901,7 @@ class TransferJobTests(TestCase):
         self.assertEqual(urls, ["https://example.test/first", "https://example.test/second"])
         self.assertTrue(any("[VERIFY 1/2]" in line for line in job.logs), job.logs)
 
-    def test_download_with_retry_waits_20s_three_times_then_raises(self):
+    def test_download_with_retry_waits_10s_for_verify_then_raises(self):
         sleeps: list[float] = []
         attempts: list[int] = []
 
@@ -1924,8 +1924,34 @@ class TransferJobTests(TestCase):
 
         self.assertEqual(ctx.exception.code, "PROVIDER_NEEDS_VERIFY")
         self.assertEqual(len(attempts), 4)  # first try + 3 retries
-        self.assertEqual(sum(sleeps), 60.0)  # 3 x 20s, sliced for cancel checks
+        self.assertEqual(sum(sleeps), 30.0)  # 3 x 10s, sliced for cancel checks
         self.assertEqual(len([line for line in job.logs if "[RETRY" in line]), 3)
+
+    def test_download_with_retry_retries_plain_failures_immediately(self):
+        sleeps: list[float] = []
+        attempts: list[int] = []
+
+        async def no_sleep(delay):
+            sleeps.append(delay)
+            return None
+
+        async def always_fails():
+            attempts.append(1)
+            raise ProviderFailure("DOWNLOAD_FAILED", "temporary failure")
+
+        job = JobState("retry-now", {})
+        old_sleep = base_mod.asyncio.sleep
+        base_mod.asyncio.sleep = no_sleep
+        try:
+            with self.assertRaises(ProviderFailure) as ctx:
+                asyncio.run(base_mod.download_with_retry(always_fails, progress=job, label="a.jpg"))
+        finally:
+            base_mod.asyncio.sleep = old_sleep
+
+        self.assertEqual(ctx.exception.code, "DOWNLOAD_FAILED")
+        self.assertEqual(len(attempts), 4)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(len([line for line in job.logs if "retrying a.jpg now" in line]), 3)
 
     def test_download_with_retry_does_not_retry_dead_credentials(self):
         attempts: list[int] = []

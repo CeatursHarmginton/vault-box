@@ -35,6 +35,12 @@ VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts", ".3g
 # so the descent stops here even when the size target is still not met.
 MIN_QUALITY = 65
 
+OPTIMIZED_TAG_KEY = "VaultBox_Optimized"
+OPTIMIZED_TAG_VALUE = "true"
+OPTIMIZED_EXIF_DESC = "VaultBox_Optimized:true"
+EXIF_IMAGE_DESCRIPTION = 0x010E
+EXIF_USER_COMMENT = 0x9286
+
 def clamp_quality(value: Any, default: int = 95) -> int:
     try:
         q = int(float(value))
@@ -42,8 +48,71 @@ def clamp_quality(value: Any, default: int = 95) -> int:
         q = default
     return max(MIN_QUALITY, min(100, q))
 
+def is_image_already_optimized(path: Path) -> bool:
+    """
+    Fast metadata inspection to check if the image has already been optimized.
+    Only inspects headers without decoding image pixels.
+    """
+    if not PIL_AVAILABLE or not path.is_file():
+        return False
+    try:
+        with PILImage.open(path) as img:
+            fmt = (img.format or "").upper()
+            if fmt == "PNG":
+                if img.info.get(OPTIMIZED_TAG_KEY) in ("true", "1", OPTIMIZED_TAG_VALUE):
+                    return True
+                if img.info.get("Description") in (OPTIMIZED_TAG_VALUE, OPTIMIZED_EXIF_DESC):
+                    return True
+                if hasattr(img, "text") and img.text.get(OPTIMIZED_TAG_KEY) in ("true", "1", OPTIMIZED_TAG_VALUE):
+                    return True
+            else:
+                exif = img.getexif()
+                if exif:
+                    desc = exif.get(EXIF_IMAGE_DESCRIPTION)
+                    if desc and ("VaultBox_Optimized" in str(desc) or "already-optimized" in str(desc)):
+                        return True
+                    comment = exif.get(EXIF_USER_COMMENT)
+                    if comment and ("VaultBox_Optimized" in str(comment) or "already-optimized" in str(comment)):
+                        return True
+                comment = img.info.get("comment")
+                if comment and ("VaultBox_Optimized" in str(comment) or "already-optimized" in str(comment)):
+                    return True
+    except Exception:
+        return False
+    return False
+
+def embed_optimization_metadata(file_path: Path) -> bool:
+    """
+    Embeds optimization metadata into an existing image file.
+    """
+    if not PIL_AVAILABLE or not file_path.is_file():
+        return False
+    try:
+        with PILImage.open(file_path) as img:
+            fmt = (img.format or "").upper()
+            if fmt == "PNG":
+                from PIL import PngImagePlugin
+                png_info = PngImagePlugin.PngInfo()
+                for k, v in img.info.items():
+                    if isinstance(k, str) and isinstance(v, str):
+                        png_info.add_text(k, v)
+                png_info.add_text(OPTIMIZED_TAG_KEY, OPTIMIZED_TAG_VALUE)
+                img.save(file_path, format="PNG", pnginfo=png_info)
+                return True
+            elif fmt in ("JPEG", "WEBP", "TIFF"):
+                exif = img.getexif()
+                exif[EXIF_IMAGE_DESCRIPTION] = OPTIMIZED_EXIF_DESC
+                img.save(file_path, format=fmt, exif=exif)
+                return True
+    except Exception as e:
+        logger.warning("Failed to embed optimization metadata in %s: %s", file_path, e)
+        return False
+    return False
+
 def should_optimize_image_file(path: Path, options: dict[str, Any]) -> bool:
     if path.suffix.lower() not in IMAGE_EXTENSIONS:
+        return False
+    if not options.get("force_reoptimize", False) and is_image_already_optimized(path):
         return False
     size = path.stat().st_size
     min_target = int(float(options.get("min_target_mb", 1.0)) * 1024 * 1024)
@@ -64,8 +133,9 @@ def _optimize_workers(options: dict[str, Any], image_count: int) -> int:
 
 def compress_image(src_path: Path, dest_path: Path, q: int, scale: float = 1.0) -> bool:
     """
-    Compresses an image to JPEG format using pyvips, vips CLI, or PIL fallback.
+    Compresses an image to JPEG format using pyvips, PIL, or vips CLI fallback.
     Quality is clamped to MIN_QUALITY..100 — no caller may encode below the floor.
+    Embeds optimization metadata into the output image.
     Returns True if successful, False otherwise.
     """
     q = clamp_quality(q)
@@ -74,12 +144,27 @@ def compress_image(src_path: Path, dest_path: Path, q: int, scale: float = 1.0) 
             img = pyvips.Image.new_from_file(str(src_path))
             if scale < 1.0:
                 img = img.resize(scale)
-            # write_to_file with options
-            img.write_to_file(str(dest_path), Q=q, strip=True, optimize_coding=True)
+            img.set_type(pyvips.GValue.gstr_type, "image-description", OPTIMIZED_EXIF_DESC)
+            img.write_to_file(str(dest_path), Q=q, optimize_coding=True)
             return True
         except Exception as e:
             logger.warning(f"pyvips compression failed: {e}. Trying fallback.")
             
+    if PIL_AVAILABLE:
+        try:
+            img = PILImage.open(src_path)
+            if scale < 1.0:
+                w, h = img.size
+                img = img.resize((int(w * scale), int(h * scale)), PILImage.Resampling.LANCZOS)
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+            exif = img.getexif()
+            exif[EXIF_IMAGE_DESCRIPTION] = OPTIMIZED_EXIF_DESC
+            img.save(dest_path, "JPEG", quality=q, optimize=True, exif=exif)
+            return True
+        except Exception as e:
+            logger.error(f"PIL fallback failed: {e}")
+
     if VIPS_CLI_AVAILABLE:
         try:
             if scale < 1.0:
@@ -93,19 +178,6 @@ def compress_image(src_path: Path, dest_path: Path, q: int, scale: float = 1.0) 
                 logger.warning(f"vips CLI failed: {res.stderr.decode(errors='ignore')}")
         except Exception as e:
             logger.warning(f"vips CLI run failed: {e}")
-            
-    if PIL_AVAILABLE:
-        try:
-            img = PILImage.open(src_path)
-            if scale < 1.0:
-                w, h = img.size
-                img = img.resize((int(w * scale), int(h * scale)), PILImage.Resampling.LANCZOS)
-            if img.mode in ("RGBA", "P"):
-                img = img.convert("RGB")
-            img.save(dest_path, "JPEG", quality=q, optimize=True)
-            return True
-        except Exception as e:
-            logger.error(f"PIL fallback failed: {e}")
             
     return False
 
@@ -140,10 +212,16 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
     Optimizes a single image file based on size target.
     Returns: (output_path, final_quality, status_message)
     """
+    quality = clamp_quality(options.get("quality", 85), 85)
+
+    # 0. Skip if already optimized and force_reoptimize is not set
+    if not options.get("force_reoptimize", False) and is_image_already_optimized(src_path):
+        dest_path = copy_original_image(src_path, dest_dir)
+        return dest_path, quality, "Giữ nguyên (Đã tối ưu)"
+
     min_target = int(float(options.get("min_target_mb", 1.0)) * 1024 * 1024)
     max_target = int(float(options.get("max_target_mb", 3.0)) * 1024 * 1024)
     start_quality = clamp_quality(options.get("start_quality", 95))
-    quality = clamp_quality(options.get("quality", 85), 85)
     auto_size = options.get("auto_size", True)
     scale = float(options.get("resolution_scale", 1.0))
     
