@@ -144,6 +144,9 @@ class JobState:
             "failedItems": self.failed_items,
             "failedFiles": self.failed_files[-50:],
             "confirmAction": self.confirm_action,
+            # Source item list, so the app can rebuild the per-item queue view after a
+            # restart or when it reconnects to a job it did not start itself.
+            "items": [item for item in ((self.payload.get("source") or {}).get("items") or []) if isinstance(item, dict)],
             "targetProvider": (self.payload.get("target") or {}).get("provider"),
             "targetAccountId": (self.payload.get("target") or {}).get("accountId") or (self.payload.get("target") or {}).get("account_id"),
         }
