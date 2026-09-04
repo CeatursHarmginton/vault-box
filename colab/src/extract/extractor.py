@@ -85,7 +85,8 @@ def _archive_output_dir(archive: Path, input_dir: Path, output_dir: Path) -> Pat
 
 def _extract_cmd(tool: str, archive: Path, output_dir: Path, pw: str | None) -> list[str]:
     if tool == "unrar":
-        return ["unrar", "x", "-o+", f"-p{pw}" if pw else "-p-", str(archive), str(output_dir)]
+        dest = str(output_dir).rstrip("/\\") + "/"
+        return ["unrar", "x", "-o+", f"-p{pw}" if pw else "-p-", str(archive), dest]
     cmd = ["7z", "x", "-y", f"-o{output_dir}", str(archive)]
     if pw:
         cmd.insert(2, f"-p{pw}")
@@ -117,11 +118,13 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
     pw_candidates: list[str | None] = []
     if isinstance(password, list):
         for pw in password:
-            if pw and pw not in pw_candidates:
-                pw_candidates.append(pw)
-    elif isinstance(password, str) and password:
-        pw_candidates.append(password)
-    pw_candidates.append(None)
+            val = str(pw).strip() if pw is not None else ""
+            if val and val not in pw_candidates:
+                pw_candidates.append(val)
+    elif isinstance(password, str) and password.strip():
+        pw_candidates.append(password.strip())
+    if None not in pw_candidates:
+        pw_candidates.append(None)
     progress.log(f"Archive password candidates: {len(pw_candidates) - 1}; trying passwords first, then no-password fallback")
     progress.log(f"Archive tools: 7z=yes unrar={'yes' if shutil.which('unrar') else 'no'}")
 
