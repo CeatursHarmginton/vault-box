@@ -252,3 +252,74 @@ class ImageOptimizerTests(TestCase):
             image_optimizer.optimize_image_file = old
 
         self.assertEqual(seen, ["small.jpg", "mid.jpg", "large.jpg"])
+
+    def test_quality_descent_stops_at_min_quality(self) -> None:
+        src = self.src_dir / "big.jpg"
+        Image.new("RGB", (600, 600), color="green").save(src, "JPEG", quality=100)
+
+        tried: list[int] = []
+        old = image_optimizer.compress_image
+        def fake_compress(src_path, dest_path, q, scale=1.0):
+            tried.append(q)
+            # Never small enough: forces the loop to walk all the way down.
+            return old(src_path, dest_path, q, scale)
+        image_optimizer.compress_image = fake_compress
+        try:
+            results = optimize_directory(self.src_dir, self.dest_dir, {
+                "min_target_mb": 0.0,
+                "max_target_mb": 0.000001,
+                "start_quality": 95,
+                "auto_size": True,
+                "optimize_workers": 1,
+            }, MockJobState())
+        finally:
+            image_optimizer.compress_image = old
+
+        self.assertTrue(tried)
+        self.assertEqual(min(tried), image_optimizer.MIN_QUALITY)
+        self.assertGreaterEqual(results[0]["quality"], image_optimizer.MIN_QUALITY)
+
+    def test_quality_options_below_min_are_raised_to_min(self) -> None:
+        self.assertEqual(image_optimizer.clamp_quality(10), 65)
+        self.assertEqual(image_optimizer.clamp_quality(0), 65)
+        self.assertEqual(image_optimizer.clamp_quality(-5), 65)
+        self.assertEqual(image_optimizer.clamp_quality("40"), 65)
+        self.assertEqual(image_optimizer.clamp_quality(None), 95)
+        self.assertEqual(image_optimizer.clamp_quality(80), 80)
+        self.assertEqual(image_optimizer.clamp_quality(140), 100)
+
+        src = self.src_dir / "tiny.png"
+        Image.new("RGB", (30, 30), color="blue").save(src, "PNG")
+        used: list[int] = []
+        old = image_optimizer.compress_image
+        def spy(src_path, dest_path, q, scale=1.0):
+            used.append(q)
+            return old(src_path, dest_path, q, scale)
+        image_optimizer.compress_image = spy
+        try:
+            optimize_directory(self.src_dir, self.dest_dir, {
+                "min_target_mb": 0.0,
+                "max_target_mb": 0.0,
+                "quality": 20,
+                "start_quality": 30,
+                "auto_size": False,
+                "optimize_workers": 1,
+            }, MockJobState())
+        finally:
+            image_optimizer.compress_image = old
+
+        self.assertTrue(used)
+        self.assertTrue(all(q >= 65 for q in used), used)
+
+    def test_optimizer_ignores_its_own_output_inside_the_input_tree(self) -> None:
+        (self.src_dir / "keep.txt").write_text("ok")
+        nested_out = self.src_dir / "optimized"
+        results = optimize_directory(self.src_dir, nested_out, {
+            "min_target_mb": 0.0,
+            "max_target_mb": 1.0,
+            "optimize_workers": 1,
+        }, MockJobState())
+
+        self.assertEqual(results, [])
+        self.assertTrue((nested_out / "keep.txt").exists())
+        self.assertFalse((nested_out / "optimized").exists())

@@ -277,9 +277,12 @@ def test_optimize_queue_unzip_fallback_uploads_archive_and_passwords(monkeypatch
     async def fake_extract(input_dir, output_dir, progress, password=None, delete_archive=False):
         seen_passwords.append(password)
         output_dir.mkdir(parents=True, exist_ok=True)
-        out = output_dir / next(input_dir.glob("*.zip")).name
-        out.write_text("zip")
-        return [out]
+        out = []
+        for archive in sorted(input_dir.glob("*.zip")):
+            target = output_dir / archive.name
+            target.write_text("zip")
+            out.append(target)
+        return out
 
     def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
         for path in input_dir.rglob("*"):
@@ -308,7 +311,8 @@ def test_optimize_queue_unzip_fallback_uploads_archive_and_passwords(monkeypatch
         __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-unzip-fallback")
 
     assert job.status == "completed", job.error
-    assert seen_passwords == [["pw1", "pw2"], ["pw1", "pw2"]]
+    # A multi-file queue is one optimize pass, so extraction runs once for the whole batch.
+    assert seen_passwords == [["pw1", "pw2"]]
     assert [call[1].name for call in dst.calls] == ["a.zip", "b.zip"]
 
 def test_drive_mount_download_and_upload(tmp_path, monkeypatch):
@@ -1354,10 +1358,11 @@ class TransferJobTests(TestCase):
         from src.utils.temp_storage import cleanup_job, job_dirs
 
         class Source:
-            async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
-                path = local_dir / f"{file_ref['id']}.jpg"
+            async def download_folder(self, credentials, folder_ref, local_dir: Path, progress: JobState):
+                path = local_dir / f"{folder_ref['id']}.jpg"
+                path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"x")
-                return path
+                return [path]
 
         class Dst(UploadRecorder):
             async def upload_file(self, credentials, local_path, target_ref, progress):
@@ -1369,8 +1374,9 @@ class TransferJobTests(TestCase):
         old = dict(PROVIDERS)
         old_optimize = image_optimizer.optimize_directory
         def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
-            src = next(input_dir.glob("*.jpg"))
+            src = next(input_dir.rglob("*.jpg"))
             out = output_dir / src.name
+            out.parent.mkdir(parents=True, exist_ok=True)
             out.write_bytes(b"x")
             return [{"name": src.name, "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95}]
         PROVIDERS.update({"fake-source": Source(), "fake-dst": dst})
@@ -1378,8 +1384,8 @@ class TransferJobTests(TestCase):
         try:
             job = JobState("opt-cleanup-fail", {
                 "source": {"provider": "fake-source", "items": [
-                    {"type": "file", "id": "a", "name": "a.jpg"},
-                    {"type": "file", "id": "b", "name": "b.jpg"},
+                    {"type": "folder", "id": "a", "name": "a"},
+                    {"type": "folder", "id": "b", "name": "b"},
                 ]},
                 "target": {"provider": "fake-dst", "folder": {}},
                 "options": {"cleanupAfterFinish": True, "optimize_image": True},
@@ -1559,14 +1565,222 @@ class TransferJobTests(TestCase):
                 dest = Path(tmp) / "bad.jpg"
                 with self.assertRaises(ProviderFailure) as ctx:
                     asyncio.run(base_mod.stream_download("https://example.test/file", dest, JobState("json-error", {})))
-                self.assertEqual(ctx.exception.code, "DOWNLOAD_FAILED")
+                self.assertEqual(ctx.exception.code, "PROVIDER_NEEDS_VERIFY")
                 self.assertEqual(ctx.exception.details["errno"], 400141)
                 self.assertFalse(dest.exists())
                 self.assertFalse((Path(tmp) / "bad.jpg.part").exists())
         finally:
             base_mod.httpx.AsyncClient = old_client
 
-    def test_folder_downloads_are_concurrent_and_bounded(self):
+    def test_stream_download_verifies_and_retries_on_need_verify(self):
+        error_body = b'{"errmsg":"need verify","errno":400141}'
+        urls: list[str] = []
+
+        class Stream:
+            def __init__(self, url):
+                self.url = url
+                self.body = error_body if url.endswith("/first") else b"realbytes"
+                self.status_code = 200
+                self.headers = {"content-length": str(len(self.body))}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_bytes(self, size):
+                yield self.body
+
+        class Client:
+            def __init__(self, *args, **kwargs):
+                return None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def stream(self, method, url, headers):
+                urls.append(url)
+                return Stream(url)
+
+        verified: list[int] = []
+
+        async def on_verify(round_index):
+            verified.append(round_index)
+            return {"url": "https://example.test/second", "headers": {"Cookie": "fresh=1"}}
+
+        old_client = base_mod.httpx.AsyncClient
+        base_mod.httpx.AsyncClient = Client
+        try:
+            with __import__("tempfile").TemporaryDirectory() as tmp:
+                dest = Path(tmp) / "photo.jpg"
+                job = JobState("verify-recovers", {})
+                asyncio.run(base_mod.stream_download("https://example.test/first", dest, job, on_verify=on_verify))
+                self.assertEqual(dest.read_bytes(), b"realbytes")
+        finally:
+            base_mod.httpx.AsyncClient = old_client
+
+        self.assertEqual(verified, [0])
+        self.assertEqual(urls, ["https://example.test/first", "https://example.test/second"])
+        self.assertTrue(any("[VERIFY 1/2]" in line for line in job.logs), job.logs)
+
+    def test_download_with_retry_waits_20s_three_times_then_raises(self):
+        sleeps: list[float] = []
+        attempts: list[int] = []
+
+        async def no_sleep(delay):
+            sleeps.append(delay)
+            return None
+
+        async def always_needs_verify():
+            attempts.append(1)
+            raise ProviderFailure("PROVIDER_NEEDS_VERIFY", "need verify")
+
+        job = JobState("retry-then-skip", {})
+        old_sleep = base_mod.asyncio.sleep
+        base_mod.asyncio.sleep = no_sleep
+        try:
+            with self.assertRaises(ProviderFailure) as ctx:
+                asyncio.run(base_mod.download_with_retry(always_needs_verify, progress=job, label="a.jpg"))
+        finally:
+            base_mod.asyncio.sleep = old_sleep
+
+        self.assertEqual(ctx.exception.code, "PROVIDER_NEEDS_VERIFY")
+        self.assertEqual(len(attempts), 4)  # first try + 3 retries
+        self.assertEqual(sum(sleeps), 60.0)  # 3 x 20s, sliced for cancel checks
+        self.assertEqual(len([line for line in job.logs if "[RETRY" in line]), 3)
+
+    def test_download_with_retry_does_not_retry_dead_credentials(self):
+        attempts: list[int] = []
+
+        async def dead_session():
+            attempts.append(1)
+            raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "cookie died")
+
+        job = JobState("no-retry", {})
+        with self.assertRaises(ProviderFailure) as ctx:
+            asyncio.run(base_mod.download_with_retry(dead_session, progress=job, label="a.jpg"))
+        self.assertEqual(ctx.exception.code, "INVALID_PROVIDER_CREDENTIALS")
+        self.assertEqual(len(attempts), 1)
+
+    def test_folder_download_skips_file_that_keeps_needing_verify(self):
+        class Provider(base_mod.BaseProvider):
+            name = "verify-folder"
+
+            async def validate_credentials(self, credentials):
+                return {"ok": True}
+
+            async def list_files(self, credentials, path_or_id):
+                return {"items": [{"id": "ok.jpg", "name": "ok.jpg", "type": "file"}, {"id": "bad.jpg", "name": "bad.jpg", "type": "file"}]}
+
+            async def download_file(self, credentials, file_ref, local_path, progress):
+                if file_ref["id"] == "bad.jpg":
+                    raise ProviderFailure("PROVIDER_NEEDS_VERIFY", "need verify")
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                local_path.write_text("ok")
+                return local_path
+
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                return {"ok": True}
+
+        async def no_sleep(delay):
+            return None
+
+        old_sleep = base_mod.asyncio.sleep
+        base_mod.asyncio.sleep = no_sleep
+        try:
+            with __import__("tempfile").TemporaryDirectory() as tmp:
+                job = JobState("folder-skip", {})
+                saved = asyncio.run(Provider().download_folder({}, {"id": "/"}, Path(tmp), job))
+        finally:
+            base_mod.asyncio.sleep = old_sleep
+
+        self.assertEqual([p.name for p in saved], ["ok.jpg"])
+        self.assertEqual(job.files_failed, 1)
+        self.assertEqual([f["name"] for f in job.failed_files], ["bad.jpg"])
+        self.assertTrue(any("[SKIP] Download failed after retries" in line for line in job.logs), job.logs)
+
+    def test_failing_item_is_skipped_and_kept_in_queue(self):
+        class Source:
+            async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
+                if file_ref["id"] == "bad":
+                    raise ProviderFailure("PROVIDER_NEEDS_VERIFY", "need verify")
+                path = local_dir / file_ref["name"]
+                path.write_bytes(b"x")
+                return path
+
+        async def no_sleep(delay):
+            return None
+
+        dst = UploadRecorder()
+        old = dict(PROVIDERS)
+        old_sleep = base_mod.asyncio.sleep
+        PROVIDERS.update({"fake-source": Source(), "fake-dst": dst})
+        base_mod.asyncio.sleep = no_sleep
+        try:
+            job = JobState("skip-keeps-queue", {
+                "source": {"provider": "fake-source", "items": [
+                    {"type": "file", "id": "bad", "name": "bad.jpg"},
+                    {"type": "file", "id": "good", "name": "good.jpg"},
+                ]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": False},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            base_mod.asyncio.sleep = old_sleep
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("skip-keeps-queue")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual([call[1].name for call in dst.calls], ["good.jpg"])
+        self.assertEqual([entry["id"] for entry in job.failed_items], ["bad"])
+        self.assertEqual([entry["id"] for entry in job.completed_items], ["good"])
+        view = job.view()
+        self.assertEqual([entry["id"] for entry in view["failedItems"]], ["bad"])
+        self.assertTrue(any("Kept in queue" in line for line in job.logs), job.logs)
+
+    def test_every_item_failing_fails_the_job_without_clearing_queue(self):
+        class Source:
+            async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
+                raise ProviderFailure("PROVIDER_NEEDS_VERIFY", "need verify")
+
+        async def no_sleep(delay):
+            return None
+
+        old = dict(PROVIDERS)
+        old_sleep = base_mod.asyncio.sleep
+        PROVIDERS.update({"fake-source": Source(), "fake-dst": UploadRecorder()})
+        base_mod.asyncio.sleep = no_sleep
+        try:
+            job = JobState("skip-all", {
+                "source": {"provider": "fake-source", "items": [
+                    {"type": "file", "id": "a", "name": "a.jpg"},
+                    {"type": "file", "id": "b", "name": "b.jpg"},
+                ]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": False},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            base_mod.asyncio.sleep = old_sleep
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("skip-all")
+
+        self.assertEqual(job.status, "failed")
+        self.assertEqual(job.error["code"], "DOWNLOAD_FAILED")
+        self.assertEqual(job.completed_items, [])
+        self.assertEqual(sorted(entry["id"] for entry in job.failed_items), ["a", "b"])
+
+
         class Provider(base_mod.BaseProvider):
             name = "parallel"
 
@@ -1882,6 +2096,120 @@ class TransferJobTests(TestCase):
         self.assertEqual(parent, "/photos/results")
         self.assertFalse(any(call[1].startswith("create folder /photos/results") for call in s.calls))
 
+    def test_terabox_refreshes_token_and_retries_on_need_verify_errno(self):
+        bodies = [{"errno": 4000023, "errmsg": "need verify"}, {"errno": 0, "list": []}]
+        sent: list[dict] = []
+
+        class Response:
+            status_code = 200
+            cookies = {}
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def json(self):
+                return self.payload
+
+        class Client:
+            is_closed = False
+
+            async def request(self, method, url, **kwargs):
+                sent.append(dict(kwargs.get("params") or {}))
+                return Response(bodies[len(sent) - 1])
+
+        s = TeraBoxSession({"cookies": {"ndus": "x"}, "jstoken": "stale", "bdstoken": "b"})
+        s._api_client = Client()
+        refreshed: list[bool] = []
+
+        async def bootstrap(*, force=False):
+            refreshed.append(force)
+            s.jstoken = "fresh"
+
+        s.bootstrap_tokens = bootstrap
+        out = asyncio.run(s.request_json("GET", "https://www.terabox.com/api/list", context="list /", params=s.params()))
+
+        self.assertEqual(out["list"], [])
+        self.assertEqual(refreshed, [True])
+        self.assertEqual([p.get("jsToken") for p in sent], ["stale", "fresh"])
+
+    def test_terabox_persistent_verify_surfaces_needs_verify_code(self):
+        class Response:
+            status_code = 200
+            cookies = {}
+
+            def json(self):
+                return {"errno": 400141, "errmsg": "need verify"}
+
+        class Client:
+            is_closed = False
+
+            async def request(self, method, url, **kwargs):
+                return Response()
+
+        s = TeraBoxSession({"cookies": {"ndus": "x"}, "jstoken": "j", "bdstoken": "b"})
+        s._api_client = Client()
+
+        async def bootstrap(*, force=False):
+            return None
+
+        s.bootstrap_tokens = bootstrap
+        with self.assertRaises(ProviderFailure) as ctx:
+            asyncio.run(s.request_json("GET", "https://www.terabox.com/api/filemetas", context="filemetas /a.jpg", params=s.params()))
+        self.assertEqual(ctx.exception.code, "PROVIDER_NEEDS_VERIFY")
+
+    def test_terabox_download_sends_referer_and_verify_refetches_dlink(self):
+        captured: dict = {}
+        dlink_calls: list[str] = []
+
+        class Provider(TeraBoxProvider):
+            async def _session(self, credentials):
+                return session
+
+            async def _dlink(self, s, path):
+                dlink_calls.append(path)
+                return {"dlink": f"https://dm-d.terabox.com/file/{len(dlink_calls)}", "server_filename": "a.jpg", "src_location": "kul"}
+
+        class Session:
+            base = "https://www.terabox.com"
+            cookies = {"ndus": "abc"}
+
+            async def bootstrap_tokens(self, *, force=False):
+                captured["forced"] = force
+
+        session = Session()
+
+        async def fake_stream(url, dest, progress, *, headers=None, phase="download", on_verify=None):
+            captured["url"] = url
+            captured["headers"] = dict(headers or {})
+            captured["fresh"] = await on_verify(0)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"x")
+            return dest
+
+        old_stream = terabox_mod.stream_download
+        terabox_mod.stream_download = fake_stream
+        try:
+            with __import__("tempfile").TemporaryDirectory() as tmp:
+                asyncio.run(Provider().download_file({}, {"path": "/a.jpg", "name": "a.jpg"}, Path(tmp), JobState("tb-dl", {})))
+        finally:
+            terabox_mod.stream_download = old_stream
+
+        self.assertEqual(captured["headers"]["Referer"], "https://www.terabox.com/")
+        self.assertEqual(captured["headers"]["Cookie"], "ndus=abc")
+        self.assertTrue(captured["forced"])
+        self.assertEqual(dlink_calls, ["/a.jpg", "/a.jpg"])
+        # Round 0 retries a freshly issued dlink rather than replaying the stale one.
+        self.assertNotEqual(captured["fresh"]["url"], captured["url"])
+        self.assertIn("terabox.com", captured["fresh"]["url"])
+        self.assertEqual(captured["fresh"]["headers"]["Referer"], "https://www.terabox.com/")
+
+    def test_dlink_candidates_mirror_known_edges(self):
+        urls = terabox_mod._dlink_candidates("https://dm-d.terabox.com/file/abc?x=1", {"src_location": "kul"})
+        self.assertEqual(urls[0], "https://dm-d.terabox.com/file/abc?x=1")
+        self.assertGreater(len(urls), 1)
+        self.assertTrue(all(url.endswith("/file/abc?x=1") for url in urls))
+        self.assertIn("https://kul-d.terabox.com/file/abc?x=1", urls)
+
     def test_terabox_results_folder_creation_is_serialized(self):
         class Session:
             base = "https://www.terabox.com"
@@ -2103,3 +2431,34 @@ class TransferJobPathSafetyTests(TestCase):
 
         self.assertEqual(job.status, "completed", job.error)
         self.assertEqual(job.payload["options"].get("upload_prefix"), "results")
+
+
+def test_relay_monitor_swallows_dead_socket_and_stop_cancels_tasks():
+    """A dropped relay socket must not surface as an unretrieved task exception."""
+    from src import relay_client
+
+    class DeadSocket:
+        async def send(self, _raw):
+            raise ConnectionResetError("no close frame received or sent")
+
+    class Manager:
+        def __init__(self, job):
+            self.jobs = {job.job_id: job}
+
+        def get(self, job_id):
+            return self.jobs.get(job_id)
+
+    job = JobState("relay-monitor", {})
+    job.status = "running"
+
+    async def scenario():
+        # The monitor returns quietly instead of raising into an unawaited task.
+        await relay_client._monitor(DeadSocket(), Manager(job), job.job_id)
+
+        monitors = {"a": asyncio.create_task(asyncio.sleep(30)), "b": asyncio.create_task(asyncio.sleep(30))}
+        relay_client._stop_monitors(monitors)
+        await asyncio.sleep(0)
+        return monitors
+
+    tasks = asyncio.run(scenario())
+    assert tasks == {}

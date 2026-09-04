@@ -9,7 +9,7 @@ from typing import Any
 from ..extract.extractor import extract_archives
 from ..config import FOLDER_DOWNLOAD_CONCURRENCY, UPLOAD_FILE_CONCURRENCY
 from ..providers import PROVIDERS
-from ..providers.base import ProviderFailure, close_shared_clients, safe_name
+from ..providers.base import ProviderFailure, close_shared_clients, download_with_retry, is_skippable_download_failure, safe_name
 from ..security import redact
 from ..utils.image_optimizer import VIDEO_EXTENSIONS
 from ..utils.temp_storage import cleanup_job, job_dirs
@@ -40,6 +40,9 @@ async def run_transfer(job: JobState) -> None:
         if options.get("optimize_image") and len(source.get("items") or []) > 1 and has_folder_batch:
             await _run_optimized_batches(job, dirs, source, target, options, src, dst)
             job.log(f"Done: Downloaded {job.files_downloaded}/{job.files_to_download} file(s), Uploaded {job.files_uploaded}/{job.files_to_upload} file(s) (skipped {job.files_skipped} file(s))")
+            _log_skip_summary(job)
+            if job.failed_items and not job.completed_items:
+                raise ProviderFailure("DOWNLOAD_FAILED", f"All {len(job.failed_items)} item(s) skipped after retries", {"failedItems": job.failed_items[:5]})
             job.set(status="completed", step="completed")
             return
 
@@ -57,10 +60,19 @@ async def run_transfer(job: JobState) -> None:
         has_folder_source = False
         sem = asyncio.Semaphore(max(1, FOLDER_DOWNLOAD_CONCURRENCY))
 
-        async def download_one(item: dict[str, Any]) -> Path:
+        async def download_one(item: dict[str, Any]) -> list[Path]:
             async with sem:
                 job.check_cancelled()
-                return await src.download_file(source.get("credentials") or {}, item, dirs["input"], job)
+                try:
+                    return [await download_with_retry(
+                        lambda: src.download_file(source.get("credentials") or {}, item, dirs["input"], job),
+                        progress=job, label=_item_name(item),
+                    )]
+                except ProviderFailure as exc:
+                    if not is_skippable_download_failure(exc):
+                        raise
+                    _mark_item_skipped(job, source, item, exc.message)
+                    return []
 
         for item in source.get("items") or []:
             job.check_cancelled()
@@ -70,15 +82,29 @@ async def run_transfer(job: JobState) -> None:
                 raw_name = str(item.get("name") or item.get("path") or item.get("id") or "folder").replace("\\", "/")
                 folder_dir = dirs["input"] / safe_name(PurePosixPath(raw_name).name or raw_name)
                 folder_dir.mkdir(parents=True, exist_ok=True)
-                downloaded.extend(await src.download_folder(source.get("credentials") or {}, item, folder_dir, job))
+                failed_before = job.files_failed
+                try:
+                    downloaded.extend(await src.download_folder(source.get("credentials") or {}, item, folder_dir, job))
+                except ProviderFailure as exc:
+                    if not is_skippable_download_failure(exc):
+                        raise
+                    _mark_item_skipped(job, source, item, exc.message)
+                    continue
+                if job.files_failed > failed_before:
+                    _mark_item_skipped(job, source, item, f"{job.files_failed - failed_before} file(s) unavailable after retries")
             else:
                 continue
-        downloaded.extend(await asyncio.gather(*(download_one(item) for item in file_items)))
+        for batch in await asyncio.gather(*(download_one(item) for item in file_items)):
+            downloaded.extend(batch)
         if not downloaded and options.get("optimize_image") and job.files_skipped:
             job.log("No image files found for optimization.")
+            _mark_remaining_items_completed(job, source)
+            _log_skip_summary(job)
             job.set(status="completed", step="completed")
             return
         if not downloaded:
+            if job.failed_items:
+                raise ProviderFailure("DOWNLOAD_FAILED", f"All {len(job.failed_items)} item(s) skipped after retries; nothing downloaded", {"failedItems": job.failed_items[:5]})
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "No source files downloaded")
         stray = [p for p in downloaded if not p.is_relative_to(dirs["input"])]
         if stray:
@@ -92,8 +118,12 @@ async def run_transfer(job: JobState) -> None:
         outputs = downloaded
         if options.get("extract"):
             job.log("Extract enabled: scanning downloaded files for archives...")
-            outputs = await extract_archives(dirs["input"], dirs["output"], job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
-            out_root = dirs["output"]
+            # Extract into its own subdir: the optimizer writes to a sibling ("optimized"), and
+            # having its output nested inside its input would make it re-scan its own results.
+            extract_root = dirs["output"] / "extracted"
+            extract_root.mkdir(parents=True, exist_ok=True)
+            outputs = await extract_archives(dirs["input"], extract_root, job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
+            out_root = extract_root
             job.log(f"Extract stage output files: {len(outputs)}")
 
         if options.get("optimize_image"):
@@ -155,7 +185,9 @@ async def run_transfer(job: JobState) -> None:
                     result = await _upload_outputs_with_retry(job, target, options, dst, upload_root, {})
                 else:
                     result = await dst.upload_folder(target.get("credentials") or {}, upload_root, _upload_target(target.get("folder") or {}, "", options), job)
+        _mark_remaining_items_completed(job, source)
         job.log(f"Done: Downloaded {job.files_downloaded}/{job.files_to_download} file(s), Uploaded {job.files_uploaded}/{job.files_to_upload} file(s) (skipped {job.files_skipped} file(s))")
+        _log_skip_summary(job)
         job.set(status="completed", step="completed")
     except JobCancelled:
         job.error = {"code": "JOB_CANCELLED", "message": "Job cancelled", "details": {}}
@@ -205,12 +237,27 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         batch_input.mkdir(parents=True, exist_ok=True)
         batch_output.mkdir(parents=True, exist_ok=True)
         job.set(status="running", step="downloading")
-        downloaded = await _download_batch_item(job, source, src, item, batch_input)
+        failed_before = job.files_failed
+        try:
+            downloaded = await _download_batch_item(job, source, src, item, batch_input)
+        except ProviderFailure as exc:
+            # Retries are already exhausted inside the download; move to the next queue item
+            # and leave this one in the queue so it can be picked up again later.
+            if not is_skippable_download_failure(exc):
+                raise
+            _mark_item_skipped(job, source, item, exc.message)
+            shutil.rmtree(batch_input, ignore_errors=True)
+            shutil.rmtree(batch_output.parent, ignore_errors=True)
+            continue
+        item_failed = job.files_failed > failed_before
+        if item_failed:
+            _mark_item_skipped(job, source, item, f"{job.files_failed - failed_before} file(s) unavailable after retries")
         if not downloaded:
             job.log(f"No image files found for optimization: {_item_name(item)}")
             shutil.rmtree(batch_input, ignore_errors=True)
             shutil.rmtree(batch_output.parent, ignore_errors=True)
-            job.completed_items.append(_queue_item_ref(source, item))
+            if not item_failed:
+                job.completed_items.append(_queue_item_ref(source, item))
             continue
         _validate_downloads(downloaded, batch_input)
         job.log(f"Downloaded files: {len(downloaded)}")
@@ -235,7 +282,8 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
             job.log(f"No image files found for optimization: {_item_name(item)}")
             shutil.rmtree(batch_input, ignore_errors=True)
             shutil.rmtree(batch_output.parent, ignore_errors=True)
-            job.completed_items.append(_queue_item_ref(source, item))
+            if not item_failed:
+                job.completed_items.append(_queue_item_ref(source, item))
             continue
 
         if batch_results and action is None:
@@ -264,7 +312,8 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         await _upload_outputs_with_retry(job, target, options, dst, upload_root, item)
         shutil.rmtree(batch_input, ignore_errors=True)
         shutil.rmtree(batch_output.parent, ignore_errors=True)
-        job.completed_items.append(_queue_item_ref(source, item))
+        if not item_failed:
+            job.completed_items.append(_queue_item_ref(source, item))
 
     if not job.optimized_files and job.files_skipped:
         job.log("No image files found for optimization.")
@@ -277,7 +326,36 @@ async def _download_batch_item(job: JobState, source: dict[str, Any], src: Any, 
         folder_dir.mkdir(parents=True, exist_ok=True)
         return await src.download_folder(source.get("credentials") or {}, item, folder_dir, job)
     job.files_to_download += 1
-    return [await src.download_file(source.get("credentials") or {}, item, batch_input, job)]
+    return [await download_with_retry(
+        lambda: src.download_file(source.get("credentials") or {}, item, batch_input, job),
+        progress=job, label=_item_name(item),
+    )]
+
+def _mark_item_skipped(job: JobState, source: dict[str, Any], item: dict[str, Any], reason: str) -> None:
+    """Park a queue item: skipped this run, still in the queue for the next one."""
+    ref = _queue_item_ref(source, item)
+    key = (str(ref.get("provider") or ""), str(ref.get("id") or ""))
+    if any((str(f.get("provider") or ""), str(f.get("id") or "")) == key for f in job.failed_items):
+        return
+    job.failed_items.append({**ref, "name": _item_name(item), "reason": reason})
+    job.log(f"[SKIP] Kept in queue, moving to the next item: {_item_name(item)} ({reason})")
+
+def _mark_remaining_items_completed(job: JobState, source: dict[str, Any]) -> None:
+    """Name every item that was not skipped, so the queue drops exactly those."""
+    seen = {(str(entry.get("provider") or ""), str(entry.get("id") or "")) for entry in (*job.failed_items, *job.completed_items)}
+    for item in source.get("items") or []:
+        ref = _queue_item_ref(source, item)
+        key = (str(ref.get("provider") or ""), str(ref.get("id") or ""))
+        if key not in seen:
+            job.completed_items.append(ref)
+            seen.add(key)
+
+def _log_skip_summary(job: JobState) -> None:
+    if not job.failed_items:
+        return
+    job.log(f"[SKIP] {len(job.failed_items)} item(s) skipped and left in the queue: {', '.join(str(entry.get('name') or entry.get('id')) for entry in job.failed_items[:10])}")
+    if job.files_failed:
+        job.log(f"[SKIP] {job.files_failed} file(s) could not be downloaded after retries.")
 
 async def _upload_outputs(job: JobState, target: dict[str, Any], options: dict[str, Any], dst: Any, upload_root: Path, item: dict[str, Any]) -> None:
     files = [p for p in upload_root.rglob("*") if p.is_file()]

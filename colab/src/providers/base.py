@@ -74,6 +74,74 @@ class ProviderFailure(RuntimeError):
         self.message = message
         self.details = details or {}
 
+# TeraBox answers a dlink with {"errno": 400141, "errmsg": "need verify"} when it wants the
+# web session re-verified; the other codes are the token-expiry family the web client fixes
+# by re-scraping jsToken. All of them are recoverable, so they get a verify round + retries
+# before the item is skipped.
+VERIFY_ERRNOS = {-19, 9013, 9019, 400141, 4000020, 4000023, 450016}
+VERIFY_HINTS = ("need verify", "verify", "captcha", "risk control", "token expired")
+VERIFY_ROUNDS = 3
+DOWNLOAD_RETRIES = 3
+DOWNLOAD_RETRY_DELAY = 20.0
+# Failures where the bytes are probably still fetchable later: retry, then skip the item.
+RETRYABLE_DOWNLOAD_CODES = {"DOWNLOAD_FAILED", "PROVIDER_NEEDS_VERIFY", "PROVIDER_RATE_LIMITED"}
+SKIPPABLE_DOWNLOAD_CODES = RETRYABLE_DOWNLOAD_CODES | {"SOURCE_FILE_NOT_FOUND"}
+
+def is_verify_error(err: dict[str, Any] | None) -> bool:
+    if not err:
+        return False
+    try:
+        if int(str(err.get("errno"))) in VERIFY_ERRNOS:
+            return True
+    except (TypeError, ValueError):
+        pass
+    message = str(err.get("message") or "").lower()
+    return any(hint in message for hint in VERIFY_HINTS)
+
+def is_retryable_download_failure(exc: BaseException) -> bool:
+    return isinstance(exc, ProviderFailure) and exc.code in RETRYABLE_DOWNLOAD_CODES
+
+def is_skippable_download_failure(exc: BaseException) -> bool:
+    return isinstance(exc, ProviderFailure) and exc.code in SKIPPABLE_DOWNLOAD_CODES
+
+async def sleep_cancellable(seconds: float, progress: JobState) -> None:
+    """Wait in 0.5s slices so a cancel during the retry backoff lands promptly."""
+    remaining = max(0.0, float(seconds))
+    while remaining > 0:
+        progress.check_cancelled()
+        step = min(0.5, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
+
+async def download_with_retry(
+    factory: Any,
+    *,
+    progress: JobState,
+    label: str,
+    retries: int = DOWNLOAD_RETRIES,
+    delay: float = DOWNLOAD_RETRY_DELAY,
+) -> Any:
+    """Await `factory()`, retrying provider refusals `retries` times, `delay` apart.
+
+    Provider-side verification (refresh tokens, re-issue the dlink) already happened inside
+    the download itself; this is the outer fallback for when verifying did not clear it.
+    The last failure propagates so the caller can skip the item.
+    """
+    last: ProviderFailure | None = None
+    for attempt in range(max(1, retries + 1)):
+        progress.check_cancelled()
+        try:
+            return await factory()
+        except ProviderFailure as exc:
+            if not is_retryable_download_failure(exc):
+                raise
+            last = exc
+            if attempt >= retries:
+                break
+            progress.log(f"[RETRY {attempt + 1}/{retries}] Download failed ({exc.message}); retrying {label} in {int(delay)}s")
+            await sleep_cancellable(delay, progress)
+    raise last or ProviderFailure("DOWNLOAD_FAILED", f"Download failed: {label}")
+
 class BaseProvider(ABC):
     name = "base"
 
@@ -106,7 +174,19 @@ class BaseProvider(ABC):
                 progress.log(f"[SKIP] File ignored by image optimizer: {item.get('name') or item.get('server_filename') or item.get('id') or 'file'}")
                 return []
             async with sem:
-                return [await self.download_file(credentials, item, local_dir / _safe_name(item.get("name") or item.get("server_filename") or item.get("id") or "file"), progress)]
+                dest = local_dir / _safe_name(item.get("name") or item.get("server_filename") or item.get("id") or "file")
+                try:
+                    return [await download_with_retry(
+                        lambda: self.download_file(credentials, item, dest, progress),
+                        progress=progress, label=dest.name,
+                    )]
+                except ProviderFailure as exc:
+                    # One unfetchable file must not sink the whole folder: record it and let the
+                    # rest through. The folder then stays in the queue (see JobState.failed_items).
+                    if not is_skippable_download_failure(exc):
+                        raise
+                    progress.fail_file(dest.name, exc.code, exc.message)
+                    return []
 
         try:
             return [path for batch in await asyncio.gather(*(save(item) for item in items)) for path in batch]
@@ -148,54 +228,75 @@ class BaseProvider(ABC):
         skipped = len(results) - len(uploaded)
         return {"ok": True, "uploaded": len(uploaded), "skipped": skipped, "items": uploaded}
 
-async def stream_download(url: str, dest: Path, progress: JobState, *, headers: dict[str, str] | None = None, phase: str = "download") -> Path:
+async def stream_download(url: str, dest: Path, progress: JobState, *, headers: dict[str, str] | None = None, phase: str = "download", on_verify: Any = None) -> Path:
+    """Stream `url` into `dest`, resuming across connection drops.
+
+    When the provider answers with a JSON error instead of bytes and `on_verify` is given,
+    the hook gets a chance to re-verify the session and hand back a fresh url/headers; that
+    is what recovers TeraBox's `need verify`. Without a hook (or once the rounds run out)
+    the failure surfaces as PROVIDER_NEEDS_VERIFY so the caller can retry, then skip.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".part")
-    expected = 0
-    content_type = ""
-    last_exc: Exception | None = None
-    for attempt in range(5):
-        done = part.stat().st_size if part.exists() else 0
-        attempt_start = done
-        req_headers = dict(headers or {})
-        if done:
-            req_headers["Range"] = f"bytes={done}-"
-        try:
-            async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
-                async with client.stream("GET", url, headers=req_headers) as resp:
-                    if resp.status_code in (401, 403):
-                        raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Provider rejected download credentials")
-                    resp.raise_for_status()
-                    if done and resp.status_code != 206:
-                        part.unlink(missing_ok=True)
-                        done = 0
-                    total = done + int(resp.headers.get("content-length") or 0)
-                    expected = total or expected
-                    content_type = resp.headers.get("content-type", content_type)
-                    with part.open("ab" if done else "wb") as fh:
-                        async for chunk in resp.aiter_bytes(CHUNK_SIZE):
-                            progress.check_cancelled()
-                            fh.write(chunk)
-                            done += len(chunk)
-                            progress.add_bytes(len(chunk), total, phase, str(dest))
-            if not expected or part.stat().st_size >= expected:
-                break
-            raise RuntimeError(f"Download incomplete: got {part.stat().st_size} bytes, expected {expected}")
-        except ProviderFailure:
-            raise
-        except Exception as exc:
-            last_exc = exc
-            if attempt == 4:
+    strict = dest.suffix.lower() in IMAGE_EXTENSIONS
+    rounds = VERIFY_ROUNDS if on_verify else 1
+    for verify_round in range(rounds):
+        expected = 0
+        content_type = ""
+        last_exc: Exception | None = None
+        for attempt in range(5):
+            done = part.stat().st_size if part.exists() else 0
+            attempt_start = done
+            req_headers = dict(headers or {})
+            if done:
+                req_headers["Range"] = f"bytes={done}-"
+            try:
+                async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+                    async with client.stream("GET", url, headers=req_headers) as resp:
+                        if resp.status_code in (401, 403):
+                            raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Provider rejected download credentials")
+                        resp.raise_for_status()
+                        if done and resp.status_code != 206:
+                            part.unlink(missing_ok=True)
+                            done = 0
+                        total = done + int(resp.headers.get("content-length") or 0)
+                        expected = total or expected
+                        content_type = resp.headers.get("content-type", content_type)
+                        with part.open("ab" if done else "wb") as fh:
+                            async for chunk in resp.aiter_bytes(CHUNK_SIZE):
+                                progress.check_cancelled()
+                                fh.write(chunk)
+                                done += len(chunk)
+                                progress.add_bytes(len(chunk), total, phase, str(dest))
+                if not expected or part.stat().st_size >= expected:
+                    break
+                raise RuntimeError(f"Download incomplete: got {part.stat().st_size} bytes, expected {expected}")
+            except ProviderFailure:
                 raise
-            progress.log(f"[RETRY] Download interrupted, resuming: {dest.name}")
-            if not part.exists() or part.stat().st_size <= attempt_start:
-                await asyncio.sleep(min(2 ** attempt, 8))
-    if expected and part.stat().st_size < expected and last_exc:
-        raise last_exc
-    err = _download_error_payload(part, content_type, dest.suffix.lower() in IMAGE_EXTENSIONS)
-    if err:
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 4:
+                    raise
+                progress.log(f"[RETRY] Download interrupted, resuming: {dest.name}")
+                if not part.exists() or part.stat().st_size <= attempt_start:
+                    await asyncio.sleep(min(2 ** attempt, 8))
+        if expected and part.stat().st_size < expected and last_exc:
+            raise last_exc
+        err = _download_error_payload(part, content_type, strict)
+        if not err:
+            break
         part.unlink(missing_ok=True)
-        raise ProviderFailure("DOWNLOAD_FAILED", f"Provider returned error instead of file: {err.get('message')}", err)
+        needs_verify = is_verify_error(err)
+        if not (needs_verify and on_verify and verify_round < rounds - 1):
+            code = "PROVIDER_NEEDS_VERIFY" if needs_verify else "DOWNLOAD_FAILED"
+            raise ProviderFailure(code, f"Provider returned error instead of file: {err.get('message')}", err)
+        progress.log(f"[VERIFY {verify_round + 1}/{rounds - 1}] Provider wants verification ({err.get('message')}); refreshing session for {dest.name}")
+        fresh = await on_verify(verify_round)
+        if not (fresh and fresh.get("url")):
+            raise ProviderFailure("PROVIDER_NEEDS_VERIFY", f"Provider returned error instead of file: {err.get('message')}", err)
+        url = str(fresh["url"])
+        if fresh.get("headers"):
+            headers = dict(fresh["headers"])
     part.replace(dest)
     progress.files_downloaded += 1
     ctx = _DOWNLOAD_LOG_CONTEXT.get()
@@ -223,9 +324,14 @@ def _download_error_payload(path: Path, content_type: str, strict: bool) -> dict
     message = data.get("errmsg") or data.get("error_description") or data.get("error") or data.get("message")
     if not message and errno in (None, 0, "0"):
         return None
+    payload = {"errno": errno, "message": str(message or "download error"), "body": data}
+    # A complete errno+errmsg envelope is a provider refusal whatever the content-type claims;
+    # trusting the content-type here would leave a 70-byte "video" on disk.
+    if message and errno not in (None, 0, "0"):
+        return payload
     if "json" not in content_type.lower() and not strict:
         return None
-    return {"errno": errno, "message": str(message or "download error"), "body": data}
+    return payload
 
 def safe_name(name: str) -> str:
     clean = "".join(c for c in str(name or "file") if c not in '<>:"/\\|?*').strip().strip(".")

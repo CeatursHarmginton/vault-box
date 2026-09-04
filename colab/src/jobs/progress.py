@@ -44,16 +44,26 @@ class JobState:
     files_to_download: int = 0
     files_uploaded: int = 0
     files_skipped: int = 0
+    files_failed: int = 0
     files_to_upload: int = 0
     confirm_event: threading.Event = field(default_factory=threading.Event, compare=False, hash=False)
     confirm_action: str | None = None
     optimized_files: list[dict[str, Any]] = field(default_factory=list)
     completed_items: list[dict[str, Any]] = field(default_factory=list)
+    failed_items: list[dict[str, Any]] = field(default_factory=list)
+    failed_files: list[dict[str, Any]] = field(default_factory=list)
 
     def log(self, message: str) -> None:
         self.logs.append(message)
         self.logs = self.logs[-200:]
         self.updated_at = time.time()
+
+    def fail_file(self, name: str, code: str, message: str) -> None:
+        """Record a file the provider would not hand over, so the run can move on without it."""
+        self.files_failed += 1
+        self.failed_files.append({"name": name, "code": code, "message": message})
+        self.failed_files = self.failed_files[-200:]
+        self.log(f"[SKIP] Download failed after retries, skipping file: {name} ({message})")
 
     def set(self, *, status: str | None = None, step: str | None = None, current_file: str | None = None) -> None:
         if status:
@@ -127,9 +137,12 @@ class JobState:
             "filesToDownload": self.files_to_download,
             "filesUploaded": self.files_uploaded,
             "filesSkipped": self.files_skipped,
+            "filesFailed": self.files_failed,
             "filesToUpload": self.files_to_upload,
             "optimizedFiles": self.optimized_files,
             "completedItems": self.completed_items,
+            "failedItems": self.failed_items,
+            "failedFiles": self.failed_files[-50:],
             "confirmAction": self.confirm_action,
             "targetProvider": (self.payload.get("target") or {}).get("provider"),
             "targetAccountId": (self.payload.get("target") or {}).get("accountId") or (self.payload.get("target") or {}).get("account_id"),

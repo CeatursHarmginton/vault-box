@@ -9,11 +9,11 @@ import time
 import zlib
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 
-from .base import BaseProvider, ProviderFailure, dict_lock, owner_store, safe_name, stream_download, track_client
+from .base import BaseProvider, ProviderFailure, dict_lock, is_verify_error, owner_store, safe_name, stream_download, track_client
 from ..config import TERABOX_UPLOAD_CONCURRENCY
 from ..jobs.progress import JobCancelled, JobState
 
@@ -27,6 +27,40 @@ UPLOAD_CONCURRENCY = TERABOX_UPLOAD_CONCURRENCY
 JS_PAT = (r"fn%28%22([0-9A-Fa-f]+)%22%29", r'"jsToken"\s*:\s*"([0-9A-Fa-f]+)"', r"jsToken['\"]?\s*[:=]\s*['\"]([0-9A-Fa-f]+)['\"]")
 BD_PAT = (r'"bdstoken"\s*:\s*"([0-9a-f]{32})"', r"bdstoken['\"]?\s*[:=]\s*['\"]([0-9a-f]{32})['\"]")
 TOKEN_EXPIRED = {"4000020", "4000023", "450016"}
+DLINK_SUFFIXES = ("terabox.com", "nephobox.com")
+DLINK_PREFIXES = ("dm", "kul")
+
+def _dlink_candidates(dlink: str, entry: dict[str, Any] | None = None) -> list[str]:
+    """The same dlink pointed at sibling CDN edges.
+
+    A single edge can keep answering `need verify` while its neighbours serve the bytes, so
+    each verify round moves the download to the next host in this list.
+    """
+    parsed = urlparse(dlink)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return [dlink] if dlink else []
+    out = [dlink]
+
+    def add(host: str) -> None:
+        host = host.strip().lower().rstrip(".")
+        if not host or not any(host == s or host.endswith("." + s) for s in DLINK_SUFFIXES):
+            return
+        mirrored = urlunparse((parsed.scheme, host, parsed.path, parsed.params, parsed.query, parsed.fragment))
+        if mirrored not in out:
+            out.append(mirrored)
+
+    prefix, _, suffix = parsed.netloc.lower().partition(".")
+    if not any(suffix == s or suffix.endswith("." + s) for s in DLINK_SUFFIXES):
+        suffix = "terabox.com"
+    src = str((entry or {}).get("src_location") or "").strip().lower()
+    if src and src.replace("-", "").isalnum():
+        for host_suffix in dict.fromkeys([suffix, *DLINK_SUFFIXES]):
+            add(f"{src}-d.{host_suffix}")
+    for host_suffix in dict.fromkeys([suffix, *DLINK_SUFFIXES]):
+        for host_prefix in dict.fromkeys([prefix.removesuffix("-d"), *DLINK_PREFIXES]):
+            if host_prefix:
+                add(f"{host_prefix}-d.{host_suffix}")
+    return out
 
 def _cookie_dict(c: dict[str, Any]) -> dict[str, str]:
     cookies = dict(c.get("cookies") or {})
@@ -111,7 +145,7 @@ class TeraBoxSession:
         out.update({k: str(v) for k, v in extra.items() if v is not None})
         return out
 
-    async def request_json(self, method: str, url: str, *, context: str, **kw: Any) -> dict[str, Any]:
+    async def request_json(self, method: str, url: str, *, context: str, _verified: bool = False, **kw: Any) -> dict[str, Any]:
         resp = await self.client().request(method, url, **kw)
         self.cookies.update({k: v for k, v in resp.cookies.items() if v})
         if resp.status_code in (401, 403):
@@ -123,12 +157,24 @@ class TeraBoxSession:
         errno = data.get("errno", data.get("errcode"))
         if errno not in (None, 0, "0"):
             code = int(errno) if str(errno).lstrip("-").isdigit() else -1
+            if str(code) in TOKEN_EXPIRED and not _verified:
+                # What the web client does for "need verify"/token expiry: re-scrape jsToken
+                # from the logged-in page and replay the call once with the fresh token.
+                await self.bootstrap_tokens(force=True)
+                params = kw.get("params")
+                if isinstance(params, dict) and self.jstoken:
+                    params["jsToken"] = self.jstoken
+                return await self.request_json(method, url, context=context, _verified=True, **kw)
             if code in {111, -62, 6, -6, 4000023}:
                 raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", f"TeraBox session invalid ({context})", {"errno": code})
             if code in {31034, -32}:
                 raise ProviderFailure("PROVIDER_RATE_LIMITED", f"TeraBox rate limited ({context})", {"errno": code})
             if code == -9:
                 raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"TeraBox path not found ({context})")
+            if is_verify_error({"errno": code, "message": data.get("errmsg") or ""}):
+                # Verification still demanded after a token refresh: recoverable, so the caller
+                # retries on a delay instead of failing the whole job.
+                raise ProviderFailure("PROVIDER_NEEDS_VERIFY", f"TeraBox wants verification ({context})", {"errno": code, "body": data})
             failure_code = "UPLOAD_FAILED" if any(token in context for token in ("upload", "precreate", "create folder")) else "DOWNLOAD_FAILED"
             raise ProviderFailure(failure_code, f"TeraBox API error ({context})", {"errno": code, "body": data})
         return data
@@ -250,8 +296,29 @@ class TeraBoxProvider(BaseProvider):
         name = file_ref.get("name") or meta.get("server_filename") or PurePosixPath(path).name
         dest = local_path if local_path.suffix else local_path / safe_name(name)
         progress.set(step="downloading", current_file=dest.name)
-        cookie = "; ".join(f"{k}={v}" for k, v in s.cookies.items())
-        return await stream_download(str(meta["dlink"]), dest, progress, headers={"User-Agent": UA, "Cookie": cookie})
+
+        def dl_headers() -> dict[str, str]:
+            # Referer matters: without it the CDN is markedly more likely to answer the dlink
+            # with `need verify` instead of bytes.
+            return {
+                "User-Agent": UA,
+                "Referer": f"{s.base}/",
+                "Accept": "*/*",
+                "Cookie": "; ".join(f"{k}={v}" for k, v in s.cookies.items()),
+            }
+
+        async def verify(round_index: int) -> dict[str, Any]:
+            """Re-verify the session the way the web client does, then hand back a fresh link.
+
+            Round 0 retries the freshly issued dlink (new jsToken + cookies); later rounds move
+            to a sibling CDN edge, since one edge can keep refusing what its neighbours serve.
+            """
+            await s.bootstrap_tokens(force=True)
+            fresh = await self._dlink(s, path)
+            urls = _dlink_candidates(str(fresh.get("dlink") or meta.get("dlink") or ""), fresh)
+            return {"url": urls[min(round_index, len(urls) - 1)], "headers": dl_headers()}
+
+        return await stream_download(str(meta["dlink"]), dest, progress, headers=dl_headers(), on_verify=verify)
 
     async def _upload_hosts(self, s: TeraBoxSession) -> list[str]:
         """locateupload is session-wide, not per-file: resolve it once per job (TTL 10 min)."""
