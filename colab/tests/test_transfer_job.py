@@ -49,46 +49,41 @@ def test_links_provider_downloads_inside_directory_path(tmp_path, monkeypatch):
     assert out == tmp_path / "a.bin"
     assert out.read_text() == "ok"
 
-def test_pikpak_parallel_download_ranges_and_merges(tmp_path, monkeypatch):
-    data = b"abcdefghijklmnop"
-    ranges = []
+def test_pikpak_aria2_download_uses_split_and_reports_progress(tmp_path, monkeypatch):
+    cmd_seen = []
 
-    class Stream:
-        def __init__(self, headers):
-            raw = (headers or {}).get("Range", "")
-            ranges.append(raw)
-            start, end = [int(x) for x in raw.removeprefix("bytes=").split("-")]
-            self.body = data[start:end + 1]
-            self.status_code = 206
-            self.headers = {"content-range": f"bytes {start}-{end}/{len(data)}", "content-length": str(len(self.body))}
+    class Stdout:
+        def __init__(self):
+            self.chunks = [b"[#1 8MiB/16MiB(50%)]\n", b"[#1 16MiB/16MiB(100%)]\n"]
 
-        async def __aenter__(self):
-            return self
+        async def read(self, n):
+            return self.chunks.pop(0) if self.chunks else b""
 
-        async def __aexit__(self, *args):
-            return False
+    class Process:
+        stdout = Stdout()
+        returncode = 0
 
-        async def aiter_bytes(self, size):
-            yield self.body
+        async def wait(self):
+            (tmp_path / "file.bin").write_bytes(b"ok")
 
-    class Client:
-        def __init__(self, *args, **kwargs):
-            return None
+    async def fake_exec(*cmd, stdout=None, stderr=None):
+        cmd_seen.extend(cmd)
+        return Process()
 
-        def stream(self, method, url, headers):
-            return Stream(headers)
+    async def no_deps():
+        return None
 
-    monkeypatch.setattr(base_mod.httpx, "AsyncClient", Client)
-    monkeypatch.setattr(pikpak_mod, "PIKPAK_DOWNLOAD_PART_SIZE", 4)
-    monkeypatch.setattr(pikpak_mod, "PIKPAK_DOWNLOAD_CONCURRENCY", 2)
-    monkeypatch.setattr(pikpak_mod, "PARALLEL_DOWNLOAD_MIN_SIZE", 1)
+    monkeypatch.setattr(pikpak_mod, "_ensure_aria2", no_deps)
+    monkeypatch.setattr(pikpak_mod.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(pikpak_mod, "PIKPAK_DOWNLOAD_CONCURRENCY", 8)
+    monkeypatch.setattr(pikpak_mod, "ARIA2_MIN_SIZE", 1)
 
     dest = tmp_path / "file.bin"
-    job = JobState("pikpak-parallel", {})
-    asyncio.run(pikpak_mod.pikpak_parallel_download("https://example.test/file", dest, job, len(data)))
+    job = JobState("pikpak-aria2", {})
+    asyncio.run(pikpak_mod.pikpak_aria2_download("https://example.test/file", dest, job, 16 * 1024 * 1024))
 
-    assert dest.read_bytes() == data
-    assert ranges == ["bytes=0-0", "bytes=0-3", "bytes=4-7", "bytes=8-11", "bytes=12-15"]
+    assert "--split=8" in cmd_seen
+    assert "--max-connection-per-server=8" in cmd_seen
     assert job.files_downloaded == 1
     assert job.progress.download == 100
 
@@ -99,7 +94,7 @@ def test_pikpak_download_falls_back_to_stream(tmp_path, monkeypatch):
     async def req(self, method, url, **kw):
         return {"name": "file.bin", "size": 64, "web_content_link": "https://example.test/file"}
 
-    async def parallel(url, dest, progress, size):
+    async def aria2(url, dest, progress, size):
         progress.add_bytes(10, 64, "download", str(dest))
         raise ProviderFailure("DOWNLOAD_FAILED", "range refused")
 
@@ -111,7 +106,7 @@ def test_pikpak_download_falls_back_to_stream(tmp_path, monkeypatch):
 
     monkeypatch.setattr(pikpak_mod.PikPakSession, "captcha_init", captcha_init)
     monkeypatch.setattr(pikpak_mod.PikPakSession, "req", req)
-    monkeypatch.setattr(pikpak_mod, "pikpak_parallel_download", parallel)
+    monkeypatch.setattr(pikpak_mod, "pikpak_aria2_download", aria2)
     monkeypatch.setattr(pikpak_mod, "stream_download", stream)
 
     job = JobState("pikpak-fallback", {})
