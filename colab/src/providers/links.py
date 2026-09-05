@@ -105,7 +105,8 @@ class LinksProvider(BaseProvider):
                 pass
         return None
 
-    async def _download_aria2(self, url: str, dest_dir: Path, name: str | None, progress: JobState) -> list[Path]:
+    async def _download_aria2(self, url: str | list[str], dest_dir: Path, name: str | None, progress: JobState) -> list[Path]:
+        urls = [str(item) for item in (url if isinstance(url, list) else [url]) if str(item or "")]
         cmd = [
             "aria2c", 
             f"--dir={dest_dir}",
@@ -117,11 +118,12 @@ class LinksProvider(BaseProvider):
             "--auto-file-renaming=true",
             "--allow-overwrite=true",
             "--max-tries=5",
-            "--retry-wait=2"
+            "--retry-wait=2",
+            "--uri-selector=adaptive",
         ]
         if name:
             cmd.append(f"--out={name}")
-        cmd.append(url)
+        cmd.extend(urls)
         
         return await self._run_aria2_cmd(cmd, dest_dir, progress)
 
@@ -285,6 +287,8 @@ class LinksProvider(BaseProvider):
         url = file_ref.get("id") or file_ref.get("path") or ""
         if not url:
             raise ProviderFailure("DOWNLOAD_FAILED", "No URL provided")
+        urls = [str(item) for item in (file_ref.get("urls") or []) if str(item or "").startswith(("http://", "https://"))]
+        urls = urls or [str(url)]
 
         raw_name = file_ref.get("name") or (local_path.name if local_path.suffix else "")
         name = safe_name(raw_name) if raw_name else None
@@ -305,7 +309,7 @@ class LinksProvider(BaseProvider):
         elif link_type == "gdrive":
             downloaded = await self._download_gdrive(url, dest_dir, name, progress)
         else:
-            downloaded = await self._download_aria2(url, dest_dir, name, progress)
+            downloaded = await self._download_aria2(urls, dest_dir, name, progress)
 
         if not downloaded:
             raise ProviderFailure("DOWNLOAD_FAILED", "Download completed but no files found on disk")

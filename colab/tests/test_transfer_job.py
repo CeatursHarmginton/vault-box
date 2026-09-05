@@ -111,8 +111,36 @@ def test_links_provider_treats_gofile_direct_download_as_direct(tmp_path, monkey
     url = "https://store-na-phx-5.gofile.io/download/web/39d1667c/file.rar"
     out = asyncio.run(provider.download_file({}, {"id": url, "name": "file.rar"}, tmp_path, JobState("gofile-direct", {})))
 
-    assert seen["url"] == url
+    assert seen["url"] == [url]
     assert out.name == "file.rar"
+
+def test_links_provider_passes_multiple_urls_to_aria2(tmp_path, monkeypatch):
+    provider = LinksProvider()
+    cmd_seen = []
+
+    class Process:
+        returncode = 0
+        stdout = None
+
+        async def wait(self):
+            (tmp_path / "file.bin").write_text("ok")
+
+    async def fake_exec(*cmd, stdout=None, stderr=None):
+        cmd_seen.extend(cmd)
+        return Process()
+
+    async def no_deps():
+        return None
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr("src.providers.links.asyncio.create_subprocess_exec", fake_exec)
+
+    urls = ["https://cdn1.example/file.bin", "https://cdn2.example/file.bin"]
+    out = asyncio.run(provider.download_file({}, {"id": urls[0], "urls": urls, "name": "file.bin"}, tmp_path, JobState("links-mirror", {})))
+
+    assert out.name == "file.bin"
+    assert "--uri-selector=adaptive" in cmd_seen
+    assert cmd_seen[-2:] == urls
 
 def test_links_provider_rejects_gofile_page_with_direct_link_hint(tmp_path, monkeypatch):
     provider = LinksProvider()
