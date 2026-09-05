@@ -146,6 +146,27 @@ def test_links_provider_passes_multiple_urls_to_aria2(tmp_path, monkeypatch):
     assert "--uri-selector=adaptive" in cmd_seen
     assert input_seen == "\t".join(urls) + "\n  out=file.bin\n"
 
+def test_links_provider_rejects_incomplete_download(tmp_path, monkeypatch):
+    provider = LinksProvider()
+
+    async def fake_download(url, dest_dir, name, progress):
+        out = dest_dir / (name or "file.bin")
+        out.write_bytes(b"x" * 10)
+        return [out]
+
+    async def no_deps():
+        return None
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr(provider, "_download_aria2", fake_download)
+
+    try:
+        asyncio.run(provider.download_file({}, {"id": "https://example.com/file.bin", "name": "file.bin", "size": 100}, tmp_path, JobState("links-short", {})))
+    except ProviderFailure as exc:
+        assert exc.code == "DOWNLOAD_INCOMPLETE"
+    else:
+        raise AssertionError("expected incomplete download failure")
+
 def test_links_provider_rejects_gofile_page_with_direct_link_hint(tmp_path, monkeypatch):
     provider = LinksProvider()
 
