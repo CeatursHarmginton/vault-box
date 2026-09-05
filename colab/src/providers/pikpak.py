@@ -6,9 +6,6 @@ import hashlib
 import hmac
 import json
 import mimetypes
-import re
-import shutil
-import subprocess
 import time
 import xml.etree.ElementTree as ET
 from email.utils import formatdate
@@ -19,7 +16,7 @@ from urllib.parse import quote, urlencode
 import httpx
 
 from .base import BaseProvider, ProviderFailure, safe_name, stream_download
-from ..config import PIKPAK_DOWNLOAD_CONCURRENCY, PIKPAK_UPLOAD_CONCURRENCY
+from ..config import PIKPAK_UPLOAD_CONCURRENCY
 from ..jobs.progress import JobState
 
 API = "https://api-drive.mypikpak.com"
@@ -32,7 +29,6 @@ WEB_CLIENT_VERSION = "2.0.0"
 WEB_PACKAGE = "mypikpak.com"
 MIN_PART = 5 * 1024 * 1024
 PART = 8 * 1024 * 1024
-ARIA2_MIN_SIZE = 32 * 1024 * 1024
 SALTS = ["Gez0T9ijiI9WCeTsKSg3SMlx", "zQdbalsolyb1R/", "ftOjr52zt51JD68C3s", "yeOBMH0JkbQdEFNNwQ0RI9T3wU/v", "BRJrQZiTQ65WtMvwO", "je8fqxKPdQVJiy1DM6Bc9Nb1", "niV", "9hFCW2R1", "sHKHpe2i96", "p7c5E6AcXQ/IJUuAEC9W6", "", "aRv9hjc9P+Pbn+u3krN6", "BzStcgE8qVdqjEH16l4", "SqgeZvL5j9zoHP95xWHt", "zVof5yaJkPe3VFpadPof"]
 WEB_SALTS = ["C9qPpZLN8ucRTaTiUMWYS9cQvWOE", "+r6CQVxjzJV6LCV", "F", "pFJRC", "9WXYIDGrwTCz2OiVlgZa90qpECPD6olt", "/750aCr4lm/Sly/c", "RB+DT/gZCrbV", "", "CyLsf7hdkIRxRm215hl", "7xHvLi2tOYP0Y92b", "ZGTXXxu8E/MIWaEDB+Sm/", "1UI3", "E7fP5Pfijd+7K+t6Tg/NhuLq0eEUVChpJSkrKxpO", "ihtqpG6FMt65+Xk+tWUH2", "NhXXU9rg4XXdzo7u5o"]
 
@@ -100,101 +96,6 @@ def _xml(raw: str, tag: str) -> str:
         return ""
     node = root.find(f".//{tag}")
     return node.text if node is not None and node.text else ""
-
-def _progress_snapshot(progress: JobState) -> dict[str, Any]:
-    return {
-        "bytes_done": progress.bytes_done,
-        "bytes_total": progress.bytes_total,
-        "_phase": progress._phase,
-        "_phase_done": progress._phase_done,
-        "_phase_total": progress._phase_total,
-        "_phase_total_keys": set(progress._phase_total_keys),
-        "_phase_done_by_name": dict(progress._phase_done_by_name),
-        "_phase_total_by_name": dict(progress._phase_total_by_name),
-    }
-
-def _restore_progress(progress: JobState, snap: dict[str, Any]) -> None:
-    for key, value in snap.items():
-        setattr(progress, key, value)
-
-def _aria2_bytes(value: str) -> int:
-    text = str(value or "").upper().replace("IB", "").replace("B", "")
-    scale = 1
-    if text.endswith("K"):
-        scale = 1024
-    elif text.endswith("M"):
-        scale = 1024 ** 2
-    elif text.endswith("G"):
-        scale = 1024 ** 3
-    try:
-        return int(float(re.sub(r"[A-Z]", "", text)) * scale)
-    except ValueError:
-        return 0
-
-def _aria2_progress(line: str) -> tuple[int, int] | None:
-    match = re.search(r"([0-9.]+[A-Za-z]+)/([0-9.]+[A-Za-z]+)\(", line)
-    return (_aria2_bytes(match.group(1)), _aria2_bytes(match.group(2))) if match else None
-
-async def _ensure_aria2() -> None:
-    if shutil.which("aria2c"):
-        return
-    await asyncio.to_thread(subprocess.check_call, ["apt-get", "install", "-y", "-qq", "aria2"])
-
-async def pikpak_aria2_download(url: str, dest: Path, progress: JobState, size: int) -> Path:
-    size = int(size or 0)
-    if size < ARIA2_MIN_SIZE:
-        raise ProviderFailure("DOWNLOAD_FAILED", "aria2 skipped for small file")
-    await _ensure_aria2()
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    split = max(1, int(PIKPAK_DOWNLOAD_CONCURRENCY or 1))
-    cmd = [
-        "aria2c",
-        f"--dir={dest.parent}",
-        f"--out={dest.name}",
-        f"--max-connection-per-server={split}",
-        f"--split={split}",
-        "--min-split-size=4M",
-        "--summary-interval=1",
-        "--console-log-level=warn",
-        "--allow-overwrite=true",
-        "--auto-file-renaming=false",
-        "--max-tries=5",
-        "--retry-wait=2",
-        "--timeout=60",
-        url,
-    ]
-    progress.log(f"PikPak aria2 download: size={size} connections={split}")
-    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-    last_done = 0
-    tail: list[str] = []
-    if process.stdout:
-        while True:
-            chunk = await process.stdout.read(1024)
-            if not chunk:
-                break
-            for line in chunk.decode("utf-8", errors="ignore").replace("\r", "\n").splitlines():
-                line = line.strip()
-                if line:
-                    tail = (tail + [line])[-3:]
-                progress.check_cancelled()
-                parsed = _aria2_progress(line)
-                if parsed:
-                    done, total = parsed
-                    diff = done - last_done
-                    if diff > 0:
-                        progress.add_bytes(diff, total or size, "download", str(dest))
-                    last_done = done
-    await process.wait()
-    if process.returncode != 0:
-        detail = f": {' | '.join(tail)}" if tail else ""
-        raise ProviderFailure("DOWNLOAD_FAILED", f"aria2c exited with code {process.returncode}{detail}")
-    if not dest.exists():
-        raise ProviderFailure("DOWNLOAD_FAILED", "aria2c completed but file is missing")
-    if size and last_done < size:
-        progress.add_bytes(size - last_done, size, "download", str(dest))
-    progress.files_downloaded += 1
-    progress.log(f"[{progress.files_downloaded}/{progress.files_to_download}] Downloaded: {dest.name}")
-    return dest
 
 class PikPakSession:
     def __init__(self, c: dict[str, Any]) -> None:
@@ -286,16 +187,7 @@ class PikPakProvider(BaseProvider):
             raise ProviderFailure("DOWNLOAD_FAILED", "PikPak did not return download url")
         dest = local_path if local_path.suffix else local_path / safe_name(file_ref.get("name") or info.get("name") or fid)
         progress.set(step="downloading", current_file=dest.name)
-        size = int(info.get("size") or file_ref.get("size") or 0)
-        snap = _progress_snapshot(progress)
-        try:
-            return await pikpak_aria2_download(str(url), dest, progress, size)
-        except ProviderFailure as exc:
-            if exc.code == "INVALID_PROVIDER_CREDENTIALS":
-                raise
-            _restore_progress(progress, snap)
-            progress.log(f"PikPak aria2 download fallback: {exc.message}")
-            return await stream_download(str(url), dest, progress)
+        return await stream_download(str(url), dest, progress)
 
     async def _create_folder(self, s: PikPakSession, parent_id: str, name: str) -> str:
         payload = {"kind": "drive#folder", "name": name, "parent_id": parent_id or ""}

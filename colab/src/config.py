@@ -14,7 +14,6 @@ CHUNK_SIZE = int(os.environ.get("COLAB_CHUNK_SIZE", str(4 * 1024 * 1024)))
 MAX_JOBS = int(os.environ.get("COLAB_MAX_JOBS", "8"))
 FOLDER_DOWNLOAD_CONCURRENCY = int(os.environ.get("COLAB_FOLDER_DOWNLOAD_CONCURRENCY", "12"))
 FOLDER_UPLOAD_CONCURRENCY = int(os.environ.get("COLAB_FOLDER_UPLOAD_CONCURRENCY", "12"))
-PIKPAK_DOWNLOAD_CONCURRENCY = int(os.environ.get("COLAB_PIKPAK_DOWNLOAD_CONCURRENCY", "8"))
 # Files uploaded in parallel out of one optimize batch (each file may itself split into parallel parts).
 UPLOAD_FILE_CONCURRENCY = int(os.environ.get("COLAB_UPLOAD_FILE_CONCURRENCY", "8"))
 PIKPAK_UPLOAD_CONCURRENCY = int(os.environ.get("COLAB_PIKPAK_UPLOAD_CONCURRENCY", "16"))
