@@ -117,6 +117,7 @@ def test_links_provider_treats_gofile_direct_download_as_direct(tmp_path, monkey
 def test_links_provider_passes_multiple_urls_to_aria2(tmp_path, monkeypatch):
     provider = LinksProvider()
     cmd_seen = []
+    input_seen = ""
 
     class Process:
         returncode = 0
@@ -126,7 +127,10 @@ def test_links_provider_passes_multiple_urls_to_aria2(tmp_path, monkeypatch):
             (tmp_path / "file.bin").write_text("ok")
 
     async def fake_exec(*cmd, stdout=None, stderr=None):
+        nonlocal input_seen
         cmd_seen.extend(cmd)
+        input_arg = next(arg for arg in cmd if str(arg).startswith("--input-file="))
+        input_seen = Path(str(input_arg).split("=", 1)[1]).read_text(encoding="utf-8")
         return Process()
 
     async def no_deps():
@@ -140,7 +144,7 @@ def test_links_provider_passes_multiple_urls_to_aria2(tmp_path, monkeypatch):
 
     assert out.name == "file.bin"
     assert "--uri-selector=adaptive" in cmd_seen
-    assert cmd_seen[-2:] == urls
+    assert input_seen == "\t".join(urls) + "\n  out=file.bin\n"
 
 def test_links_provider_rejects_gofile_page_with_direct_link_hint(tmp_path, monkeypatch):
     provider = LinksProvider()

@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -107,6 +108,7 @@ class LinksProvider(BaseProvider):
 
     async def _download_aria2(self, url: str | list[str], dest_dir: Path, name: str | None, progress: JobState) -> list[Path]:
         urls = [str(item) for item in (url if isinstance(url, list) else [url]) if str(item or "")]
+        uri_file: Path | None = None
         cmd = [
             "aria2c", 
             f"--dir={dest_dir}",
@@ -121,11 +123,22 @@ class LinksProvider(BaseProvider):
             "--retry-wait=2",
             "--uri-selector=adaptive",
         ]
-        if name:
+        if len(urls) > 1:
+            uri_file = dest_dir / f".vaultbox-aria2-{uuid.uuid4().hex}.txt"
+            uri_file.write_text("\t".join(urls) + ("\n  out=" + name if name else "") + "\n", encoding="utf-8")
+            cmd.append(f"--input-file={uri_file}")
+        elif name:
             cmd.append(f"--out={name}")
-        cmd.extend(urls)
+        if len(urls) <= 1:
+            cmd.extend(urls)
         
-        return await self._run_aria2_cmd(cmd, dest_dir, progress)
+        try:
+            downloaded = await self._run_aria2_cmd(cmd, dest_dir, progress)
+            expected = dest_dir / name if name else None
+            return [expected] if expected and expected.exists() else downloaded
+        finally:
+            if uri_file:
+                uri_file.unlink(missing_ok=True)
 
     async def _download_torrent(self, url: str, dest_dir: Path, progress: JobState) -> list[Path]:
         progress.log("Starting aria2c torrent download")
@@ -184,8 +197,8 @@ class LinksProvider(BaseProvider):
             raise ProviderFailure("DOWNLOAD_FAILED", f"aria2c exited with code {process.returncode}{detail}")
 
         after = set(dest_dir.iterdir()) if dest_dir.exists() else set()
-        new_files = [p for p in (after - before) if p.is_file() and not p.name.endswith(".aria2")]
-        return new_files or [p for p in dest_dir.iterdir() if p.is_file() and not p.name.endswith(".aria2")]
+        new_files = [p for p in (after - before) if p.is_file() and not p.name.endswith(".aria2") and not p.name.startswith(".vaultbox-aria2-")]
+        return new_files or [p for p in dest_dir.iterdir() if p.is_file() and not p.name.endswith(".aria2") and not p.name.startswith(".vaultbox-aria2-")]
 
     async def _download_ytdlp(self, url: str, dest_dir: Path, name: str | None, progress: JobState) -> list[Path]:
         before = set(dest_dir.iterdir()) if dest_dir.exists() else set()
