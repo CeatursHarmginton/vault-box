@@ -110,10 +110,13 @@ def embed_optimization_metadata(file_path: Path) -> bool:
     return False
 
 def should_optimize_image_file(path: Path, options: dict[str, Any]) -> bool:
-    if path.suffix.lower() not in IMAGE_EXTENSIONS:
+    suffix = path.suffix.lower()
+    if suffix not in IMAGE_EXTENSIONS:
         return False
     if not options.get("force_reoptimize", False) and is_image_already_optimized(path):
         return False
+    if suffix not in (".jpg", ".jpeg"):
+        return True
     size = path.stat().st_size
     min_target = int(float(options.get("min_target_mb", 1.0)) * 1024 * 1024)
     max_target = int(float(options.get("max_target_mb", 3.0)) * 1024 * 1024)
@@ -384,6 +387,7 @@ def optimize_directory(
             out_path, final_q, status = optimize_image_file(p, output_dir / relative_path.parent, options, start_quality)
             return index, {
                 "name": str(out_path.relative_to(output_dir)),
+                "source_name": str(relative_path),
                 "original_size": orig_size,
                 "optimized_size": out_path.stat().st_size,
                 "status": status,
@@ -436,6 +440,7 @@ def optimize_directory(
                     adaptive_quality = new_start
             group_results.append({
                 "name": str(out_path.relative_to(output_dir)),
+                "source_name": str(relative_path),
                 "original_size": orig_size,
                 "optimized_size": new_size,
                 "status": status,

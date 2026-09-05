@@ -69,10 +69,12 @@ async def run_transfer(job: JobState) -> None:
                 item_src = PROVIDERS.get(item_prov, src)
                 item_creds = item.get("credentials") or source.get("credentials") or {}
                 try:
-                    return [await download_with_retry(
+                    path = await download_with_retry(
                         lambda: item_src.download_file(item_creds, item, dirs["input"], job),
                         progress=job, label=_item_name(item),
-                    )]
+                    )
+                    _remember_source_ref(job, path, item)
+                    return [path]
                 except ProviderFailure as exc:
                     if not is_skippable_download_failure(exc):
                         raise
@@ -143,10 +145,11 @@ async def run_transfer(job: JobState) -> None:
             job.set(step="optimizing")
             job.log("Starting image optimization...")
             from ..utils.image_optimizer import optimize_directory
+            opt_input = out_root
             opt_dest = dirs["output"] / "optimized"
             opt_dest.mkdir(parents=True, exist_ok=True)
             job.optimized_files = await asyncio.to_thread(
-                optimize_directory, out_root, opt_dest, options, job,
+                optimize_directory, opt_input, opt_dest, options, job,
                 cancel_check=job.check_cancelled,
             )
             out_root = opt_dest
@@ -195,7 +198,8 @@ async def run_transfer(job: JobState) -> None:
                 if not any(p.is_file() for p in upload_root.rglob("*")):
                     raise ProviderFailure("UPLOAD_FAILED", "No files staged for upload", {"root": str(upload_root)})
                 if options.get("optimize_image"):
-                    result = await _upload_outputs_with_retry(job, target, options, dst, upload_root, {})
+                    upload_item = {"_replace_refs": _optimized_replace_refs(job, job.optimized_files, out_root, upload_root, opt_input)}
+                    result = await _upload_outputs_with_retry(job, target, options, dst, upload_root, upload_item)
                 else:
                     result = await dst.upload_folder(target.get("credentials") or {}, upload_root, _upload_target(target.get("folder") or {}, "", options), job)
         _mark_remaining_items_completed(job, source)
@@ -323,7 +327,8 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
                 upload_root = folder_root
         job.set(status="running", step="uploading")
         item_target, item_dst = _item_upload_target(source, target, dst, item)
-        await _upload_outputs_with_retry(job, item_target, options, item_dst, upload_root, item)
+        upload_item = {**item, "_replace_refs": _optimized_replace_refs(job, batch_results, batch_output, upload_root, optimize_input)}
+        await _upload_outputs_with_retry(job, item_target, options, item_dst, upload_root, upload_item)
         shutil.rmtree(batch_input, ignore_errors=True)
         shutil.rmtree(batch_output.parent, ignore_errors=True)
         if not item_failed:
@@ -343,10 +348,12 @@ async def _download_batch_item(job: JobState, source: dict[str, Any], src: Any, 
         folder_dir.mkdir(parents=True, exist_ok=True)
         return await item_src.download_folder(item_creds, item, folder_dir, job)
     job.files_to_download += 1
-    return [await download_with_retry(
+    path = await download_with_retry(
         lambda: item_src.download_file(item_creds, item, batch_input, job),
         progress=job, label=_item_name(item),
-    )]
+    )
+    _remember_source_ref(job, path, item)
+    return [path]
 
 def _item_scope(source: dict[str, Any], item: dict[str, Any]) -> tuple[str, str]:
     provider = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
@@ -480,10 +487,10 @@ async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options
             attempt_gen = gate.generation
         folder = _item_target_folder(target.get("folder") or {}, item)
         target_ref = _upload_target(folder, rel, options)
-        item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
         try:
-            if options.get("replace") and item_type != "folder" and hasattr(dst, "replace_file"):
-                await dst.replace_file(target.get("credentials") or {}, path, item, job)
+            source_ref = _replacement_source_ref(item, path, rel) if options.get("replace") and hasattr(dst, "replace_file") else None
+            if source_ref:
+                await dst.replace_file(target.get("credentials") or {}, path, source_ref, job)
             else:
                 await dst.upload_file(target.get("credentials") or {}, path, target_ref, job)
             job.files_uploaded += 1
@@ -510,7 +517,8 @@ async def _upload_one_with_retry(job: JobState, target: dict[str, Any], options:
     while True:
         try:
             source = (job.payload.get("source") or {}).get("items") or []
-            result = await (dst.replace_file(target.get("credentials") or {}, path, source[0], job) if options.get("replace") and source and hasattr(dst, "replace_file") else dst.upload_file(target.get("credentials") or {}, path, _upload_target(target.get("folder") or {}, path.name, options), job))
+            source_ref = {**source[0], "name": path.name} if source and options.get("replace") and hasattr(dst, "replace_file") else None
+            result = await (dst.replace_file(target.get("credentials") or {}, path, source_ref, job) if source_ref else dst.upload_file(target.get("credentials") or {}, path, _upload_target(target.get("folder") or {}, path.name, options), job))
             job.files_uploaded = 1
             job.error = None
             job.log(f"[1/1] Uploaded: {path.name}")
@@ -591,6 +599,37 @@ def _validate_downloads(downloaded: list[Path], root: Path) -> None:
     missing = [p for p in downloaded if not p.is_file()]
     if missing:
         raise ProviderFailure("DOWNLOAD_FAILED", "Downloaded files missing on disk", {"paths": [str(p) for p in missing[:5]]})
+
+def _remember_source_ref(job: JobState, path: Path, item: dict[str, Any]) -> None:
+    refs = getattr(job, "_source_refs", None)
+    if refs is None:
+        refs = {}
+        setattr(job, "_source_refs", refs)
+    refs[str(path.resolve())] = dict(item)
+
+def _optimized_replace_refs(job: JobState, results: list[dict[str, Any]], output_root: Path, upload_root: Path, input_root: Path) -> dict[str, dict[str, Any]]:
+    source_refs = getattr(job, "_source_refs", {})
+    out: dict[str, dict[str, Any]] = {}
+    for result in results:
+        name = str(result.get("name") or "").replace("\\", "/")
+        source_name = str(result.get("source_name") or "").replace("\\", "/")
+        if not name or not source_name:
+            continue
+        ref = source_refs.get(str((input_root / source_name).resolve()))
+        if not ref:
+            continue
+        output_path = output_root / name
+        if output_path.is_relative_to(upload_root):
+            out[output_path.relative_to(upload_root).as_posix()] = ref
+    return out
+
+def _replacement_source_ref(item: dict[str, Any], path: Path, rel: str) -> dict[str, Any] | None:
+    refs = item.get("_replace_refs") if isinstance(item.get("_replace_refs"), dict) else {}
+    ref = refs.get(str(rel).replace("\\", "/")) or refs.get(path.name)
+    if ref:
+        return {**ref, "name": path.name}
+    item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
+    return {**item, "name": path.name} if item_type != "folder" else None
 
 def _item_target_folder(folder: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
     item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")

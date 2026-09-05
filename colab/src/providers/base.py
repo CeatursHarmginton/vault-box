@@ -182,10 +182,12 @@ class BaseProvider(ABC):
             async with sem:
                 dest = local_dir / _safe_name(item.get("name") or item.get("server_filename") or item.get("id") or "file")
                 try:
-                    return [await download_with_retry(
+                    path = await download_with_retry(
                         lambda: self.download_file(credentials, item, dest, progress),
                         progress=progress, label=dest.name,
-                    )]
+                    )
+                    _remember_source_ref(progress, path, item)
+                    return [path]
                 except ProviderFailure as exc:
                     # One unfetchable file must not sink the whole folder: record it and let the
                     # rest through. The folder then stays in the queue (see JobState.failed_items).
@@ -356,12 +358,22 @@ def _skip_optimize_item(item: dict[str, Any], progress: JobState) -> bool:
         if options.get("extract") and (lower_name.endswith(ARCHIVE_DOWNLOAD_EXTENSIONS) or (len(suffix) == 4 and suffix[1:].isdigit())):
             return False
         return True
+    if suffix not in (".jpg", ".jpeg"):
+        return False
     size = int(item.get("size") or item.get("file_size") or item.get("bytes") or 0)
     if not size:
         return False
     min_target = int(float(options.get("min_target_mb", 1.0)) * 1024 * 1024)
     max_target = int(float(options.get("max_target_mb", 3.0)) * 1024 * 1024)
     return size >= min_target if options.get("upscale") else size <= max_target
+
+
+def _remember_source_ref(progress: JobState, path: Path, item: dict[str, Any]) -> None:
+    refs = getattr(progress, "_source_refs", None)
+    if refs is None:
+        refs = {}
+        setattr(progress, "_source_refs", refs)
+    refs[str(path.resolve())] = dict(item)
 
 
 def copy_tree_files(src: Path, dst: Path) -> list[Path]:

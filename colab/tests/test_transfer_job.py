@@ -2499,6 +2499,44 @@ class TransferJobTests(TestCase):
         self.assertEqual(parent, "/photos/results")
         self.assertFalse(any(call[1].startswith("create folder /photos/results") for call in s.calls))
 
+    def test_terabox_replace_uploads_old_name_then_renames_converted_jpg(self):
+        with __import__("tempfile").TemporaryDirectory() as tmp:
+            provider = TeraBoxProvider()
+            local = Path(tmp) / "photo.jpg"
+            local.write_bytes(b"jpg")
+            events = []
+
+            async def upload_file(credentials, local_path, target_ref, progress):
+                events.append(("upload", target_ref))
+                return {"ok": True}
+
+            class Session:
+                base = "https://www.terabox.com"
+
+                def params(self, **extra):
+                    return extra
+
+                def headers(self):
+                    return {}
+
+                async def request_json(self, method, url, **kwargs):
+                    if kwargs.get("context", "").startswith("list "):
+                        return {"list": [{"isdir": 0, "server_filename": "photo.png", "path": "/root/photo.png"}]}
+                    events.append(("rename", kwargs["data"]))
+                    return {"errno": 0}
+
+            async def session(credentials):
+                return Session()
+
+            provider.upload_file = upload_file
+            provider._session = session
+
+            out = asyncio.run(provider.replace_file({}, local, {"path": "/root/photo.png", "name": "photo.jpg"}, JobState("tb-replace", {})))
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(events[0], ("upload", {"id": "/root", "relative_path": "photo.png"}))
+        self.assertEqual(json.loads(events[1][1]["filelist"]), [{"path": "/root/photo.png", "newname": "photo.jpg"}])
+
     def test_terabox_refreshes_token_and_retries_on_need_verify_errno(self):
         bodies = [{"errno": 4000023, "errmsg": "need verify"}, {"errno": 0, "list": []}]
         sent: list[dict] = []
@@ -2801,6 +2839,107 @@ class TransferJobPathSafetyTests(TestCase):
 
         self.assertEqual(job.status, "completed", job.error)
         self.assertTrue(job.payload["options"].get("replace"))
+
+    def test_optimized_single_file_replace_uses_output_name(self):
+        class Source:
+            async def download_file(self, credentials, file_ref, local_path: Path, progress: JobState):
+                path = local_path / file_ref["name"]
+                path.write_bytes(b"image data")
+                return path
+
+        class Dst:
+            def __init__(self):
+                self.replaced = []
+
+            async def replace_file(self, credentials, local_path, source_ref, progress):
+                self.replaced.append((local_path.name, source_ref))
+                return {"ok": True}
+
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                raise AssertionError("replace expected")
+
+        dst = Dst()
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            out = output_dir / "pic.jpg"
+            out.write_bytes(b"opt data")
+            return [{"name": "pic.jpg", "source_name": "pic.png", "original_size": 10, "optimized_size": 8, "status": "ok"}]
+
+        PROVIDERS.update({"fake-source": Source(), "fake-dst": dst})
+        image_optimizer.optimize_directory = fake_optimize
+        try:
+            job = JobState("opt-single-png-replace", {
+                "source": {"provider": "fake-source", "items": [{"type": "file", "name": "pic.png", "id": "f1"}]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True, "confirm_action": "replace"},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-single-png-replace")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(dst.replaced[0][0], "pic.jpg")
+        self.assertEqual(dst.replaced[0][1]["id"], "f1")
+        self.assertEqual(dst.replaced[0][1]["name"], "pic.jpg")
+
+    def test_optimized_folder_replace_maps_converted_jpg_to_original_png(self):
+        class Source(base_mod.BaseProvider):
+            async def validate_credentials(self, credentials):
+                return {"ok": True}
+
+            async def list_files(self, credentials, path_or_id):
+                return {"items": [{"type": "file", "name": "photo.png", "id": "/root/photo.png", "path": "/root/photo.png", "size": 1024}]}
+
+            async def download_file(self, credentials, file_ref, local_path: Path, progress: JobState):
+                local_path.write_bytes(b"image data")
+                return local_path
+
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                raise AssertionError("source only")
+
+        class Dst:
+            def __init__(self):
+                self.replaced = []
+
+            async def replace_file(self, credentials, local_path, source_ref, progress):
+                self.replaced.append((local_path.name, source_ref))
+                return {"ok": True}
+
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                raise AssertionError("replace expected")
+
+        dst = Dst()
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            out = output_dir / "root" / "photo.jpg"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"opt data")
+            return [{"name": "root/photo.jpg", "source_name": "root/photo.png", "original_size": 10, "optimized_size": 8, "status": "ok"}]
+
+        PROVIDERS.update({"fake-source": Source(), "fake-dst": dst})
+        image_optimizer.optimize_directory = fake_optimize
+        try:
+            job = JobState("opt-folder-png-replace", {
+                "source": {"provider": "fake-source", "items": [{"type": "folder", "name": "root", "id": "/root"}]},
+                "target": {"provider": "fake-dst", "folder": {"id": "/root", "path": "/root"}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True, "confirm_action": "replace"},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-folder-png-replace")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(dst.replaced[0][0], "photo.jpg")
+        self.assertEqual(dst.replaced[0][1]["path"], "/root/photo.png")
+        self.assertEqual(dst.replaced[0][1]["name"], "photo.jpg")
 
     def test_confirmation_strategy_auto_upload_new(self):
         class OneFileSource:

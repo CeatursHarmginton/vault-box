@@ -503,3 +503,32 @@ class TeraBoxProvider(BaseProvider):
         return await s.request_json("POST", f"{s.base}/api/create", context=f"upload create {remote_path}", params=s.params(a="commit"), data={
             "path": remote_path, "size": str(size), "isdir": "0", "uploadid": str(upload_id), "target_path": parent, "block_list": json.dumps(hashes["chunks"]), "content-md5": hashes["file"], "slice-md5": hashes["slice"], "content-crc32": str(hashes["crc32"]), "rtype": rtype, "local_mtime": "0",
         }, headers={**s.headers(), "Content-Type": "application/x-www-form-urlencoded"})
+
+    async def replace_file(self, credentials: dict[str, Any], local_path: Path, source_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:
+        source_path = str(source_ref.get("path") or source_ref.get("id") or "")
+        if not source_path:
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "TeraBox source path missing")
+        parent = str(PurePosixPath(source_path).parent)
+        parent = "/" if parent == "." else parent
+        old_name = PurePosixPath(source_path).name
+        new_name = safe_name(source_ref.get("name") or local_path.name)
+        s = await self._session(credentials)
+        if new_name != old_name:
+            listing = await s.request_json("GET", f"{s.base}/api/list", context=f"list {parent}", params=s.params(order="time", desc=1, dir=parent, num=1000, page=1, showempty=0), headers=s.headers())
+            if any(not i.get("isdir") and i.get("server_filename") == new_name and i.get("path") != source_path for i in listing.get("list") or []):
+                raise ProviderFailure("UPLOAD_FAILED", "Replacement target name already exists")
+        options = progress.payload.setdefault("options", {})
+        old_replace = options.get("replace")
+        options["replace"] = True
+        try:
+            await self.upload_file(credentials, local_path, {"id": parent, "relative_path": old_name}, progress)
+        finally:
+            if old_replace is None:
+                options.pop("replace", None)
+            else:
+                options["replace"] = old_replace
+        if new_name != old_name:
+            await s.request_json("POST", f"{s.base}/api/filemanager", context=f"rename {source_path}", params=s.params(opera="rename", ondup="fail"), data={
+                "filelist": json.dumps([{"path": source_path, "newname": new_name}], ensure_ascii=False),
+            }, headers={**s.headers(), "Content-Type": "application/x-www-form-urlencoded"})
+        return {"ok": True, "old_path": source_path, "new_name": new_name}

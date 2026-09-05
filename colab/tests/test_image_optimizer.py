@@ -88,6 +88,17 @@ class ImageOptimizerTests(TestCase):
         self.assertEqual(results, [])
         self.assertTrue((self.dest_dir / "small.jpg").exists())
 
+    def test_optimize_directory_converts_small_png_even_under_target(self) -> None:
+        img_path = self.src_dir / "small.png"
+        Image.new("RGB", (10, 10), color="red").save(img_path, "PNG")
+
+        results = optimize_directory(self.src_dir, self.dest_dir, {"max_target_mb": 3.0}, MockJobState())
+
+        self.assertEqual(results[0]["name"], "small.jpg")
+        self.assertEqual(results[0]["source_name"], "small.png")
+        with Image.open(self.dest_dir / "small.jpg") as img:
+            self.assertEqual(img.format, "JPEG")
+
     def test_optimize_directory_uses_worker_override(self) -> None:
         for i in range(4):
             (self.src_dir / f"{i}.jpg").write_bytes(b"x")
