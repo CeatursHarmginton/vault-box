@@ -106,6 +106,31 @@ class LinksProvider(BaseProvider):
                 pass
         return None
 
+    async def _remote_size(self, url: str) -> int:
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as client:
+                resp = await client.head(url)
+                if resp.status_code >= 400:
+                    async with client.stream("GET", url, headers={"Range": "bytes=0-0"}) as streamed:
+                        resp = streamed
+                        content_range = resp.headers.get("Content-Range") or resp.headers.get("content-range") or ""
+                        match = re.search(r"/(\d+)$", content_range)
+                        if match:
+                            return int(match.group(1))
+                        return int(resp.headers.get("Content-Length") or resp.headers.get("content-length") or 0)
+                content_range = resp.headers.get("Content-Range") or resp.headers.get("content-range") or ""
+                match = re.search(r"/(\d+)$", content_range)
+                if match:
+                    return int(match.group(1))
+                return int(resp.headers.get("Content-Length") or resp.headers.get("content-length") or 0)
+        except Exception:
+            return 0
+
+    async def _filter_urls_by_size(self, urls: list[str], expected_size: int) -> list[str]:
+        sizes = await asyncio.gather(*(self._remote_size(url) for url in urls))
+        filtered = [url for url, size in zip(urls, sizes) if not size or size >= expected_size]
+        return filtered or urls
+
     async def _download_aria2(self, url: str | list[str], dest_dir: Path, name: str | None, progress: JobState) -> list[Path]:
         urls = [str(item) for item in (url if isinstance(url, list) else [url]) if str(item or "")]
         uri_file: Path | None = None
@@ -302,6 +327,12 @@ class LinksProvider(BaseProvider):
             raise ProviderFailure("DOWNLOAD_FAILED", "No URL provided")
         urls = [str(item) for item in (file_ref.get("urls") or []) if str(item or "").startswith(("http://", "https://"))]
         urls = urls or [str(url)]
+        try:
+            expected_size = int(file_ref.get("size") or file_ref.get("file_size") or file_ref.get("bytes") or 0)
+        except (TypeError, ValueError):
+            expected_size = 0
+        if expected_size and len(urls) > 1:
+            urls = await self._filter_urls_by_size(urls, expected_size)
 
         raw_name = file_ref.get("name") or (local_path.name if local_path.suffix else "")
         name = safe_name(raw_name) if raw_name else None
@@ -328,10 +359,6 @@ class LinksProvider(BaseProvider):
             raise ProviderFailure("DOWNLOAD_FAILED", "Download completed but no files found on disk")
 
         result = downloaded[0]
-        try:
-            expected_size = int(file_ref.get("size") or file_ref.get("file_size") or file_ref.get("bytes") or 0)
-        except (TypeError, ValueError):
-            expected_size = 0
         if expected_size and result.stat().st_size < expected_size:
             raise ProviderFailure("DOWNLOAD_INCOMPLETE", f"Downloaded {result.stat().st_size} bytes, expected {expected_size}")
         progress.files_downloaded += 1
