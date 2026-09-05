@@ -15,8 +15,8 @@ from urllib.parse import quote, urlencode
 
 import httpx
 
-from .base import BaseProvider, ProviderFailure, safe_name, stream_download
-from ..config import PIKPAK_UPLOAD_CONCURRENCY
+from .base import BaseProvider, ProviderFailure, safe_name, shared_client, stream_download
+from ..config import CHUNK_SIZE, PIKPAK_DOWNLOAD_CONCURRENCY, PIKPAK_DOWNLOAD_PART_SIZE, PIKPAK_UPLOAD_CONCURRENCY
 from ..jobs.progress import JobState
 
 API = "https://api-drive.mypikpak.com"
@@ -29,6 +29,7 @@ WEB_CLIENT_VERSION = "2.0.0"
 WEB_PACKAGE = "mypikpak.com"
 MIN_PART = 5 * 1024 * 1024
 PART = 8 * 1024 * 1024
+PARALLEL_DOWNLOAD_MIN_SIZE = 32 * 1024 * 1024
 SALTS = ["Gez0T9ijiI9WCeTsKSg3SMlx", "zQdbalsolyb1R/", "ftOjr52zt51JD68C3s", "yeOBMH0JkbQdEFNNwQ0RI9T3wU/v", "BRJrQZiTQ65WtMvwO", "je8fqxKPdQVJiy1DM6Bc9Nb1", "niV", "9hFCW2R1", "sHKHpe2i96", "p7c5E6AcXQ/IJUuAEC9W6", "", "aRv9hjc9P+Pbn+u3krN6", "BzStcgE8qVdqjEH16l4", "SqgeZvL5j9zoHP95xWHt", "zVof5yaJkPe3VFpadPof"]
 WEB_SALTS = ["C9qPpZLN8ucRTaTiUMWYS9cQvWOE", "+r6CQVxjzJV6LCV", "F", "pFJRC", "9WXYIDGrwTCz2OiVlgZa90qpECPD6olt", "/750aCr4lm/Sly/c", "RB+DT/gZCrbV", "", "CyLsf7hdkIRxRm215hl", "7xHvLi2tOYP0Y92b", "ZGTXXxu8E/MIWaEDB+Sm/", "1UI3", "E7fP5Pfijd+7K+t6Tg/NhuLq0eEUVChpJSkrKxpO", "ihtqpG6FMt65+Xk+tWUH2", "NhXXU9rg4XXdzo7u5o"]
 
@@ -96,6 +97,90 @@ def _xml(raw: str, tag: str) -> str:
         return ""
     node = root.find(f".//{tag}")
     return node.text if node is not None and node.text else ""
+
+def _progress_snapshot(progress: JobState) -> dict[str, Any]:
+    return {
+        "bytes_done": progress.bytes_done,
+        "bytes_total": progress.bytes_total,
+        "_phase": progress._phase,
+        "_phase_done": progress._phase_done,
+        "_phase_total": progress._phase_total,
+        "_phase_total_keys": set(progress._phase_total_keys),
+        "_phase_done_by_name": dict(progress._phase_done_by_name),
+        "_phase_total_by_name": dict(progress._phase_total_by_name),
+    }
+
+def _restore_progress(progress: JobState, snap: dict[str, Any]) -> None:
+    for key, value in snap.items():
+        setattr(progress, key, value)
+
+def _range_total(value: str) -> int:
+    try:
+        return int(str(value or "").rsplit("/", 1)[1])
+    except (IndexError, TypeError, ValueError):
+        return 0
+
+async def pikpak_parallel_download(url: str, dest: Path, progress: JobState, size: int) -> Path:
+    size = int(size or 0)
+    if size < PARALLEL_DOWNLOAD_MIN_SIZE:
+        raise ProviderFailure("DOWNLOAD_FAILED", "parallel download skipped for small file")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    client = shared_client("pikpak-download", timeout=None, follow_redirects=True, limits=httpx.Limits(max_connections=max(16, PIKPAK_DOWNLOAD_CONCURRENCY + 2), max_keepalive_connections=PIKPAK_DOWNLOAD_CONCURRENCY + 2))
+    async with client.stream("GET", url, headers={"Range": "bytes=0-0"}) as probe:
+        if probe.status_code != 206:
+            raise ProviderFailure("DOWNLOAD_FAILED", f"PikPak CDN did not accept Range probe (HTTP {probe.status_code})")
+        probed_size = _range_total(probe.headers.get("content-range", ""))
+        async for _ in probe.aiter_bytes(CHUNK_SIZE):
+            break
+    if probed_size and probed_size != size:
+        size = probed_size
+    ranges = [(i, start, min(start + PIKPAK_DOWNLOAD_PART_SIZE - 1, size - 1)) for i, start in enumerate(range(0, size, PIKPAK_DOWNLOAD_PART_SIZE))]
+    workers = max(1, min(PIKPAK_DOWNLOAD_CONCURRENCY, len(ranges)))
+    sem = asyncio.Semaphore(workers)
+    progress.log(f"PikPak parallel download: size={size} parts={len(ranges)} concurrency={workers}")
+
+    async def one(index: int, start: int, end: int) -> Path:
+        part = dest.with_name(f"{dest.name}.part.{index}")
+        part.unlink(missing_ok=True)
+        async with sem:
+            progress.check_cancelled()
+            async with client.stream("GET", url, headers={"Range": f"bytes={start}-{end}"}) as resp:
+                if resp.status_code in (401, 403):
+                    raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Provider rejected download credentials")
+                if resp.status_code != 206:
+                    raise ProviderFailure("DOWNLOAD_FAILED", f"PikPak Range part {index} failed HTTP {resp.status_code}")
+                got = 0
+                with part.open("wb") as fh:
+                    async for chunk in resp.aiter_bytes(CHUNK_SIZE):
+                        progress.check_cancelled()
+                        fh.write(chunk)
+                        got += len(chunk)
+                        progress.add_bytes(len(chunk), size, "download", str(dest))
+                expected = end - start + 1
+                if got != expected:
+                    raise ProviderFailure("DOWNLOAD_FAILED", f"PikPak Range part {index} incomplete")
+                return part
+
+    parts = []
+    try:
+        parts = await asyncio.gather(*(one(*r) for r in ranges))
+        with dest.with_suffix(dest.suffix + ".part").open("wb") as out:
+            for part in sorted(parts, key=lambda p: int(p.name.rsplit(".", 1)[1])):
+                with part.open("rb") as fh:
+                    while True:
+                        chunk = fh.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+        dest.with_suffix(dest.suffix + ".part").replace(dest)
+        progress.files_downloaded += 1
+        progress.log(f"[{progress.files_downloaded}/{progress.files_to_download}] Downloaded: {dest.name}")
+        return dest
+    finally:
+        for path in parts:
+            path.unlink(missing_ok=True)
+        for path in dest.parent.glob(dest.name + ".part.*"):
+            path.unlink(missing_ok=True)
 
 class PikPakSession:
     def __init__(self, c: dict[str, Any]) -> None:
@@ -187,7 +272,16 @@ class PikPakProvider(BaseProvider):
             raise ProviderFailure("DOWNLOAD_FAILED", "PikPak did not return download url")
         dest = local_path if local_path.suffix else local_path / safe_name(file_ref.get("name") or info.get("name") or fid)
         progress.set(step="downloading", current_file=dest.name)
-        return await stream_download(str(url), dest, progress)
+        size = int(info.get("size") or file_ref.get("size") or 0)
+        snap = _progress_snapshot(progress)
+        try:
+            return await pikpak_parallel_download(str(url), dest, progress, size)
+        except ProviderFailure as exc:
+            if exc.code == "INVALID_PROVIDER_CREDENTIALS":
+                raise
+            _restore_progress(progress, snap)
+            progress.log(f"PikPak parallel download fallback: {exc.message}")
+            return await stream_download(str(url), dest, progress)
 
     async def _create_folder(self, s: PikPakSession, parent_id: str, name: str) -> str:
         payload = {"kind": "drive#folder", "name": name, "parent_id": parent_id or ""}

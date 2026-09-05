@@ -49,6 +49,78 @@ def test_links_provider_downloads_inside_directory_path(tmp_path, monkeypatch):
     assert out == tmp_path / "a.bin"
     assert out.read_text() == "ok"
 
+def test_pikpak_parallel_download_ranges_and_merges(tmp_path, monkeypatch):
+    data = b"abcdefghijklmnop"
+    ranges = []
+
+    class Stream:
+        def __init__(self, headers):
+            raw = (headers or {}).get("Range", "")
+            ranges.append(raw)
+            start, end = [int(x) for x in raw.removeprefix("bytes=").split("-")]
+            self.body = data[start:end + 1]
+            self.status_code = 206
+            self.headers = {"content-range": f"bytes {start}-{end}/{len(data)}", "content-length": str(len(self.body))}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def aiter_bytes(self, size):
+            yield self.body
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        def stream(self, method, url, headers):
+            return Stream(headers)
+
+    monkeypatch.setattr(base_mod.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(pikpak_mod, "PIKPAK_DOWNLOAD_PART_SIZE", 4)
+    monkeypatch.setattr(pikpak_mod, "PIKPAK_DOWNLOAD_CONCURRENCY", 2)
+    monkeypatch.setattr(pikpak_mod, "PARALLEL_DOWNLOAD_MIN_SIZE", 1)
+
+    dest = tmp_path / "file.bin"
+    job = JobState("pikpak-parallel", {})
+    asyncio.run(pikpak_mod.pikpak_parallel_download("https://example.test/file", dest, job, len(data)))
+
+    assert dest.read_bytes() == data
+    assert ranges == ["bytes=0-0", "bytes=0-3", "bytes=4-7", "bytes=8-11", "bytes=12-15"]
+    assert job.files_downloaded == 1
+    assert job.progress.download == 100
+
+def test_pikpak_download_falls_back_to_stream(tmp_path, monkeypatch):
+    async def captcha_init(self, action):
+        return "captcha"
+
+    async def req(self, method, url, **kw):
+        return {"name": "file.bin", "size": 64, "web_content_link": "https://example.test/file"}
+
+    async def parallel(url, dest, progress, size):
+        progress.add_bytes(10, 64, "download", str(dest))
+        raise ProviderFailure("DOWNLOAD_FAILED", "range refused")
+
+    async def stream(url, dest, progress):
+        dest.write_bytes(b"ok")
+        progress.add_bytes(2, 2, "download", str(dest))
+        progress.files_downloaded += 1
+        return dest
+
+    monkeypatch.setattr(pikpak_mod.PikPakSession, "captcha_init", captcha_init)
+    monkeypatch.setattr(pikpak_mod.PikPakSession, "req", req)
+    monkeypatch.setattr(pikpak_mod, "pikpak_parallel_download", parallel)
+    monkeypatch.setattr(pikpak_mod, "stream_download", stream)
+
+    job = JobState("pikpak-fallback", {})
+    out = asyncio.run(PikPakProvider().download_file({"access_token": "t"}, {"id": "f1"}, tmp_path, job))
+
+    assert out.read_bytes() == b"ok"
+    assert job.bytes_done == 2
+    assert any("fallback: range refused" in line for line in job.logs)
+
 def test_links_provider_resolves_mediafire_before_aria2(tmp_path, monkeypatch):
     provider = LinksProvider()
     seen = {}

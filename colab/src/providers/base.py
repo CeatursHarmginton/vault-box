@@ -257,23 +257,23 @@ async def stream_download(url: str, dest: Path, progress: JobState, *, headers: 
             if done:
                 req_headers["Range"] = f"bytes={done}-"
             try:
-                async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
-                    async with client.stream("GET", url, headers=req_headers) as resp:
-                        if resp.status_code in (401, 403):
-                            raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Provider rejected download credentials")
-                        resp.raise_for_status()
-                        if done and resp.status_code != 206:
-                            part.unlink(missing_ok=True)
-                            done = 0
-                        total = done + int(resp.headers.get("content-length") or 0)
-                        expected = total or expected
-                        content_type = resp.headers.get("content-type", content_type)
-                        with part.open("ab" if done else "wb") as fh:
-                            async for chunk in resp.aiter_bytes(CHUNK_SIZE):
-                                progress.check_cancelled()
-                                fh.write(chunk)
-                                done += len(chunk)
-                                progress.add_bytes(len(chunk), total, phase, str(dest))
+                client = shared_client("download", timeout=None, follow_redirects=True)
+                async with client.stream("GET", url, headers=req_headers) as resp:
+                    if resp.status_code in (401, 403):
+                        raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Provider rejected download credentials")
+                    resp.raise_for_status()
+                    if done and resp.status_code != 206:
+                        part.unlink(missing_ok=True)
+                        done = 0
+                    total = done + int(resp.headers.get("content-length") or 0)
+                    expected = total or expected
+                    content_type = resp.headers.get("content-type", content_type)
+                    with part.open("ab" if done else "wb") as fh:
+                        async for chunk in resp.aiter_bytes(CHUNK_SIZE):
+                            progress.check_cancelled()
+                            fh.write(chunk)
+                            done += len(chunk)
+                            progress.add_bytes(len(chunk), total, phase, str(dest))
                 if not expected or part.stat().st_size >= expected:
                     break
                 raise RuntimeError(f"Download incomplete: got {part.stat().st_size} bytes, expected {expected}")
