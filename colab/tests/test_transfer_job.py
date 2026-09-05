@@ -156,21 +156,46 @@ def test_links_provider_filters_small_preview_urls_before_aria2(tmp_path, monkey
         out.write_bytes(b"x" * 100)
         return [out]
 
-    async def fake_size(url):
-        return 10 if "preview" in url else 100
+    async def fake_probe(url):
+        return (url, 10 if "preview" in url else 100, 1.0)
 
     async def no_deps():
         return None
 
     monkeypatch.setattr(provider, "_ensure_deps", no_deps)
     monkeypatch.setattr(provider, "_download_aria2", fake_download)
-    monkeypatch.setattr(provider, "_remote_size", fake_size)
+    monkeypatch.setattr(provider, "_probe_url", fake_probe)
 
     urls = ["https://preview.example/file.bin", "https://cdn.example/file.bin"]
     out = asyncio.run(provider.download_file({}, {"id": urls[0], "urls": urls, "name": "file.bin", "size": 100}, tmp_path, JobState("links-filter", {})))
 
     assert out.name == "file.bin"
     assert seen["url"] == ["https://cdn.example/file.bin"]
+
+def test_links_provider_ranks_full_size_urls_by_probe_speed(tmp_path, monkeypatch):
+    provider = LinksProvider()
+    seen = {}
+
+    async def fake_download(url, dest_dir, name, progress):
+        seen["url"] = url
+        out = dest_dir / (name or "file.bin")
+        out.write_bytes(b"x" * 100)
+        return [out]
+
+    async def fake_probe(url):
+        return (url, 100, 10.0 if "fast" in url else 1.0)
+
+    async def no_deps():
+        return None
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr(provider, "_download_aria2", fake_download)
+    monkeypatch.setattr(provider, "_probe_url", fake_probe)
+
+    urls = ["https://slow.example/file.bin", "https://fast.example/file.bin"]
+    asyncio.run(provider.download_file({}, {"id": urls[0], "urls": urls, "name": "file.bin", "size": 100}, tmp_path, JobState("links-rank", {})))
+
+    assert seen["url"] == ["https://fast.example/file.bin", "https://slow.example/file.bin"]
 
 def test_links_provider_rejects_incomplete_download(tmp_path, monkeypatch):
     provider = LinksProvider()

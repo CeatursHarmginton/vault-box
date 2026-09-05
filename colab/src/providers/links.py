@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -117,7 +118,7 @@ class LinksProvider(BaseProvider):
                         match = re.search(r"/(\d+)$", content_range)
                         if match:
                             return int(match.group(1))
-                        return int(resp.headers.get("Content-Length") or resp.headers.get("content-length") or 0)
+                        return int(resp.headers.get("Content-Length") or resp.headers.get("content-length") or 0) if resp.status_code == 200 else 0
                 content_range = resp.headers.get("Content-Range") or resp.headers.get("content-range") or ""
                 match = re.search(r"/(\d+)$", content_range)
                 if match:
@@ -127,9 +128,32 @@ class LinksProvider(BaseProvider):
             return 0
 
     async def _filter_urls_by_size(self, urls: list[str], expected_size: int) -> list[str]:
-        sizes = await asyncio.gather(*(self._remote_size(url) for url in urls))
-        filtered = [url for url, size in zip(urls, sizes) if not size or size >= expected_size]
-        return filtered or urls
+        probes = await asyncio.gather(*(self._probe_url(url) for url in urls))
+        filtered = [probe for probe in probes if not probe[1] or probe[1] >= expected_size]
+        filtered.sort(key=lambda probe: probe[2], reverse=True)
+        return [probe[0] for probe in filtered] or urls
+
+    async def _probe_url(self, url: str) -> tuple[str, int, float]:
+        size = await self._remote_size(url)
+        started = time.monotonic()
+        read = 0
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+                async with client.stream("GET", url, headers={"Range": "bytes=0-2097151"}) as resp:
+                    async for chunk in resp.aiter_bytes():
+                        read += len(chunk)
+                        if read >= 2 * 1024 * 1024:
+                            break
+                    content_range = resp.headers.get("Content-Range") or resp.headers.get("content-range") or ""
+                    match = re.search(r"/(\d+)$", content_range)
+                    if match:
+                        size = int(match.group(1))
+                    elif not size and resp.status_code == 200:
+                        size = int(resp.headers.get("Content-Length") or resp.headers.get("content-length") or 0)
+        except Exception:
+            pass
+        elapsed = max(time.monotonic() - started, 0.001)
+        return url, size, read / elapsed
 
     async def _download_aria2(self, url: str | list[str], dest_dir: Path, name: str | None, progress: JobState) -> list[Path]:
         urls = [str(item) for item in (url if isinstance(url, list) else [url]) if str(item or "")]
