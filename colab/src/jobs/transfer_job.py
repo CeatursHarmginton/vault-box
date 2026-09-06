@@ -6,7 +6,7 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from ..extract.extractor import extract_archives
+from ..extract.extractor import extract_archives, is_archive_name
 from ..config import FOLDER_DOWNLOAD_CONCURRENCY, UPLOAD_FILE_CONCURRENCY
 from ..providers import PROVIDERS
 from ..providers.base import ProviderFailure, close_shared_clients, download_with_retry, is_skippable_download_failure, safe_name
@@ -55,7 +55,11 @@ async def run_transfer(job: JobState) -> None:
             for item in skipped_videos:
                 job.files_skipped += 1
                 job.log(f"[SKIP] Video ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
-            file_items = [item for item in file_items if not _is_video_item(item)]
+            skipped_archives = [item for item in file_items if not options.get("extract") and _is_archive_item(item)]
+            for item in skipped_archives:
+                job.files_skipped += 1
+                job.log(f"[SKIP] Archive ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
+            file_items = [item for item in file_items if not _is_video_item(item) and not (not options.get("extract") and _is_archive_item(item))]
         job.files_to_download = len(file_items)
 
         downloaded: list[Path] = []
@@ -246,6 +250,11 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         if item_type != "folder" and _is_video_item(item):
             job.files_skipped += 1
             job.log(f"[SKIP] Video ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
+            job.completed_items.append(_queue_item_ref(source, item))
+            continue
+        if item_type != "folder" and not options.get("extract") and _is_archive_item(item):
+            job.files_skipped += 1
+            job.log(f"[SKIP] Archive ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
             job.completed_items.append(_queue_item_ref(source, item))
             continue
 
@@ -668,6 +677,9 @@ def _queue_item_ref(source: dict[str, Any], item: dict[str, Any]) -> dict[str, A
 
 def _is_video_item(item: dict[str, Any]) -> bool:
     return Path(str(item.get("name") or item.get("path") or item.get("id") or "")).suffix.lower() in VIDEO_EXTENSIONS
+
+def _is_archive_item(item: dict[str, Any]) -> bool:
+    return is_archive_name(str(item.get("name") or item.get("path") or item.get("id") or ""))
 
 def _archive_passwords(options: dict[str, Any]) -> Any:
     return options.get("archive_passwords") or options.get("archivePasswords") or options.get("archivePassword") or options.get("archive_password")

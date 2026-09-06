@@ -642,6 +642,35 @@ def test_optimize_queue_unzip_fallback_uploads_archive_and_passwords(monkeypatch
     assert seen_passwords == [["pw1", "pw2"]]
     assert [call[1].name for call in dst.calls] == ["a.zip", "b.zip"]
 
+def test_optimize_archive_without_extract_skips_download_and_upload():
+    class Source:
+        async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
+            raise AssertionError("archive should not download")
+
+    class Dst:
+        async def upload_file(self, credentials, local_path, target_ref, progress):
+            raise AssertionError("archive should not upload")
+
+    old = dict(PROVIDERS)
+    PROVIDERS.update({"fake-source": Source(), "fake-dst": Dst()})
+    try:
+        job = JobState("opt-archive-no-extract", {
+            "source": {"provider": "fake-source", "items": [{"type": "file", "id": "a", "name": "a.zip"}]},
+            "target": {"provider": "fake-dst", "folder": {"id": "/", "path": "/"}},
+            "options": {"cleanupAfterFinish": False, "optimize_image": True, "extract": False},
+        })
+        asyncio.run(run_transfer(job))
+    finally:
+        PROVIDERS.clear()
+        PROVIDERS.update(old)
+        __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-archive-no-extract")
+
+    assert job.status == "completed", job.error
+    assert job.files_downloaded == 0
+    assert job.files_uploaded == 0
+    assert job.files_skipped == 1
+    assert any("Archive ignored by image optimizer" in line for line in job.logs)
+
 def test_drive_mount_download_and_upload(tmp_path, monkeypatch):
     mount = tmp_path / "MyDrive"
     mount.mkdir()
