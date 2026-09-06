@@ -609,13 +609,15 @@ def _remember_source_ref(job: JobState, path: Path, item: dict[str, Any]) -> Non
 
 def _optimized_replace_refs(job: JobState, results: list[dict[str, Any]], output_root: Path, upload_root: Path, input_root: Path) -> dict[str, dict[str, Any]]:
     source_refs = getattr(job, "_source_refs", {})
+    by_stem = {Path(key).stem: ref for key, ref in source_refs.items()}
     out: dict[str, dict[str, Any]] = {}
     for result in results:
         name = str(result.get("name") or "").replace("\\", "/")
         source_name = str(result.get("source_name") or "").replace("\\", "/")
-        if not name or not source_name:
+        if not name:
             continue
-        ref = source_refs.get(str((input_root / source_name).resolve()))
+        ref = source_refs.get(str((input_root / source_name).resolve())) if source_name else None
+        ref = ref or by_stem.get(PurePosixPath(name).stem)
         if not ref:
             continue
         output_path = output_root / name
