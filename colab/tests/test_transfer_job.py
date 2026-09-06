@@ -2954,6 +2954,52 @@ class TransferJobPathSafetyTests(TestCase):
         self.assertEqual(dst.replaced[0][1]["id"], "f1")
         self.assertEqual(dst.replaced[0][1]["name"], "pic.jpg")
 
+    def test_optimized_single_file_replace_uses_relay_source_path(self):
+        class Source:
+            async def download_file(self, credentials, file_ref, local_path: Path, progress: JobState):
+                path = local_path / file_ref["name"]
+                path.write_bytes(b"image data")
+                return path
+
+        class Dst:
+            def __init__(self):
+                self.replaced = []
+
+            async def replace_file(self, credentials, local_path, source_ref, progress):
+                self.replaced.append((local_path.name, source_ref))
+                return {"ok": True}
+
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                raise AssertionError("replace expected")
+
+        dst = Dst()
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            out = output_dir / "2.jpg"
+            out.write_bytes(b"opt data")
+            return [{"name": "2.jpg", "source_name": "2.png", "original_size": 10, "optimized_size": 8, "status": "ok"}]
+
+        PROVIDERS.update({"fake-source": Source(), "fake-dst": dst})
+        image_optimizer.optimize_directory = fake_optimize
+        try:
+            job = JobState("opt-relay-path-replace", {
+                "source": {"provider": "fake-source", "items": [{"type": "file", "name": "2.png", "relay": {"sourcePath": "/root/2.png"}}]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True, "confirm_action": "replace"},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-relay-path-replace")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(dst.replaced[0][0], "2.jpg")
+        self.assertEqual(dst.replaced[0][1]["relay"]["sourcePath"], "/root/2.png")
+        self.assertEqual(dst.replaced[0][1]["name"], "2.jpg")
+
     def test_optimized_folder_replace_maps_converted_jpg_to_original_png(self):
         class Source(base_mod.BaseProvider):
             async def validate_credentials(self, credentials):
