@@ -229,15 +229,27 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
     scale = float(options.get("resolution_scale", 1.0))
     
     size = src_path.stat().st_size
+    dest_ext = ".jpg" if src_path.suffix.lower() not in (".jpg", ".jpeg") else src_path.suffix.lower()
+    dest_path = dest_dir / f"{src_path.stem}{dest_ext}"
     # 1. Skip if already within range
     if min_target <= size <= max_target:
+        if src_path.suffix.lower() not in (".jpg", ".jpeg"):
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                copy_or_convert_image(src_path, dest_path, quality)
+            except RuntimeError:
+                dest_path = copy_original_image(src_path, dest_dir)
+                return dest_path, quality, "Giữ nguyên"
+            if not _valid_optimized_output(src_path, dest_path, 1.0):
+                dest_path.unlink(missing_ok=True)
+                dest_path = copy_original_image(src_path, dest_dir)
+                return dest_path, quality, "Giữ nguyên (Lỗi convert)"
+            return dest_path, quality, "Thành công (Converted)"
         dest_path = copy_original_image(src_path, dest_dir)
         return dest_path, quality, "Giữ nguyên"
         
     # 2. Upscale if too small (Real-ESRGAN placeholder or keep as-is)
     if size < min_target:
-        dest_ext = ".jpg" if src_path.suffix.lower() not in (".jpg", ".jpeg") else src_path.suffix.lower()
-        dest_path = dest_dir / f"{src_path.stem}{dest_ext}"
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         if options.get("upscale") and shutil.which("realesrgan-ncnn-vulkan"):
             outscale = int(options.get("outscale", 3))
@@ -255,13 +267,22 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
                 except Exception as e:
                     logger.warning(f"Real-ESRGAN failed: {e}")
             
+        if src_path.suffix.lower() not in (".jpg", ".jpeg"):
+            try:
+                copy_or_convert_image(src_path, dest_path, quality)
+            except RuntimeError:
+                dest_path = copy_original_image(src_path, dest_dir)
+                return dest_path, quality, "Giữ nguyên (Lỗi convert)"
+            if not _valid_optimized_output(src_path, dest_path, 1.0):
+                dest_path.unlink(missing_ok=True)
+                dest_path = copy_original_image(src_path, dest_dir)
+                return dest_path, quality, "Giữ nguyên (Lỗi convert)"
+            return dest_path, quality, "Thành công (Converted)"
         dest_path = copy_original_image(src_path, dest_dir)
         return dest_path, quality, "Giữ nguyên (Upscale tắt hoặc lỗi)"
 
     # 3. Compress if larger than max_target
-    dest_ext = ".jpg" if src_path.suffix.lower() not in (".jpg", ".jpeg") else src_path.suffix.lower()
     # Use stem + ext to avoid string-replace collision (e.g. "image.png.png")
-    dest_path = dest_dir / f"{src_path.stem}{dest_ext}"
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     q = adaptive_quality if auto_size else quality
     q = clamp_quality(q, quality)
