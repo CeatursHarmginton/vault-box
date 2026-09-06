@@ -2537,6 +2537,30 @@ class TransferJobTests(TestCase):
         self.assertEqual(events[0], ("upload", {"id": "/root", "relative_path": "photo.png"}))
         self.assertEqual(json.loads(events[1][1]["filelist"]), [{"path": "/root/photo.png", "newname": "photo.jpg"}])
 
+    def test_terabox_replace_accepts_relay_source_path(self):
+        with __import__("tempfile").TemporaryDirectory() as tmp:
+            provider = TeraBoxProvider()
+            local = Path(tmp) / "2.jpg"
+            local.write_bytes(b"jpg")
+            events = []
+
+            async def upload_file(credentials, local_path, target_ref, progress):
+                events.append(target_ref)
+                return {"ok": True}
+
+            async def session(credentials):
+                class Session:
+                    base = "https://www.terabox.com"
+                return Session()
+
+            provider.upload_file = upload_file
+            provider._session = session
+
+            out = asyncio.run(provider.replace_file({}, local, {"relay": {"sourcePath": "/root/2.png"}, "name": "2.png"}, JobState("tb-relay-replace", {})))
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(events[0], {"id": "/root", "relative_path": "2.png"})
+
     def test_terabox_download_canonicalizes_source_path_for_replace(self):
         class Provider(TeraBoxProvider):
             async def _session(self, credentials):

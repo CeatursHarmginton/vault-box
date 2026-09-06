@@ -628,6 +628,8 @@ def _replacement_source_ref(item: dict[str, Any], path: Path, rel: str) -> dict[
     ref = refs.get(str(rel).replace("\\", "/")) or refs.get(path.name)
     if ref:
         return {**ref, "name": path.name}
+    if not (item.get("path") or item.get("id")):
+        return None
     item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
     return {**item, "name": path.name} if item_type != "folder" else None
 

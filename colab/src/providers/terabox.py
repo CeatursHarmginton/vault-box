@@ -506,7 +506,8 @@ class TeraBoxProvider(BaseProvider):
         }, headers={**s.headers(), "Content-Type": "application/x-www-form-urlencoded"})
 
     async def replace_file(self, credentials: dict[str, Any], local_path: Path, source_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:
-        source_path = str(source_ref.get("path") or source_ref.get("id") or "")
+        relay = source_ref.get("relay") if isinstance(source_ref.get("relay"), dict) else {}
+        source_path = str(source_ref.get("path") or source_ref.get("id") or relay.get("sourcePath") or relay.get("sourceId") or "")
         if not source_path:
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "TeraBox source path missing")
         parent = str(PurePosixPath(source_path).parent)
