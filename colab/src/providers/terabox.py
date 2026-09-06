@@ -292,6 +292,7 @@ class TeraBoxProvider(BaseProvider):
     async def download_file(self, credentials: dict[str, Any], file_ref: dict[str, Any], local_path: Path, progress: JobState) -> Path:
         s = await self._session(credentials)
         path = (await self._resolve_file_paths(credentials, file_ref))[0]
+        file_ref["path"] = path
         meta = await self._dlink(s, path)
         name = file_ref.get("name") or meta.get("server_filename") or PurePosixPath(path).name
         dest = local_path if local_path.suffix else local_path / safe_name(name)

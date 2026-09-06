@@ -2537,6 +2537,50 @@ class TransferJobTests(TestCase):
         self.assertEqual(events[0], ("upload", {"id": "/root", "relative_path": "photo.png"}))
         self.assertEqual(json.loads(events[1][1]["filelist"]), [{"path": "/root/photo.png", "newname": "photo.jpg"}])
 
+    def test_terabox_download_canonicalizes_source_path_for_replace(self):
+        class Provider(TeraBoxProvider):
+            async def _session(self, credentials):
+                return session
+
+            async def _resolve_file_paths(self, credentials, ref):
+                return ["/root/2.png"]
+
+            async def _dlink(self, s, path):
+                return {"dlink": "https://dm-d.terabox.com/file/2", "server_filename": "2.png"}
+
+        class Session:
+            base = "https://www.terabox.com"
+            cookies = {}
+
+        async def fake_stream(url, dest, progress, **kwargs):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"png")
+            return dest
+
+        session = Session()
+        old_stream = terabox_mod.stream_download
+        terabox_mod.stream_download = fake_stream
+        try:
+            with __import__("tempfile").TemporaryDirectory() as tmp:
+                ref = {"id": "https://www.terabox.com/s/old-domain", "name": "2.png"}
+                asyncio.run(Provider().download_file({}, ref, Path(tmp), JobState("tb-canon", {})))
+        finally:
+            terabox_mod.stream_download = old_stream
+
+        self.assertEqual(ref["path"], "/root/2.png")
+
+    def test_png_within_optimize_range_keeps_png_name(self):
+        with __import__("tempfile").TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "2.png"
+            out = root / "out"
+            src.write_bytes(b"x" * 1024)
+
+            path, _, status = image_optimizer.optimize_image_file(src, out, {"min_target_mb": 0, "max_target_mb": 1}, 95)
+
+        self.assertEqual(path.name, "2.png")
+        self.assertEqual(status, "Giữ nguyên")
+
     def test_terabox_refreshes_token_and_retries_on_need_verify_errno(self):
         bodies = [{"errno": 4000023, "errmsg": "need verify"}, {"errno": 0, "list": []}]
         sent: list[dict] = []
