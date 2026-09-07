@@ -173,7 +173,14 @@ class LinksProvider(BaseProvider):
             out_name = name or safe_name(unquote(Path(urlparse(one).path).name) or "download")
             try:
                 progress.log(f"Starting browser-compatible download: {out_name}")
-                return [await stream_download(one, dest_dir / out_name, progress, headers=self._http_headers(headers))]
+                return [await stream_download(
+                    one,
+                    dest_dir / out_name,
+                    progress,
+                    headers=self._http_headers(headers),
+                    auth_fail_code="DOWNLOAD_FAILED",
+                    auth_fail_message="Direct link rejected the browser headers; copy a fresh payload from VaultBox Sniffer",
+                )]
             except ProviderFailure as exc:
                 last = exc
         if last:

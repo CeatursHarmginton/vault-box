@@ -331,7 +331,7 @@ def test_links_provider_sniffer_mp4_uses_stream_download(tmp_path, monkeypatch):
     async def fail_aria2(*args, **kwargs):
         raise AssertionError("aria2 should not be used for browser-bound media")
 
-    async def fake_stream(url, dest, progress, *, headers=None, phase="download", on_verify=None):
+    async def fake_stream(url, dest, progress, *, headers=None, phase="download", on_verify=None, **kwargs):
         seen.update({"url": url, "dest": dest, "headers": headers})
         dest.write_text("video-ok")
         return dest
@@ -367,7 +367,7 @@ def test_links_provider_aria2_code_22_falls_back_to_stream_download(tmp_path, mo
     async def fake_aria2(*args, **kwargs):
         raise ProviderFailure("DOWNLOAD_FAILED", "aria2c exited with code 22")
 
-    async def fake_stream(url, dest, progress, *, headers=None, phase="download", on_verify=None):
+    async def fake_stream(url, dest, progress, *, headers=None, phase="download", on_verify=None, **kwargs):
         seen["headers"] = headers
         dest.write_text("ok")
         return dest
@@ -380,6 +380,41 @@ def test_links_provider_aria2_code_22_falls_back_to_stream_download(tmp_path, mo
 
     assert out.name == "file.zip"
     assert seen["headers"]["Accept-Encoding"] == "identity"
+
+def test_links_provider_direct_403_is_download_failed(tmp_path, monkeypatch):
+    provider = LinksProvider()
+
+    class Stream:
+        status_code = 403
+        headers = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        def stream(self, method, url, headers):
+            return Stream()
+
+    async def no_deps():
+        return None
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr("src.providers.base.httpx.AsyncClient", Client)
+
+    try:
+        asyncio.run(provider.download_file({}, {"id": "https://cdn.example/video.mp4", "name": "video.mp4", "type": "mp4", "headers": {"Referer": "https://site.test/"}}, tmp_path, JobState("links-403", {})))
+    except ProviderFailure as exc:
+        assert exc.code == "DOWNLOAD_FAILED"
+        assert "copy a fresh payload" in exc.message
+        assert exc.details["status"] == 403
+    else:
+        raise AssertionError("expected direct 403 failure")
 
 def test_links_provider_size_probe_passes_headers(tmp_path, monkeypatch):
     provider = LinksProvider()

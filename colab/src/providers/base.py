@@ -237,7 +237,7 @@ class BaseProvider(ABC):
         skipped = len(results) - len(uploaded)
         return {"ok": True, "uploaded": len(uploaded), "skipped": skipped, "items": uploaded}
 
-async def stream_download(url: str, dest: Path, progress: JobState, *, headers: dict[str, str] | None = None, phase: str = "download", on_verify: Any = None) -> Path:
+async def stream_download(url: str, dest: Path, progress: JobState, *, headers: dict[str, str] | None = None, phase: str = "download", on_verify: Any = None, auth_fail_code: str = "INVALID_PROVIDER_CREDENTIALS", auth_fail_message: str = "Provider rejected download credentials") -> Path:
     """Stream `url` into `dest`, resuming across connection drops.
 
     When the provider answers with a JSON error instead of bytes and `on_verify` is given,
@@ -263,7 +263,7 @@ async def stream_download(url: str, dest: Path, progress: JobState, *, headers: 
                 client = shared_client("download", timeout=httpx.Timeout(None, connect=30.0, read=DOWNLOAD_READ_TIMEOUT, write=60.0, pool=30.0), follow_redirects=True)
                 async with client.stream("GET", url, headers=req_headers) as resp:
                     if resp.status_code in (401, 403):
-                        raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Provider rejected download credentials")
+                        raise ProviderFailure(auth_fail_code, f"{auth_fail_message} (HTTP {resp.status_code})", {"status": resp.status_code})
                     resp.raise_for_status()
                     if done and resp.status_code != 206:
                         part.unlink(missing_ok=True)
