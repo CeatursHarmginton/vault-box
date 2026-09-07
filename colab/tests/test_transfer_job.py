@@ -255,6 +255,72 @@ def test_links_provider_routes_magnet_and_torrent_to_aria2_torrent(tmp_path, mon
 
     assert seen == ["magnet:?xt=urn:btih:abc", "https://example.com/archive.torrent"]
 
+def test_links_provider_ytdlp_passes_custom_headers(tmp_path, monkeypatch):
+    provider = LinksProvider()
+    seen = {}
+
+    async def no_deps():
+        return None
+
+    async def fake_ytdlp(url, dest_dir, name, progress, headers=None):
+        seen["url"] = url
+        seen["name"] = name
+        seen["headers"] = headers
+        out = dest_dir / (name or "video.mp4")
+        out.write_text("video-ok")
+        return [out]
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr(provider, "_download_ytdlp", fake_ytdlp)
+
+    payload = {
+        "id": "https://example.com/live/master.m3u8",
+        "name": "stream.mp4",
+        "headers": {
+            "Referer": "https://example.com/watch/123",
+            "User-Agent": "VaultBoxSniffer/1.0",
+            "Origin": "https://example.com"
+        }
+    }
+    out = asyncio.run(provider.download_file({}, payload, tmp_path, JobState("links-ytdlp", {})))
+
+    assert out.name == "stream.mp4"
+    assert seen["url"] == "https://example.com/live/master.m3u8"
+    assert seen["headers"]["Referer"] == "https://example.com/watch/123"
+    assert seen["headers"]["User-Agent"] == "VaultBoxSniffer/1.0"
+
+def test_links_provider_aria2_passes_custom_headers(tmp_path, monkeypatch):
+    provider = LinksProvider()
+    seen = {}
+
+    async def no_deps():
+        return None
+
+    async def fake_aria2(url, dest_dir, name, progress, headers=None):
+        seen["url"] = url
+        seen["name"] = name
+        seen["headers"] = headers
+        out = dest_dir / (name or "file.bin")
+        out.write_text("file-ok")
+        return [out]
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr(provider, "_download_aria2", fake_aria2)
+
+    payload = {
+        "id": "https://example.com/download.zip",
+        "name": "download.zip",
+        "meta": {
+            "headers": {
+                "Cookie": "session=abc123xyz"
+            }
+        }
+    }
+    out = asyncio.run(provider.download_file({}, payload, tmp_path, JobState("links-aria2", {})))
+
+    assert out.name == "download.zip"
+    assert seen["headers"]["Cookie"] == "session=abc123xyz"
+
 def test_links_provider_reads_aria2_carriage_return_progress(tmp_path, monkeypatch):
     provider = LinksProvider()
     out = tmp_path / "done.bin"

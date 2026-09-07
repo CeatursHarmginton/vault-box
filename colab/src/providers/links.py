@@ -155,7 +155,7 @@ class LinksProvider(BaseProvider):
         elapsed = max(time.monotonic() - started, 0.001)
         return url, size, read / elapsed
 
-    async def _download_aria2(self, url: str | list[str], dest_dir: Path, name: str | None, progress: JobState) -> list[Path]:
+    async def _download_aria2(self, url: str | list[str], dest_dir: Path, name: str | None, progress: JobState, headers: dict[str, str] | None = None) -> list[Path]:
         urls = [str(item) for item in (url if isinstance(url, list) else [url]) if str(item or "")]
         uri_file: Path | None = None
         cmd = [
@@ -172,9 +172,14 @@ class LinksProvider(BaseProvider):
             "--retry-wait=2",
             "--uri-selector=adaptive",
         ]
+        if headers:
+            for k, v in headers.items():
+                if v and str(k).lower() not in ("host", "content-length"):
+                    cmd.append(f"--header={k}: {v}")
         if len(urls) > 1:
             uri_file = dest_dir / f".vaultbox-aria2-{uuid.uuid4().hex}.txt"
-            uri_file.write_text("\t".join(urls) + ("\n  out=" + name if name else "") + "\n", encoding="utf-8")
+            header_lines = "".join([f"\n  header={k}: {v}" for k, v in (headers or {}).items() if v and str(k).lower() not in ("host", "content-length")])
+            uri_file.write_text("\t".join(urls) + ("\n  out=" + name if name else "") + header_lines + "\n", encoding="utf-8")
             cmd.append(f"--input-file={uri_file}")
         elif name:
             cmd.append(f"--out={name}")
@@ -249,7 +254,7 @@ class LinksProvider(BaseProvider):
         new_files = [p for p in (after - before) if p.is_file() and not p.name.endswith(".aria2") and not p.name.startswith(".vaultbox-aria2-")]
         return new_files or [p for p in dest_dir.iterdir() if p.is_file() and not p.name.endswith(".aria2") and not p.name.startswith(".vaultbox-aria2-")]
 
-    async def _download_ytdlp(self, url: str, dest_dir: Path, name: str | None, progress: JobState) -> list[Path]:
+    async def _download_ytdlp(self, url: str, dest_dir: Path, name: str | None, progress: JobState, headers: dict[str, str] | None = None) -> list[Path]:
         before = set(dest_dir.iterdir()) if dest_dir.exists() else set()
         out_tpl = str(dest_dir / "%(title)s.%(ext)s")
         if name:
@@ -260,10 +265,24 @@ class LinksProvider(BaseProvider):
             "--no-warnings",
             "--newline",
             "--progress",
+            "-N", "8",
             "-o",
             out_tpl,
-            url
         ]
+
+        if headers:
+            for k, v in headers.items():
+                if not v:
+                    continue
+                k_low = str(k).lower()
+                if k_low == "referer":
+                    cmd.extend(["--referer", str(v)])
+                elif k_low == "user-agent":
+                    cmd.extend(["--user-agent", str(v)])
+                elif k_low not in ("host", "content-length"):
+                    cmd.extend(["--add-header", f"{k}: {v}"])
+
+        cmd.append(url)
         progress.log(f"Starting yt-dlp download for: {url}")
 
         process = await asyncio.create_subprocess_exec(
@@ -358,6 +377,10 @@ class LinksProvider(BaseProvider):
         if expected_size and len(urls) > 1:
             urls = await self._filter_urls_by_size(urls, expected_size)
 
+        headers = file_ref.get("headers") or (file_ref.get("meta") or {}).get("headers") or {}
+        if not isinstance(headers, dict):
+            headers = {}
+
         raw_name = file_ref.get("name") or (local_path.name if local_path.suffix else "")
         name = safe_name(raw_name) if raw_name else None
         link_type = self._classify_link(url)
@@ -373,11 +396,17 @@ class LinksProvider(BaseProvider):
         elif link_type == "mediafire":
             downloaded = await self._download_mediafire(url, dest_dir, name, progress)
         elif link_type == "ytdlp":
-            downloaded = await self._download_ytdlp(url, dest_dir, name, progress)
+            try:
+                downloaded = await self._download_ytdlp(url, dest_dir, name, progress, headers=headers)
+            except TypeError:
+                downloaded = await self._download_ytdlp(url, dest_dir, name, progress)
         elif link_type == "gdrive":
             downloaded = await self._download_gdrive(url, dest_dir, name, progress)
         else:
-            downloaded = await self._download_aria2(urls, dest_dir, name, progress)
+            try:
+                downloaded = await self._download_aria2(urls, dest_dir, name, progress, headers=headers)
+            except TypeError:
+                downloaded = await self._download_aria2(urls, dest_dir, name, progress)
 
         if not downloaded:
             raise ProviderFailure("DOWNLOAD_FAILED", "Download completed but no files found on disk")
