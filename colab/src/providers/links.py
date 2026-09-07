@@ -179,7 +179,7 @@ class LinksProvider(BaseProvider):
                     progress,
                     headers=self._http_headers(headers),
                     auth_fail_code="DOWNLOAD_FAILED",
-                    auth_fail_message="Direct link rejected the browser headers; copy a fresh payload from VaultBox Sniffer",
+                    auth_fail_message="Direct link rejected Colab; this host likely binds the URL to the original browser/IP",
                 )]
             except ProviderFailure as exc:
                 last = exc

@@ -411,7 +411,7 @@ def test_links_provider_direct_403_is_download_failed(tmp_path, monkeypatch):
         asyncio.run(provider.download_file({}, {"id": "https://cdn.example/video.mp4", "name": "video.mp4", "type": "mp4", "headers": {"Referer": "https://site.test/"}}, tmp_path, JobState("links-403", {})))
     except ProviderFailure as exc:
         assert exc.code == "DOWNLOAD_FAILED"
-        assert "copy a fresh payload" in exc.message
+        assert "original browser/IP" in exc.message
         assert exc.details["status"] == 403
     else:
         raise AssertionError("expected direct 403 failure")
