@@ -175,7 +175,7 @@ class TeraBoxSession:
                 # Verification still demanded after a token refresh: recoverable, so the caller
                 # retries on a delay instead of failing the whole job.
                 raise ProviderFailure("PROVIDER_NEEDS_VERIFY", f"TeraBox wants verification ({context})", {"errno": code, "body": data})
-            failure_code = "UPLOAD_FAILED" if any(token in context for token in ("upload", "precreate", "create folder")) else "DOWNLOAD_FAILED"
+            failure_code = "UPLOAD_FAILED" if any(token in context for token in ("upload", "precreate", "create folder", "rename", "filemanager")) else "DOWNLOAD_FAILED"
             raise ProviderFailure(failure_code, f"TeraBox API error ({context})", {"errno": code, "body": data})
         return data
 
@@ -530,7 +530,16 @@ class TeraBoxProvider(BaseProvider):
             else:
                 options["replace"] = old_replace
         if new_name != old_name:
-            await s.request_json("POST", f"{s.base}/api/filemanager", context=f"rename {source_path}", params=s.params(opera="rename", ondup="fail"), data={
-                "filelist": json.dumps([{"path": source_path, "newname": new_name}], ensure_ascii=False),
-            }, headers={**s.headers(), "Content-Type": "application/x-www-form-urlencoded"})
+            for attempt in range(3):
+                progress.check_cancelled()
+                try:
+                    await s.request_json("POST", f"{s.base}/api/filemanager", context=f"rename {source_path}", params=s.params(opera="rename", ondup="fail"), data={
+                        "filelist": json.dumps([{"path": source_path, "newname": new_name}], ensure_ascii=False),
+                    }, headers={**s.headers(), "Content-Type": "application/x-www-form-urlencoded"})
+                    break
+                except ProviderFailure as exc:
+                    if exc.code != "UPLOAD_FAILED" or attempt == 2:
+                        raise
+                    progress.log(f"[RETRY {attempt + 1}/2] Rename failed ({exc.message}); retrying {new_name}")
+                    await asyncio.sleep(0.5 * (attempt + 1))
         return {"ok": True, "old_path": source_path, "new_name": new_name}
