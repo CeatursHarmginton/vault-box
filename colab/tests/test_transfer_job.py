@@ -1936,6 +1936,58 @@ class TransferJobTests(TestCase):
         self.assertEqual(job.status, "completed", job.error)
         self.assertEqual(events, [("a", "a.jpg"), ("a", "b.jpg"), ("b", "b.jpg")])
 
+    def test_optimized_rename_failure_skips_item_and_continues_queue(self):
+        events = []
+
+        class Source:
+            async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
+                path = local_dir / file_ref["name"]
+                path.write_bytes(b"x")
+                return path
+
+        class Dst:
+            async def replace_file(self, credentials, local_path, source_ref, progress):
+                events.append(local_path.name)
+                if local_path.name == "b.jpg":
+                    raise ProviderFailure("UPLOAD_FAILED", "TeraBox API error (rename /root/b.jpg)")
+                return {"ok": True}
+
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                raise AssertionError("replace expected")
+
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            src = next(input_dir.rglob("*.jpg"))
+            out = output_dir / src.name
+            out.write_bytes(b"x")
+            return [{"name": src.name, "source_name": src.name, "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95}]
+        PROVIDERS.update({"fake-source": Source(), "fake-dst": Dst()})
+        image_optimizer.optimize_directory = fake_optimize
+        try:
+            job = JobState("opt-rename-skip", {
+                "source": {"provider": "fake-source", "items": [
+                    {"type": "file", "id": "/root/a.jpg", "path": "/root/a.jpg", "name": "a.jpg", "accountId": "a"},
+                    {"type": "file", "id": "/root/b.jpg", "path": "/root/b.jpg", "name": "b.jpg", "accountId": "b"},
+                    {"type": "file", "id": "/root/c.jpg", "path": "/root/c.jpg", "name": "c.jpg", "accountId": "c"},
+                ]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True, "confirm_action": "replace"},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-rename-skip")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(events, ["a.jpg", "b.jpg", "c.jpg"])
+        self.assertEqual([entry["id"] for entry in job.failed_items], ["/root/b.jpg"])
+        self.assertEqual([entry["id"] for entry in job.completed_items], ["/root/a.jpg", "/root/c.jpg"])
+        self.assertNotEqual(job.status, "waiting_target_account")
+        self.assertTrue(any("Skipped (rename failed): b.jpg" in line for line in job.logs), job.logs)
+
     def test_optimized_batches_cleanup_only_uploaded_item_on_failure(self):
         from src.utils.temp_storage import cleanup_job, job_dirs
 

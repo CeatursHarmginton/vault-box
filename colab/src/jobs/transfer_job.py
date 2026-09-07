@@ -340,7 +340,7 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         await _upload_outputs_with_retry(job, item_target, options, item_dst, upload_root, upload_item)
         shutil.rmtree(batch_input, ignore_errors=True)
         shutil.rmtree(batch_output.parent, ignore_errors=True)
-        if not item_failed:
+        if not item_failed and not _item_is_failed(job, source, item):
             job.completed_items.append(_queue_item_ref(source, item))
 
     if not job.optimized_files and job.files_skipped:
@@ -508,6 +508,13 @@ async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options
             job.log(f"[{job._upload_log_done}/{getattr(job, '_upload_log_total', job.files_to_upload)}] Uploaded: {path.name}")
             return
         except ProviderFailure as exc:
+            if _is_rename_failure(exc):
+                failed_ref = item if (item.get("id") or item.get("path") or item.get("relay")) else (source_ref or item)
+                _mark_item_skipped(job, job.payload.get("source") or {}, failed_ref, exc.message)
+                job.files_skipped += 1
+                job._upload_log_done = getattr(job, "_upload_log_done", 0) + 1
+                job.log(f"[{job._upload_log_done}/{getattr(job, '_upload_log_total', job.files_to_upload)}] Skipped (rename failed): {path.name}")
+                return
             auto_replace = bool(options.get("_auto_confirm_upload_new")) and not options.get("replace")
             if not auto_replace:
                 if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
@@ -533,6 +540,13 @@ async def _upload_one_with_retry(job: JobState, target: dict[str, Any], options:
             job.log(f"[1/1] Uploaded: {path.name}")
             return result
         except ProviderFailure as exc:
+            if _is_rename_failure(exc):
+                source = (job.payload.get("source") or {}).get("items") or []
+                if source:
+                    _mark_item_skipped(job, job.payload.get("source") or {}, source[0], exc.message)
+                job.files_skipped = 1
+                job.log(f"[1/1] Skipped (rename failed): {path.name}")
+                return {"ok": True, "uploaded": 0, "skipped": 1, "items": []}
             if _fallback_auto_upload_new_to_replace(job, options, exc):
                 continue
             if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
@@ -565,6 +579,14 @@ def _fallback_auto_upload_new_to_replace(job: JobState, options: dict[str, Any],
     options.pop("upload_prefix", None)
     job.log(f"Auto upload_new failed ({exc.message}); retrying with replace.")
     return True
+
+def _is_rename_failure(exc: ProviderFailure) -> bool:
+    return exc.code == "UPLOAD_FAILED" and "rename" in f"{exc.message} {exc.details}".lower()
+
+def _item_is_failed(job: JobState, source: dict[str, Any], item: dict[str, Any]) -> bool:
+    ref = _queue_item_ref(source, item)
+    key = (str(ref.get("provider") or ""), str(ref.get("accountId") or ref.get("account_id") or ""), str(ref.get("id") or ""))
+    return any((str(f.get("provider") or ""), str(f.get("accountId") or f.get("account_id") or ""), str(f.get("id") or "")) == key for f in job.failed_items)
 
 async def _wait_for_retry_account(job: JobState, target: dict[str, Any], exc: ProviderFailure) -> None:
     job.error = {"code": exc.code, "message": exc.message, "details": exc.details}
