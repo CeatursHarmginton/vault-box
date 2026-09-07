@@ -156,7 +156,7 @@ def test_links_provider_filters_small_preview_urls_before_aria2(tmp_path, monkey
         out.write_bytes(b"x" * 100)
         return [out]
 
-    async def fake_probe(url):
+    async def fake_probe(url, headers=None):
         return (url, 10 if "preview" in url else 100, 1.0)
 
     async def no_deps():
@@ -182,7 +182,7 @@ def test_links_provider_ranks_full_size_urls_by_probe_speed(tmp_path, monkeypatc
         out.write_bytes(b"x" * 100)
         return [out]
 
-    async def fake_probe(url):
+    async def fake_probe(url, headers=None):
         return (url, 100, 10.0 if "fast" in url else 1.0)
 
     async def no_deps():
@@ -320,6 +320,81 @@ def test_links_provider_aria2_passes_custom_headers(tmp_path, monkeypatch):
 
     assert out.name == "download.zip"
     assert seen["headers"]["Cookie"] == "session=abc123xyz"
+
+def test_links_provider_sniffer_mp4_uses_stream_download(tmp_path, monkeypatch):
+    provider = LinksProvider()
+    seen = {}
+
+    async def no_deps():
+        return None
+
+    async def fail_aria2(*args, **kwargs):
+        raise AssertionError("aria2 should not be used for browser-bound media")
+
+    async def fake_stream(url, dest, progress, *, headers=None, phase="download", on_verify=None):
+        seen.update({"url": url, "dest": dest, "headers": headers})
+        dest.write_text("video-ok")
+        return dest
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr(provider, "_download_aria2", fail_aria2)
+    monkeypatch.setattr("src.providers.links.stream_download", fake_stream)
+
+    payload = {
+        "id": "https://cdn.example/video.mp4?sig=1",
+        "name": "video.mp4",
+        "type": "mp4",
+        "headers": {
+            "Origin": "https://miixdrop.top",
+            "Referer": "https://miixdrop.top/",
+            "User-Agent": "VaultBoxSniffer/1.0",
+        },
+    }
+    out = asyncio.run(provider.download_file({}, payload, tmp_path, JobState("links-sniffer-mp4", {})))
+
+    assert out.name == "video.mp4"
+    assert seen["url"] == payload["id"]
+    assert seen["headers"]["Referer"] == "https://miixdrop.top/"
+    assert seen["headers"]["Accept-Encoding"] == "identity"
+
+def test_links_provider_aria2_code_22_falls_back_to_stream_download(tmp_path, monkeypatch):
+    provider = LinksProvider()
+    seen = {}
+
+    async def no_deps():
+        return None
+
+    async def fake_aria2(*args, **kwargs):
+        raise ProviderFailure("DOWNLOAD_FAILED", "aria2c exited with code 22")
+
+    async def fake_stream(url, dest, progress, *, headers=None, phase="download", on_verify=None):
+        seen["headers"] = headers
+        dest.write_text("ok")
+        return dest
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr(provider, "_download_aria2", fake_aria2)
+    monkeypatch.setattr("src.providers.links.stream_download", fake_stream)
+
+    out = asyncio.run(provider.download_file({}, {"id": "https://example.com/file.zip", "name": "file.zip"}, tmp_path, JobState("links-aria2-fallback", {})))
+
+    assert out.name == "file.zip"
+    assert seen["headers"]["Accept-Encoding"] == "identity"
+
+def test_links_provider_size_probe_passes_headers(tmp_path, monkeypatch):
+    provider = LinksProvider()
+    seen = []
+
+    async def fake_probe(url, headers=None):
+        seen.append((url, headers))
+        return (url, 100, 1.0)
+
+    monkeypatch.setattr(provider, "_probe_url", fake_probe)
+
+    urls = ["https://slow.example/file.bin", "https://fast.example/file.bin"]
+    asyncio.run(provider._filter_urls_by_size(urls, 100, {"Referer": "https://site.test/"}))
+
+    assert seen == [(urls[0], {"Referer": "https://site.test/"}), (urls[1], {"Referer": "https://site.test/"})]
 
 def test_links_provider_reads_aria2_carriage_return_progress(tmp_path, monkeypatch):
     provider = LinksProvider()

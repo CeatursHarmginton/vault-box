@@ -14,7 +14,7 @@ from urllib.parse import unquote, urlparse
 
 import httpx
 
-from ..providers.base import BaseProvider, ProviderFailure, safe_name
+from ..providers.base import BaseProvider, ProviderFailure, safe_name, stream_download
 from ..jobs.progress import JobState
 
 BT_TRACKERS = "udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,udp://tracker.openbittorrent.com:6969/announce,udp://exodus.desync.com:6969/announce"
@@ -107,12 +107,23 @@ class LinksProvider(BaseProvider):
                 pass
         return None
 
-    async def _remote_size(self, url: str) -> int:
+    def _http_headers(self, headers: dict[str, str] | None, *, range_header: str | None = None) -> dict[str, str]:
+        out = {str(k): str(v) for k, v in (headers or {}).items() if v and str(k).lower() not in ("host", "content-length")}
+        out.setdefault("Accept-Encoding", "identity")
+        if range_header:
+            out["Range"] = range_header
+        return out
+
+    def _needs_browser_stream(self, headers: dict[str, str], file_ref: dict[str, Any]) -> bool:
+        keys = {str(k).lower() for k in headers}
+        return bool(keys & {"origin", "referer"} or any(k.startswith(("sec-fetch-", "sec-ch-")) for k in keys) or str(file_ref.get("type") or "").lower() in {"mp4", "video"})
+
+    async def _remote_size(self, url: str, headers: dict[str, str] | None = None) -> int:
         try:
             async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as client:
-                resp = await client.head(url)
+                resp = await client.head(url, headers=self._http_headers(headers))
                 if resp.status_code >= 400:
-                    async with client.stream("GET", url, headers={"Range": "bytes=0-0"}) as streamed:
+                    async with client.stream("GET", url, headers=self._http_headers(headers, range_header="bytes=0-0")) as streamed:
                         resp = streamed
                         content_range = resp.headers.get("Content-Range") or resp.headers.get("content-range") or ""
                         match = re.search(r"/(\d+)$", content_range)
@@ -127,19 +138,19 @@ class LinksProvider(BaseProvider):
         except Exception:
             return 0
 
-    async def _filter_urls_by_size(self, urls: list[str], expected_size: int) -> list[str]:
-        probes = await asyncio.gather(*(self._probe_url(url) for url in urls))
+    async def _filter_urls_by_size(self, urls: list[str], expected_size: int, headers: dict[str, str] | None = None) -> list[str]:
+        probes = await asyncio.gather(*(self._probe_url(url, headers) for url in urls))
         filtered = [probe for probe in probes if not probe[1] or probe[1] >= expected_size]
         filtered.sort(key=lambda probe: probe[2], reverse=True)
         return [probe[0] for probe in filtered] or urls
 
-    async def _probe_url(self, url: str) -> tuple[str, int, float]:
-        size = await self._remote_size(url)
+    async def _probe_url(self, url: str, headers: dict[str, str] | None = None) -> tuple[str, int, float]:
+        size = await self._remote_size(url, headers)
         started = time.monotonic()
         read = 0
         try:
             async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
-                async with client.stream("GET", url, headers={"Range": "bytes=0-2097151"}) as resp:
+                async with client.stream("GET", url, headers=self._http_headers(headers, range_header="bytes=0-2097151")) as resp:
                     async for chunk in resp.aiter_bytes():
                         read += len(chunk)
                         if read >= 2 * 1024 * 1024:
@@ -154,6 +165,19 @@ class LinksProvider(BaseProvider):
             pass
         elapsed = max(time.monotonic() - started, 0.001)
         return url, size, read / elapsed
+
+    async def _download_http_stream(self, url: str | list[str], dest_dir: Path, name: str | None, progress: JobState, headers: dict[str, str] | None = None) -> list[Path]:
+        urls = [str(item) for item in (url if isinstance(url, list) else [url]) if str(item or "")]
+        last: ProviderFailure | None = None
+        for one in urls:
+            out_name = name or safe_name(unquote(Path(urlparse(one).path).name) or "download")
+            try:
+                return [await stream_download(one, dest_dir / out_name, progress, headers=self._http_headers(headers))]
+            except ProviderFailure as exc:
+                last = exc
+        if last:
+            raise last
+        raise ProviderFailure("DOWNLOAD_FAILED", "No URL provided")
 
     async def _download_aria2(self, url: str | list[str], dest_dir: Path, name: str | None, progress: JobState, headers: dict[str, str] | None = None) -> list[Path]:
         urls = [str(item) for item in (url if isinstance(url, list) else [url]) if str(item or "")]
@@ -374,12 +398,11 @@ class LinksProvider(BaseProvider):
             expected_size = int(file_ref.get("size") or file_ref.get("file_size") or file_ref.get("bytes") or 0)
         except (TypeError, ValueError):
             expected_size = 0
-        if expected_size and len(urls) > 1:
-            urls = await self._filter_urls_by_size(urls, expected_size)
-
         headers = file_ref.get("headers") or (file_ref.get("meta") or {}).get("headers") or {}
         if not isinstance(headers, dict):
             headers = {}
+        if expected_size and len(urls) > 1:
+            urls = await self._filter_urls_by_size(urls, expected_size, headers)
 
         raw_name = file_ref.get("name") or (local_path.name if local_path.suffix else "")
         name = safe_name(raw_name) if raw_name else None
@@ -403,10 +426,18 @@ class LinksProvider(BaseProvider):
         elif link_type == "gdrive":
             downloaded = await self._download_gdrive(url, dest_dir, name, progress)
         else:
-            try:
-                downloaded = await self._download_aria2(urls, dest_dir, name, progress, headers=headers)
-            except TypeError:
-                downloaded = await self._download_aria2(urls, dest_dir, name, progress)
+            if self._needs_browser_stream(headers, file_ref):
+                downloaded = await self._download_http_stream(urls, dest_dir, name, progress, headers=headers)
+            else:
+                try:
+                    downloaded = await self._download_aria2(urls, dest_dir, name, progress, headers=headers)
+                except TypeError:
+                    downloaded = await self._download_aria2(urls, dest_dir, name, progress)
+                except ProviderFailure as exc:
+                    if "code 22" not in exc.message:
+                        raise
+                    progress.log("aria2c failed; retrying browser-compatible downloader")
+                    downloaded = await self._download_http_stream(urls, dest_dir, name, progress, headers=headers)
 
         if not downloaded:
             raise ProviderFailure("DOWNLOAD_FAILED", "Download completed but no files found on disk")
