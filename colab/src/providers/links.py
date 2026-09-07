@@ -172,6 +172,7 @@ class LinksProvider(BaseProvider):
         for one in urls:
             out_name = name or safe_name(unquote(Path(urlparse(one).path).name) or "download")
             try:
+                progress.log(f"Starting browser-compatible download: {out_name}")
                 return [await stream_download(one, dest_dir / out_name, progress, headers=self._http_headers(headers))]
             except ProviderFailure as exc:
                 last = exc

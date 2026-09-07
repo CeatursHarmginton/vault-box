@@ -2119,6 +2119,50 @@ class TransferJobTests(TestCase):
         finally:
             base_mod.httpx.AsyncClient = old_client
 
+    def test_stream_download_times_out_as_download_failed(self):
+        class Stream:
+            status_code = 200
+            headers = {"content-length": "10"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_bytes(self, size):
+                if False:
+                    yield b""
+                raise base_mod.httpx.ReadTimeout("stalled")
+
+        class Client:
+            def __init__(self, *args, **kwargs):
+                return None
+
+            def stream(self, method, url, headers):
+                return Stream()
+
+        async def no_sleep(delay):
+            return None
+
+        old_client = base_mod.httpx.AsyncClient
+        old_sleep = base_mod.asyncio.sleep
+        base_mod.httpx.AsyncClient = Client
+        base_mod.asyncio.sleep = no_sleep
+        try:
+            with __import__("tempfile").TemporaryDirectory() as tmp:
+                dest = Path(tmp) / "file.bin"
+                with self.assertRaises(ProviderFailure) as ctx:
+                    asyncio.run(base_mod.stream_download("https://example.test/file", dest, JobState("timeout", {})))
+                self.assertEqual(ctx.exception.code, "DOWNLOAD_FAILED")
+                self.assertIn("Download stalled", ctx.exception.message)
+        finally:
+            base_mod.httpx.AsyncClient = old_client
+            base_mod.asyncio.sleep = old_sleep
+
     def test_stream_download_verifies_and_retries_on_need_verify(self):
         error_body = b'{"errmsg":"need verify","errno":400141}'
         urls: list[str] = []

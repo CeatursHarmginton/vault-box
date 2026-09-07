@@ -83,6 +83,7 @@ VERIFY_HINTS = ("need verify", "verify", "captcha", "risk control", "token expir
 VERIFY_ROUNDS = 3
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_RETRY_DELAY = 10.0
+DOWNLOAD_READ_TIMEOUT = 60.0
 # Failures where the bytes are probably still fetchable later: retry, then skip the item.
 RETRYABLE_DOWNLOAD_CODES = {"DOWNLOAD_FAILED", "PROVIDER_NEEDS_VERIFY", "PROVIDER_RATE_LIMITED"}
 SKIPPABLE_DOWNLOAD_CODES = RETRYABLE_DOWNLOAD_CODES | {"SOURCE_FILE_NOT_FOUND"}
@@ -259,7 +260,7 @@ async def stream_download(url: str, dest: Path, progress: JobState, *, headers: 
             if done:
                 req_headers["Range"] = f"bytes={done}-"
             try:
-                client = shared_client("download", timeout=None, follow_redirects=True)
+                client = shared_client("download", timeout=httpx.Timeout(None, connect=30.0, read=DOWNLOAD_READ_TIMEOUT, write=60.0, pool=30.0), follow_redirects=True)
                 async with client.stream("GET", url, headers=req_headers) as resp:
                     if resp.status_code in (401, 403):
                         raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Provider rejected download credentials")
@@ -281,6 +282,12 @@ async def stream_download(url: str, dest: Path, progress: JobState, *, headers: 
                 raise RuntimeError(f"Download incomplete: got {part.stat().st_size} bytes, expected {expected}")
             except ProviderFailure:
                 raise
+            except httpx.TimeoutException as exc:
+                last_exc = exc
+                if attempt == 4:
+                    raise ProviderFailure("DOWNLOAD_FAILED", f"Download stalled for {int(DOWNLOAD_READ_TIMEOUT)}s: {dest.name}") from exc
+                progress.log(f"[RETRY] Download stalled, resuming: {dest.name}")
+                await asyncio.sleep(min(2 ** attempt, 8))
             except Exception as exc:
                 last_exc = exc
                 if attempt == 4:
