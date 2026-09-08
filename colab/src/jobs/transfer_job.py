@@ -246,18 +246,36 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
     action: str | None = None
     for index, item in enumerate(source.get("items") or []):
         job.check_cancelled()
+        item_ref = _queue_item_ref(source, item)
+        item_k = _queue_item_key(source, item)
+        item_name_str = _item_name(item)
         item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
         if item_type != "folder" and _is_video_item(item):
             job.files_skipped += 1
             job.log(f"[SKIP] Video ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
-            job.completed_items.append(_queue_item_ref(source, item))
+            job.finish_item(item_k, status="skipped", name=item_name_str)
+            timing = job.item_timings.get(item_k) or {}
+            job.completed_items.append({
+                **item_ref,
+                "startTime": timing.get("startTime"),
+                "endTime": timing.get("endTime"),
+                "duration": timing.get("duration"),
+            })
             continue
         if item_type != "folder" and not options.get("extract") and _is_archive_item(item):
             job.files_skipped += 1
             job.log(f"[SKIP] Archive ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
-            job.completed_items.append(_queue_item_ref(source, item))
+            job.finish_item(item_k, status="skipped", name=item_name_str)
+            timing = job.item_timings.get(item_k) or {}
+            job.completed_items.append({
+                **item_ref,
+                "startTime": timing.get("startTime"),
+                "endTime": timing.get("endTime"),
+                "duration": timing.get("duration"),
+            })
             continue
 
+        job.start_item(item_k, name=item_name_str)
         batch_input = dirs["input"] / f"batch-{index}"
         batch_output = dirs["output"] / f"batch-{index}" / "optimized"
         batch_input.mkdir(parents=True, exist_ok=True)
@@ -283,7 +301,14 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
             shutil.rmtree(batch_input, ignore_errors=True)
             shutil.rmtree(batch_output.parent, ignore_errors=True)
             if not item_failed:
-                job.completed_items.append(_queue_item_ref(source, item))
+                job.finish_item(item_k, status="done", name=item_name_str)
+                timing = job.item_timings.get(item_k) or {}
+                job.completed_items.append({
+                    **item_ref,
+                    "startTime": timing.get("startTime"),
+                    "endTime": timing.get("endTime"),
+                    "duration": timing.get("duration"),
+                })
             continue
         _validate_downloads(downloaded, batch_input)
         job.log(f"Downloaded files: {len(downloaded)}")
@@ -309,7 +334,14 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
             shutil.rmtree(batch_input, ignore_errors=True)
             shutil.rmtree(batch_output.parent, ignore_errors=True)
             if not item_failed:
-                job.completed_items.append(_queue_item_ref(source, item))
+                job.finish_item(item_k, status="done", name=item_name_str)
+                timing = job.item_timings.get(item_k) or {}
+                job.completed_items.append({
+                    **item_ref,
+                    "startTime": timing.get("startTime"),
+                    "endTime": timing.get("endTime"),
+                    "duration": timing.get("duration"),
+                })
             continue
 
         if batch_results and action is None:
@@ -341,7 +373,14 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         shutil.rmtree(batch_input, ignore_errors=True)
         shutil.rmtree(batch_output.parent, ignore_errors=True)
         if not item_failed and not _item_is_failed(job, source, item):
-            job.completed_items.append(_queue_item_ref(source, item))
+            job.finish_item(item_k, status="done", name=item_name_str)
+            timing = job.item_timings.get(item_k) or {}
+            job.completed_items.append({
+                **item_ref,
+                "startTime": timing.get("startTime"),
+                "endTime": timing.get("endTime"),
+                "duration": timing.get("duration"),
+            })
 
     if not job.optimized_files and job.files_skipped:
         job.log("No image files found for optimization.")
@@ -392,18 +431,47 @@ def _mark_item_skipped(job: JobState, source: dict[str, Any], item: dict[str, An
     key = (str(ref.get("provider") or ""), str(ref.get("accountId") or ref.get("account_id") or ""), str(ref.get("id") or ""))
     if any((str(f.get("provider") or ""), str(f.get("accountId") or f.get("account_id") or ""), str(f.get("id") or "")) == key for f in job.failed_items):
         return
-    job.failed_items.append({**ref, "name": _item_name(item), "reason": reason})
+    item_k = _queue_item_key(source, item)
+    job.finish_item(item_k, status="skipped", name=_item_name(item))
+    timing = job.item_timings.get(item_k) or {}
+    job.failed_items.append({
+        **ref,
+        "name": _item_name(item),
+        "reason": reason,
+        "startTime": timing.get("startTime"),
+        "endTime": timing.get("endTime"),
+        "duration": timing.get("duration"),
+    })
     job.log(f"[SKIP] Kept in queue, moving to the next item: {_item_name(item)} ({reason})")
 
 def _mark_remaining_items_completed(job: JobState, source: dict[str, Any]) -> None:
     """Name every item that was not skipped, so the queue drops exactly those."""
     seen = {(str(entry.get("provider") or ""), str(entry.get("accountId") or entry.get("account_id") or ""), str(entry.get("id") or "")) for entry in (*job.failed_items, *job.completed_items)}
+    unseen_items = []
     for item in source.get("items") or []:
         ref = _queue_item_ref(source, item)
         key = (str(ref.get("provider") or ""), str(ref.get("accountId") or ref.get("account_id") or ""), str(ref.get("id") or ""))
         if key not in seen:
-            job.completed_items.append(ref)
+            unseen_items.append((item, ref, key))
             seen.add(key)
+
+    if not unseen_items:
+        return
+
+    now = time.time()
+    elapsed = max(1.0, now - float(job.created_at or now))
+    avg_dur = max(0.1, round(elapsed / len(unseen_items), 2))
+
+    for item, ref, _ in unseen_items:
+        item_k = _queue_item_key(source, item)
+        job.finish_item(item_k, status="done", name=_item_name(item), duration=avg_dur)
+        timing = job.item_timings.get(item_k) or {}
+        job.completed_items.append({
+            **ref,
+            "startTime": timing.get("startTime"),
+            "endTime": timing.get("endTime"),
+            "duration": timing.get("duration"),
+        })
 
 def _log_skip_summary(job: JobState) -> None:
     if not job.failed_items:
@@ -696,6 +764,14 @@ def _queue_item_ref(source: dict[str, Any], item: dict[str, Any]) -> dict[str, A
         ref["accountId"] = account
         ref["account_id"] = account
     return ref
+
+def _queue_item_key(source: dict[str, Any], item: dict[str, Any]) -> str:
+    provider = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
+    account = str(item.get("accountId") or item.get("account_id") or (item.get("meta") or {}).get("accountId") or (item.get("meta") or {}).get("account_id") or source.get("accountId") or source.get("account_id") or "")
+    relay = item.get("relay") if isinstance(item.get("relay"), dict) else {}
+    original = relay.get("sourcePath") or relay.get("sourceId")
+    item_id = str(original or item.get("id") or item.get("path") or item.get("name") or "")
+    return f"{provider}:{account}:{item_id}"
 
 def _is_video_item(item: dict[str, Any]) -> bool:
     return Path(str(item.get("name") or item.get("path") or item.get("id") or "")).suffix.lower() in VIDEO_EXTENSIONS

@@ -52,6 +52,43 @@ class JobState:
     completed_items: list[dict[str, Any]] = field(default_factory=list)
     failed_items: list[dict[str, Any]] = field(default_factory=list)
     failed_files: list[dict[str, Any]] = field(default_factory=list)
+    item_timings: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _last_item_end_time: float | None = field(default=None, compare=False, hash=False)
+
+    def start_item(self, key: str, name: str = "") -> None:
+        now = time.time()
+        timing = {
+            "startTime": now,
+            "endTime": None,
+            "duration": 0,
+            "status": "active",
+            "name": name,
+        }
+        self.item_timings[key] = timing
+        if name and name not in self.item_timings:
+            self.item_timings[name] = timing
+        self.updated_at = now
+
+    def finish_item(self, key: str, status: str = "done", name: str = "", duration: float | None = None) -> None:
+        now = time.time()
+        existing = self.item_timings.get(key) or (self.item_timings.get(name) if name else {}) or {}
+        start_t = float(existing.get("startTime") or getattr(self, "_last_item_end_time", None) or self.created_at or (now - 1.0))
+        if duration is not None and duration > 0:
+            dur = round(duration, 2)
+        else:
+            dur = max(0.1, round(now - start_t, 2))
+        timing = {
+            "startTime": start_t,
+            "endTime": now,
+            "duration": dur,
+            "status": status,
+            "name": name or existing.get("name", ""),
+        }
+        self.item_timings[key] = timing
+        if name:
+            self.item_timings[name] = timing
+        self._last_item_end_time = now
+        self.updated_at = now
 
     def log(self, message: str) -> None:
         self.logs.append(message)
@@ -143,6 +180,7 @@ class JobState:
             "completedItems": self.completed_items,
             "failedItems": self.failed_items,
             "failedFiles": self.failed_files[-50:],
+            "itemTimings": self.item_timings,
             "confirmAction": self.confirm_action,
             # Source item list, so the app can rebuild the per-item queue view after a
             # restart or when it reconnects to a job it did not start itself.
