@@ -291,13 +291,15 @@ class ImageOptimizerTests(TestCase):
         self.assertGreaterEqual(results[0]["quality"], image_optimizer.MIN_QUALITY)
 
     def test_quality_options_below_min_are_raised_to_min(self) -> None:
-        self.assertEqual(image_optimizer.clamp_quality(10), 65)
-        self.assertEqual(image_optimizer.clamp_quality(0), 65)
-        self.assertEqual(image_optimizer.clamp_quality(-5), 65)
-        self.assertEqual(image_optimizer.clamp_quality("40"), 65)
+        self.assertEqual(image_optimizer.clamp_quality(10), 50)
+        self.assertEqual(image_optimizer.clamp_quality(0), 50)
+        self.assertEqual(image_optimizer.clamp_quality(-5), 50)
+        self.assertEqual(image_optimizer.clamp_quality("40"), 50)
         self.assertEqual(image_optimizer.clamp_quality(None), 95)
         self.assertEqual(image_optimizer.clamp_quality(80), 80)
         self.assertEqual(image_optimizer.clamp_quality(140), 100)
+        self.assertEqual(image_optimizer.clamp_quality(10, min_quality=1), 10)
+        self.assertEqual(image_optimizer.option_min_quality({"min_quality": 30}), 30)
 
         src = self.src_dir / "tiny.png"
         Image.new("RGB", (30, 30), color="blue").save(src, "PNG")
@@ -313,6 +315,7 @@ class ImageOptimizerTests(TestCase):
                 "max_target_mb": 0.0,
                 "quality": 20,
                 "start_quality": 30,
+                "min_quality": 30,
                 "auto_size": False,
                 "optimize_workers": 1,
             }, MockJobState())
@@ -320,7 +323,7 @@ class ImageOptimizerTests(TestCase):
             image_optimizer.compress_image = old
 
         self.assertTrue(used)
-        self.assertTrue(all(q >= 65 for q in used), used)
+        self.assertTrue(all(q >= 30 for q in used), used)
 
     def test_optimizer_ignores_its_own_output_inside_the_input_tree(self) -> None:
         (self.src_dir / "keep.txt").write_text("ok")

@@ -31,9 +31,8 @@ except ImportError:
 VIPS_CLI_AVAILABLE = shutil.which("vips") is not None
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts", ".3gp", ".flv", ".mpeg", ".mpg", ".wmv"}
-# Hard floor for JPEG quality: below this the artefacts are worse than an oversized file,
-# so the descent stops here even when the size target is still not met.
-MIN_QUALITY = 65
+# Default floor for JPEG quality; callers can lower it with min_quality.
+MIN_QUALITY = 50
 
 OPTIMIZED_TAG_KEY = "VaultBox_Optimized"
 OPTIMIZED_TAG_VALUE = "true"
@@ -41,12 +40,20 @@ OPTIMIZED_EXIF_DESC = "VaultBox_Optimized:true"
 EXIF_IMAGE_DESCRIPTION = 0x010E
 EXIF_USER_COMMENT = 0x9286
 
-def clamp_quality(value: Any, default: int = 95) -> int:
+def clamp_quality(value: Any, default: int = 95, min_quality: int = MIN_QUALITY) -> int:
     try:
         q = int(float(value))
     except (TypeError, ValueError):
         q = default
-    return max(MIN_QUALITY, min(100, q))
+    try:
+        floor = int(float(min_quality))
+    except (TypeError, ValueError):
+        floor = MIN_QUALITY
+    floor = max(1, min(100, floor))
+    return max(floor, min(100, q))
+
+def option_min_quality(options: dict[str, Any]) -> int:
+    return clamp_quality(options.get("min_quality", MIN_QUALITY), MIN_QUALITY, 1)
 
 def is_image_already_optimized(path: Path) -> bool:
     """
@@ -137,11 +144,11 @@ def _optimize_workers(options: dict[str, Any], image_count: int) -> int:
 def compress_image(src_path: Path, dest_path: Path, q: int, scale: float = 1.0) -> bool:
     """
     Compresses an image to JPEG format using pyvips, PIL, or vips CLI fallback.
-    Quality is clamped to MIN_QUALITY..100 — no caller may encode below the floor.
+    Quality is clamped to JPEG's valid 1..100 range.
     Embeds optimization metadata into the output image.
     Returns True if successful, False otherwise.
     """
-    q = clamp_quality(q)
+    q = clamp_quality(q, min_quality=1)
     if PYVIPS_AVAILABLE:
         try:
             img = pyvips.Image.new_from_file(str(src_path))
@@ -215,7 +222,8 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
     Optimizes a single image file based on size target.
     Returns: (output_path, final_quality, status_message)
     """
-    quality = clamp_quality(options.get("quality", 85), 85)
+    min_quality = option_min_quality(options)
+    quality = clamp_quality(options.get("quality", 85), 85, min_quality)
 
     # 0. Skip if already optimized and force_reoptimize is not set
     if not options.get("force_reoptimize", False) and is_image_already_optimized(src_path):
@@ -224,7 +232,7 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
 
     min_target = int(float(options.get("min_target_mb", 1.0)) * 1024 * 1024)
     max_target = int(float(options.get("max_target_mb", 3.0)) * 1024 * 1024)
-    start_quality = clamp_quality(options.get("start_quality", 95))
+    start_quality = clamp_quality(options.get("start_quality", 95), 95, min_quality)
     auto_size = options.get("auto_size", True)
     scale = float(options.get("resolution_scale", 1.0))
     
@@ -285,7 +293,7 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
     # Use stem + ext to avoid string-replace collision (e.g. "image.png.png")
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     q = adaptive_quality if auto_size else quality
-    q = clamp_quality(q, quality)
+    q = clamp_quality(q, quality, min_quality)
     final_q = q
     
     temp_fd, temp_path_str = tempfile.mkstemp(suffix=dest_ext)
@@ -300,7 +308,7 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
     invalid_output_seen = False
     
     try:
-        while q >= MIN_QUALITY:
+        while q >= min_quality:
             if not compress_image(src_path, temp_path, q, scale):
                 break
             temp_size = temp_path.stat().st_size
@@ -378,7 +386,8 @@ def optimize_directory(
     for folder_key, group in groupby(images, key=lambda x: str(x.parent)):
         folder_groups.append((folder_key, list(group)))
     
-    start_quality = clamp_quality(options.get("start_quality", 95))
+    min_quality = option_min_quality(options)
+    start_quality = clamp_quality(options.get("start_quality", 95), 95, min_quality)
     max_target = int(float(options.get("max_target_mb", 3.0)) * 1024 * 1024)
     
     results: list[dict[str, Any]] = []
@@ -451,7 +460,7 @@ def optimize_directory(
             out_path, final_q, status = optimize_image_file(p, output_dir / relative_path.parent, options, adaptive_quality)
             new_size = out_path.stat().st_size
             if options.get("auto_size", True) and (start_quality - final_q) >= 10 and new_size >= 0.8 * max_target:
-                new_start = min(start_quality, max(MIN_QUALITY, final_q + 5))
+                new_start = min(start_quality, max(min_quality, final_q + 5))
                 if new_start < adaptive_quality:
                     job_state.log(f"[TỐI ƯU] Auto quality start giảm từ {adaptive_quality} xuống {new_start} dựa trên ảnh trước.")
                     adaptive_quality = new_start
