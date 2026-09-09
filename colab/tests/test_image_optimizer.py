@@ -71,8 +71,11 @@ class ImageOptimizerTests(TestCase):
         self.assertEqual((self.dest_dir / "test.txt").read_text(encoding="utf-8"), "Hello World")
         self.assertTrue((self.dest_dir / "clip.mp4").exists())
 
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["name"], "large.jpg")
+        self.assertEqual(len(results), 4)
+        large_res = next(r for r in results if r["name"] == "large.jpg")
+        self.assertEqual(large_res["status"], "Thành công (Compressed)")
+        skipped_names = {r["name"] for r in results if r["status"] == "Skipped"}
+        self.assertEqual(skipped_names, {"test.txt", "clip.mp4", "small.jpg"})
         self.assertTrue((self.dest_dir / "small.jpg").exists())
 
         # Verify large image output is copied/created
@@ -85,7 +88,9 @@ class ImageOptimizerTests(TestCase):
 
         results = optimize_directory(self.src_dir, self.dest_dir, {"max_target_mb": 3.0}, MockJobState())
 
-        self.assertEqual(results, [])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["name"], "small.jpg")
+        self.assertEqual(results[0]["status"], "Skipped")
         self.assertTrue((self.dest_dir / "small.jpg").exists())
 
     def test_optimize_directory_converts_small_png_even_under_target(self) -> None:
@@ -334,7 +339,9 @@ class ImageOptimizerTests(TestCase):
             "optimize_workers": 1,
         }, MockJobState())
 
-        self.assertEqual(results, [])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["name"], "keep.txt")
+        self.assertEqual(results[0]["status"], "Skipped")
         self.assertTrue((nested_out / "keep.txt").exists())
         self.assertFalse((nested_out / "optimized").exists())
 
@@ -422,7 +429,9 @@ class ImageOptimizerTests(TestCase):
         # Second run without force: should skip even if size > max_target_mb
         skip_options = {"min_target_mb": 0.01, "max_target_mb": 0.05, "optimize_workers": 1}
         results2 = optimize_directory(src2_dir, dest2_dir, skip_options, MockJobState())
-        self.assertEqual(results2, []) # Skipped from batch processing to passthrough
+        self.assertEqual(len(results2), 1) # Skipped from batch processing to passthrough
+        self.assertEqual(results2[0]["name"], "photo.jpg")
+        self.assertEqual(results2[0]["status"], "Skipped")
         self.assertTrue((dest2_dir / "photo.jpg").exists())
 
         # Second run WITH force_reoptimize: should re-optimize

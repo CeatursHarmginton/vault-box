@@ -160,7 +160,8 @@ async def run_transfer(job: JobState) -> None:
             outputs = [p for p in out_root.rglob("*") if p.is_file()]
             
             # Only ask for confirmation if there are actual optimized image results
-            if job.optimized_files:
+            actual_compressed = [f for f in (job.optimized_files or []) if f.get("status") != "Skipped"]
+            if actual_compressed:
                 conf_mode = options.get("confirm_action") or options.get("confirmation_mode")
                 if conf_mode == "replace":
                     action = "replace"
@@ -170,7 +171,7 @@ async def run_transfer(job: JobState) -> None:
                     options["_auto_confirm_upload_new"] = True
                     job.log("Confirmation strategy: auto upload as new (fallback to replace if failed).")
                 else:
-                    action = _wait_for_confirmation(job, len(job.optimized_files))
+                    action = _wait_for_confirmation(job, len(actual_compressed))
 
                 if action == "replace":
                     options["replace"] = True

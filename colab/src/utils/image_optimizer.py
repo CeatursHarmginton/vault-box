@@ -437,6 +437,15 @@ def optimize_directory(
             target_path = output_dir / relative_path
             target_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(p, target_path)
+            sz = p.stat().st_size
+            results.append({
+                "name": str(relative_path).replace("\\", "/"),
+                "source_name": str(relative_path).replace("\\", "/"),
+                "original_size": sz,
+                "optimized_size": sz,
+                "status": "Skipped",
+                "quality": "-"
+            })
 
         return results
 
@@ -489,7 +498,7 @@ def optimize_directory(
         for folder_key, folder_images in folder_groups:
             results.extend(process_group(folder_key, folder_images))
     
-    # Copy files that should pass through unchanged.
+    # Copy files that should pass through unchanged and record them as skipped.
     for p in passthrough:
         if cancel_check:
             cancel_check()
@@ -497,5 +506,14 @@ def optimize_directory(
         target_path = output_dir / relative_path
         target_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(p, target_path)
+        sz = p.stat().st_size
+        results.append({
+            "name": str(relative_path).replace("\\", "/"),
+            "source_name": str(relative_path).replace("\\", "/"),
+            "original_size": sz,
+            "optimized_size": sz,
+            "status": "Skipped",
+            "quality": "-"
+        })
         
     return results

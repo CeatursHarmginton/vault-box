@@ -2041,7 +2041,7 @@ class TransferJobTests(TestCase):
             self.assertFalse((dirs["output"] / "batch-0").exists())
             self.assertTrue((dirs["input"] / "batch-1").exists())
             self.assertTrue((dirs["output"] / "batch-1").exists())
-            self.assertEqual(job.completed_items, [{"provider": "fake-source", "id": "a", "path": "a"}])
+            self.assertEqual([{"provider": it.get("provider"), "id": it.get("id"), "path": it.get("path")} for it in job.completed_items], [{"provider": "fake-source", "id": "a", "path": "a"}])
         finally:
             PROVIDERS.clear()
             PROVIDERS.update(old)
