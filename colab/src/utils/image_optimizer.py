@@ -122,8 +122,6 @@ def should_optimize_image_file(path: Path, options: dict[str, Any]) -> bool:
         return False
     if not options.get("force_reoptimize", False) and is_image_already_optimized(path):
         return False
-    if suffix not in (".jpg", ".jpeg"):
-        return True
     size = path.stat().st_size
     min_target = int(float(options.get("min_target_mb", 1.0)) * 1024 * 1024)
     max_target = int(float(options.get("max_target_mb", 3.0)) * 1024 * 1024)
