@@ -54,10 +54,12 @@ async def run_transfer(job: JobState) -> None:
             skipped_videos = [item for item in file_items if _is_video_item(item)]
             for item in skipped_videos:
                 job.files_skipped += 1
+                _record_optimized_skip(job, item, "Skipped")
                 job.log(f"[SKIP] Video ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
             skipped_archives = [item for item in file_items if not options.get("extract") and _is_archive_item(item)]
             for item in skipped_archives:
                 job.files_skipped += 1
+                _record_optimized_skip(job, item, "Skipped")
                 job.log(f"[SKIP] Archive ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
             file_items = [item for item in file_items if not _is_video_item(item) and not (not options.get("extract") and _is_archive_item(item))]
         job.files_to_download = len(file_items)
@@ -253,6 +255,7 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
         if item_type != "folder" and _is_video_item(item):
             job.files_skipped += 1
+            _record_optimized_skip(job, item, "Skipped")
             job.log(f"[SKIP] Video ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
             job.finish_item(item_k, status="skipped", name=item_name_str)
             timing = job.item_timings.get(item_k) or {}
@@ -265,6 +268,7 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
             continue
         if item_type != "folder" and not options.get("extract") and _is_archive_item(item):
             job.files_skipped += 1
+            _record_optimized_skip(job, item, "Skipped")
             job.log(f"[SKIP] Archive ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
             job.finish_item(item_k, status="skipped", name=item_name_str)
             timing = job.item_timings.get(item_k) or {}
@@ -408,6 +412,18 @@ def _item_scope(source: dict[str, Any], item: dict[str, Any]) -> tuple[str, str]
     provider = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
     account = str(item.get("accountId") or item.get("account_id") or (item.get("meta") or {}).get("accountId") or (item.get("meta") or {}).get("account_id") or source.get("accountId") or source.get("account_id") or "")
     return provider, account
+
+def _record_optimized_skip(job: JobState, item: dict[str, Any], status: str) -> None:
+    name = str(item.get("name") or item.get("path") or item.get("id") or "file").replace("\\", "/")
+    size = int(item.get("size") or item.get("bytes") or 0)
+    job.optimized_files.append({
+        "name": name,
+        "source_name": name,
+        "original_size": size,
+        "optimized_size": size,
+        "status": status,
+        "quality": "-",
+    })
 
 def _item_upload_target(source: dict[str, Any], target: dict[str, Any], dst: Any, item: dict[str, Any]) -> tuple[dict[str, Any], Any]:
     provider, account = _item_scope(source, item)

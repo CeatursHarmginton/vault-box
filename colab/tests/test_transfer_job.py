@@ -845,6 +845,14 @@ def test_optimize_archive_without_extract_skips_download_and_upload():
     assert job.files_downloaded == 0
     assert job.files_uploaded == 0
     assert job.files_skipped == 1
+    assert job.optimized_files == [{
+        "name": "a.zip",
+        "source_name": "a.zip",
+        "original_size": 0,
+        "optimized_size": 0,
+        "status": "Skipped",
+        "quality": "-",
+    }]
     assert any("Archive ignored by image optimizer" in line for line in job.logs)
 
 def test_drive_mount_download_and_upload(tmp_path, monkeypatch):
