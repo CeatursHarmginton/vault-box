@@ -1425,6 +1425,152 @@ class TransferJobTests(TestCase):
         self.assertEqual(optimize_calls, [["a.jpg", "b.jpg", "c.jpg"]])
         self.assertEqual(job.status, "completed", job.error)
 
+    def test_optimize_batches_by_safe_disk_budget(self):
+        gb = 1024 ** 3
+        events = []
+        case = self
+
+        class Source:
+            async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
+                events.append(f"download:{file_ref['name']}")
+                if file_ref["name"] == "b.jpg":
+                    case.assertFalse((local_dir.parent / "batch-0").exists())
+                path = local_dir / file_ref["name"]
+                path.write_bytes(b"x")
+                return path
+
+        class Dst(UploadRecorder):
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                events.append(f"upload:{local_path.name}")
+                return await super().upload_file(credentials, local_path, target_ref, progress)
+
+            async def upload_folder(self, credentials, local_dir, target_ref, progress):
+                events.append(f"upload:{','.join(sorted(p.name for p in local_dir.glob('*.jpg')))}")
+                return await super().upload_folder(credentials, local_dir, target_ref, progress)
+
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        old_disk = transfer_job_mod.shutil.disk_usage
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            names = sorted(p.name for p in input_dir.glob("*.jpg"))
+            events.append(f"opt:{','.join(names)}")
+            for name in names:
+                (output_dir / name).write_bytes(b"x")
+            return [{"name": name, "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95} for name in names]
+        PROVIDERS.update({"fake-source": Source(), "fake-dst": Dst()})
+        image_optimizer.optimize_directory = fake_optimize
+        transfer_job_mod.shutil.disk_usage = lambda path: type("DU", (), {"free": 200 * gb})()
+        try:
+            job = JobState("opt-budget", {
+                "source": {"provider": "fake-source", "items": [
+                    {"type": "file", "id": "a", "name": "a.jpg", "size": 30 * gb},
+                    {"type": "file", "id": "b", "name": "b.jpg", "size": 20 * gb},
+                    {"type": "file", "id": "c", "name": "c.jpg", "size": 10 * gb},
+                ]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True, "confirm_action": "upload_new"},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            transfer_job_mod.shutil.disk_usage = old_disk
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-budget")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(events, ["download:a.jpg", "opt:a.jpg", "upload:a.jpg", "download:b.jpg", "download:c.jpg", "opt:b.jpg,c.jpg", "upload:b.jpg", "upload:c.jpg"])
+        self.assertIn("safe batch 40.0GB", "\n".join(job.logs))
+
+    def test_extract_batches_by_third_disk_budget(self):
+        gb = 1024 ** 3
+        events = []
+
+        class Source:
+            async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
+                events.append(f"download:{file_ref['name']}")
+                path = local_dir / file_ref["name"]
+                path.write_bytes(b"x")
+                return path
+
+        class Dst(UploadRecorder):
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                events.append(f"upload:{local_path.name}")
+                return await super().upload_file(credentials, local_path, target_ref, progress)
+
+        old = dict(PROVIDERS)
+        old_extract = transfer_job_mod.extract_archives
+        old_disk = transfer_job_mod.shutil.disk_usage
+        async def fake_extract(input_dir, output_dir, progress, password=None, delete_archive=False):
+            names = sorted(p.name for p in input_dir.glob("*"))
+            events.append(f"extract:{','.join(names)}")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            out = output_dir / f"{names[0]}.out"
+            out.write_bytes(b"x")
+            return [out]
+        PROVIDERS.update({"fake-source": Source(), "fake-dst": Dst()})
+        transfer_job_mod.extract_archives = fake_extract
+        transfer_job_mod.shutil.disk_usage = lambda path: type("DU", (), {"free": 200 * gb})()
+        try:
+            job = JobState("extract-budget", {
+                "source": {"provider": "fake-source", "items": [
+                    {"type": "file", "id": "a", "name": "a.zip", "size": 20 * gb},
+                    {"type": "file", "id": "b", "name": "b.zip", "size": 15 * gb},
+                ]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": False, "extract": True},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            transfer_job_mod.extract_archives = old_extract
+            transfer_job_mod.shutil.disk_usage = old_disk
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("extract-budget")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(events, ["download:a.zip", "extract:a.zip", "upload:a.zip.out", "download:b.zip", "extract:b.zip", "upload:b.zip.out"])
+        self.assertIn("safe batch 26.7GB", "\n".join(job.logs))
+
+    def test_oversized_single_file_warns_but_runs_when_disk_has_room(self):
+        gb = 1024 ** 3
+
+        class Source:
+            async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
+                path = local_dir / file_ref["name"]
+                path.write_bytes(b"x")
+                return path
+
+        old = dict(PROVIDERS)
+        old_optimize = image_optimizer.optimize_directory
+        old_disk = transfer_job_mod.shutil.disk_usage
+        def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+            out = output_dir / "huge.jpg"
+            out.write_bytes(b"x")
+            return [{"name": "huge.jpg", "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95}]
+        PROVIDERS.update({"fake-source": Source(), "fake-dst": UploadRecorder()})
+        image_optimizer.optimize_directory = fake_optimize
+        transfer_job_mod.shutil.disk_usage = lambda path: type("DU", (), {"free": 200 * gb})()
+        try:
+            job = JobState("oversized-budget", {
+                "source": {"provider": "fake-source", "items": [
+                    {"type": "file", "id": "huge", "name": "huge.jpg", "size": 70 * gb},
+                    {"type": "file", "id": "small", "name": "small.jpg", "size": 1 * gb},
+                ]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"cleanupAfterFinish": False, "optimize_image": True, "confirm_action": "upload_new"},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old)
+            image_optimizer.optimize_directory = old_optimize
+            transfer_job_mod.shutil.disk_usage = old_disk
+            __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("oversized-budget")
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertIn("above safe batch 40.0GB; allowing", "\n".join(job.logs))
+
     def test_folder_source_uploads_tree_even_when_one_file(self):
         dst = UploadRecorder()
         old = dict(PROVIDERS)

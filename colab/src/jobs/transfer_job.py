@@ -16,6 +16,7 @@ from ..utils.temp_storage import cleanup_job, job_dirs
 from .progress import JobCancelled, JobState
 
 CONFIRM_TIMEOUT_SECONDS = 120
+COLAB_DEFAULT_FREE_BYTES = 80 * 1024 ** 3
 
 async def run_transfer(job: JobState) -> None:
     dirs = job_dirs(job.job_id)
@@ -39,7 +40,7 @@ async def run_transfer(job: JobState) -> None:
         items = source.get("items") or []
         has_folder_batch = any((item.get("type") == "folder" or item.get("is_folder")) for item in items)
         has_mixed_source_scope = len({_item_scope(source, item) for item in items}) > 1
-        if options.get("optimize_image") and len(items) > 1 and (has_folder_batch or has_mixed_source_scope):
+        if options.get("optimize_image") and len(items) > 1:
             await _run_optimized_batches(job, dirs, source, target, options, src, dst)
             job.log(f"Done: Downloaded {job.files_downloaded}/{job.files_to_download} file(s), Uploaded {job.files_uploaded}/{job.files_to_upload} file(s) (skipped {job.files_skipped} file(s))")
             _log_skip_summary(job)
@@ -63,6 +64,15 @@ async def run_transfer(job: JobState) -> None:
                 job.log(f"[SKIP] Archive ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
             file_items = [item for item in file_items if not _is_video_item(item) and not (not options.get("extract") and _is_archive_item(item))]
         job.files_to_download = len(file_items)
+
+        if not options.get("optimize_image") and not has_folder_batch and len(file_items) > 1 and _needs_download_batches(file_items, dirs["input"], options):
+            await _run_plain_file_batches(job, dirs, source, target, options, src, dst, file_items)
+            job.log(f"Done: Downloaded {job.files_downloaded}/{job.files_to_download} file(s), Uploaded {job.files_uploaded}/{job.files_to_upload} file(s) (skipped {job.files_skipped} file(s))")
+            _log_skip_summary(job)
+            if job.failed_items and not job.completed_items:
+                raise ProviderFailure("DOWNLOAD_FAILED", f"All {len(job.failed_items)} item(s) skipped after retries", {"failedItems": job.failed_items[:5]})
+            job.set(status="completed", step="completed")
+            return
 
         downloaded: list[Path] = []
         has_folder_source = False
@@ -247,8 +257,8 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
     from ..utils.image_optimizer import optimize_directory
 
     action: str | None = None
-    for index, item in enumerate(source.get("items") or []):
-        job.check_cancelled()
+    candidates: list[dict[str, Any]] = []
+    for item in source.get("items") or []:
         item_ref = _queue_item_ref(source, item)
         item_k = _queue_item_key(source, item)
         item_name_str = _item_name(item)
@@ -280,40 +290,42 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
             })
             continue
 
-        job.start_item(item_k, name=item_name_str)
+        candidates.append(item)
+
+    groupable = not any((_item_type(item) == "folder") for item in candidates) and len({_item_scope(source, item) for item in candidates}) <= 1
+    groups = _download_batches(candidates, dirs["input"], options, job) if groupable else [[item] for item in candidates]
+    for index, batch_items in enumerate(groups):
+        job.check_cancelled()
+        for item in batch_items:
+            job.start_item(_queue_item_key(source, item), name=_item_name(item))
+        item = batch_items[0]
+        item_type = _item_type(item) if len(batch_items) == 1 else "batch"
         batch_input = dirs["input"] / f"batch-{index}"
         batch_output = dirs["output"] / f"batch-{index}" / "optimized"
         batch_input.mkdir(parents=True, exist_ok=True)
         batch_output.mkdir(parents=True, exist_ok=True)
         job.set(status="running", step="downloading")
         failed_before = job.files_failed
-        try:
-            downloaded = await _download_batch_item(job, source, src, item, batch_input)
-        except ProviderFailure as exc:
-            # Retries are already exhausted inside the download; move to the next queue item
-            # and leave this one in the queue so it can be picked up again later.
-            if not is_skippable_download_failure(exc):
-                raise
-            _mark_item_skipped(job, source, item, exc.message)
-            shutil.rmtree(batch_input, ignore_errors=True)
-            shutil.rmtree(batch_output.parent, ignore_errors=True)
-            continue
+        downloaded = []
+        for batch_item in batch_items:
+            try:
+                downloaded.extend(await _download_batch_item(job, source, src, batch_item, batch_input))
+            except ProviderFailure as exc:
+                # Retries are already exhausted inside the download; move to the next queue item
+                # and leave this one in the queue so it can be picked up again later.
+                if not is_skippable_download_failure(exc):
+                    raise
+                _mark_item_skipped(job, source, batch_item, exc.message)
         item_failed = job.files_failed > failed_before
         if item_failed:
-            _mark_item_skipped(job, source, item, f"{job.files_failed - failed_before} file(s) unavailable after retries")
+            for batch_item in batch_items:
+                _mark_item_skipped(job, source, batch_item, f"{job.files_failed - failed_before} file(s) unavailable after retries")
         if not downloaded:
-            job.log(f"No image files found for optimization: {_item_name(item)}")
+            job.log(f"No image files found for optimization: {_batch_name(batch_items)}")
             shutil.rmtree(batch_input, ignore_errors=True)
             shutil.rmtree(batch_output.parent, ignore_errors=True)
             if not item_failed:
-                job.finish_item(item_k, status="done", name=item_name_str)
-                timing = job.item_timings.get(item_k) or {}
-                job.completed_items.append({
-                    **item_ref,
-                    "startTime": timing.get("startTime"),
-                    "endTime": timing.get("endTime"),
-                    "duration": timing.get("duration"),
-                })
+                _finish_items(job, source, batch_items)
             continue
         _validate_downloads(downloaded, batch_input)
         job.log(f"Downloaded files: {len(downloaded)}")
@@ -327,7 +339,7 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
             job.log(f"Extract stage output files: {len(outputs)}")
 
         job.set(step="optimizing")
-        job.log(f"Starting image optimization: {_item_name(item)}")
+        job.log(f"Starting image optimization: {_batch_name(batch_items)}")
         batch_results = await asyncio.to_thread(
             optimize_directory, optimize_input, batch_output, options, job,
             cancel_check=job.check_cancelled,
@@ -335,18 +347,11 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         job.optimized_files.extend(batch_results)
         batch_files = [p for p in batch_output.rglob("*") if p.is_file()]
         if not batch_results and not batch_files:
-            job.log(f"No image files found for optimization: {_item_name(item)}")
+            job.log(f"No image files found for optimization: {_batch_name(batch_items)}")
             shutil.rmtree(batch_input, ignore_errors=True)
             shutil.rmtree(batch_output.parent, ignore_errors=True)
             if not item_failed:
-                job.finish_item(item_k, status="done", name=item_name_str)
-                timing = job.item_timings.get(item_k) or {}
-                job.completed_items.append({
-                    **item_ref,
-                    "startTime": timing.get("startTime"),
-                    "endTime": timing.get("endTime"),
-                    "duration": timing.get("duration"),
-                })
+                _finish_items(job, source, batch_items)
             continue
 
         if batch_results and action is None:
@@ -377,18 +382,65 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         await _upload_outputs_with_retry(job, item_target, options, item_dst, upload_root, upload_item)
         shutil.rmtree(batch_input, ignore_errors=True)
         shutil.rmtree(batch_output.parent, ignore_errors=True)
-        if not item_failed and not _item_is_failed(job, source, item):
-            job.finish_item(item_k, status="done", name=item_name_str)
-            timing = job.item_timings.get(item_k) or {}
-            job.completed_items.append({
-                **item_ref,
-                "startTime": timing.get("startTime"),
-                "endTime": timing.get("endTime"),
-                "duration": timing.get("duration"),
-            })
+        if not item_failed:
+            _finish_items(job, source, [item for item in batch_items if not _item_is_failed(job, source, item)])
 
     if not job.optimized_files and job.files_skipped:
         job.log("No image files found for optimization.")
+
+async def _run_plain_file_batches(job: JobState, dirs: dict[str, Path], source: dict[str, Any], target: dict[str, Any], options: dict[str, Any], src: Any, dst: Any, file_items: list[dict[str, Any]]) -> None:
+    groups = _download_batches(file_items, dirs["input"], options, job)
+    sem = asyncio.Semaphore(max(1, FOLDER_DOWNLOAD_CONCURRENCY))
+
+    async def download_one(item: dict[str, Any], batch_input: Path) -> list[Path]:
+        async with sem:
+            job.check_cancelled()
+            item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
+            item_src = PROVIDERS.get(item_prov, src)
+            item_creds = item.get("credentials") or source.get("credentials") or {}
+            try:
+                path = await download_with_retry(
+                    lambda: item_src.download_file(item_creds, item, batch_input, job),
+                    progress=job, label=_item_name(item),
+                )
+                _remember_source_ref(job, path, item)
+                return [path]
+            except ProviderFailure as exc:
+                if not is_skippable_download_failure(exc):
+                    raise
+                _mark_item_skipped(job, source, item, exc.message)
+                return []
+
+    for index, batch_items in enumerate(groups):
+        batch_input = dirs["input"] / f"batch-{index}"
+        batch_output = dirs["output"] / f"batch-{index}"
+        batch_input.mkdir(parents=True, exist_ok=True)
+        for item in batch_items:
+            job.start_item(_queue_item_key(source, item), name=_item_name(item))
+        job.set(status="running", step="downloading")
+        if str(source.get("provider") or "").lower() == "links":
+            downloaded = []
+            for item in batch_items:
+                downloaded.extend(await download_one(item, batch_input))
+        else:
+            downloaded = [path for batch in await asyncio.gather(*(download_one(item, batch_input) for item in batch_items)) for path in batch]
+        downloaded = [p for p in downloaded if p.is_file()]
+        if not downloaded:
+            shutil.rmtree(batch_input, ignore_errors=True)
+            shutil.rmtree(batch_output, ignore_errors=True)
+            continue
+        _validate_downloads(downloaded, batch_input)
+        upload_root = batch_input
+        if options.get("extract"):
+            job.log("Extract enabled: scanning downloaded files for archives...")
+            upload_root = batch_output / "extracted"
+            outputs = await extract_archives(batch_input, upload_root, job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
+            job.log(f"Extract stage output files: {len(outputs)}")
+        job.set(status="running", step="uploading")
+        await _upload_outputs_with_retry(job, target, options, dst, upload_root, {"type": "folder"})
+        shutil.rmtree(batch_input, ignore_errors=True)
+        shutil.rmtree(batch_output, ignore_errors=True)
+        _finish_items(job, source, [item for item in batch_items if not _item_is_failed(job, source, item)])
 
 async def _download_batch_item(job: JobState, source: dict[str, Any], src: Any, item: dict[str, Any], batch_input: Path) -> list[Path]:
     item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
@@ -407,6 +459,71 @@ async def _download_batch_item(job: JobState, source: dict[str, Any], src: Any, 
     )
     _remember_source_ref(job, path, item)
     return [path]
+
+def _download_batches(items: list[dict[str, Any]], root: Path, options: dict[str, Any], job: JobState) -> list[list[dict[str, Any]]]:
+    budget = _download_budget(root, options)
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    used = 0
+    for item in items:
+        size = _item_size(item)
+        if current and size and used + size > budget:
+            groups.append(current)
+            current, used = [], 0
+        if size > budget:
+            actual_free = shutil.disk_usage(root).free
+            if size > actual_free:
+                job.log(f"[BUDGET] Warning: {_item_name(item)} is {_gb(size)}GB, above free disk {_gb(actual_free)}GB; download may fail.")
+            else:
+                job.log(f"[BUDGET] Warning: {_item_name(item)} is {_gb(size)}GB, above safe batch {_gb(budget)}GB; allowing because disk has {_gb(actual_free)}GB free.")
+        current.append(item)
+        used += size
+    if current:
+        groups.append(current)
+    if len(groups) > 1:
+        job.log(f"[BUDGET] Split downloads into {len(groups)} batch(es), safe batch {_gb(budget)}GB.")
+    return groups
+
+def _needs_download_batches(items: list[dict[str, Any]], root: Path, options: dict[str, Any]) -> bool:
+    budget = _download_budget(root, options)
+    total = sum(_item_size(item) for item in items)
+    return bool(total and total > budget)
+
+def _download_budget(root: Path, options: dict[str, Any]) -> int:
+    free = min(shutil.disk_usage(root).free, COLAB_DEFAULT_FREE_BYTES)
+    if options.get("extract"):
+        return max(1, free // 3)
+    if options.get("optimize_image"):
+        return max(1, free // 2)
+    return max(1, free)
+
+def _item_size(item: dict[str, Any]) -> int:
+    try:
+        return max(0, int(item.get("size") or item.get("file_size") or item.get("bytes") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+def _gb(size: int) -> str:
+    return f"{size / 1024 ** 3:.1f}"
+
+def _batch_name(items: list[dict[str, Any]]) -> str:
+    return _item_name(items[0]) if len(items) == 1 else f"{len(items)} file batch"
+
+def _item_type(item: dict[str, Any]) -> str:
+    return item.get("type") or ("folder" if item.get("is_folder") else "file")
+
+def _finish_items(job: JobState, source: dict[str, Any], items: list[dict[str, Any]]) -> None:
+    for item in items:
+        item_k = _queue_item_key(source, item)
+        name = _item_name(item)
+        job.finish_item(item_k, status="done", name=name)
+        timing = job.item_timings.get(item_k) or {}
+        job.completed_items.append({
+            **_queue_item_ref(source, item),
+            "startTime": timing.get("startTime"),
+            "endTime": timing.get("endTime"),
+            "duration": timing.get("duration"),
+        })
 
 def _item_scope(source: dict[str, Any], item: dict[str, Any]) -> tuple[str, str]:
     provider = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()

@@ -283,7 +283,7 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
                 dest_path.unlink(missing_ok=True)
                 dest_path = copy_original_image(src_path, dest_dir)
                 return dest_path, quality, "Giữ nguyên (Lỗi convert)"
-            return dest_path, quality, "Thành công (Converted)"
+            return dest_path, quality, "Success"
         dest_path = copy_original_image(src_path, dest_dir)
         return dest_path, quality, "Giữ nguyên (Upscale tắt hoặc lỗi)"
 
@@ -327,14 +327,14 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
             if not auto_size or temp_size <= max_target:
                 final_q = q
                 shutil.copy2(temp_path, dest_path)
-                return dest_path, final_q, "Thành công (Compressed)"
+                return dest_path, final_q, "Success"
             q -= 5
             
         # Loop exhausted — use best compressed result if smaller than original
         if best_size < size:
             shutil.copy2(best_temp, dest_path)
             final_q = best_q
-            status = "Thành công (Compressed)"
+            status = "Success"
         else:
             if invalid_output_seen:
                 dest_path = copy_original_image(src_path, dest_dir)

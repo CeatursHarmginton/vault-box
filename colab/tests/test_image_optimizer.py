@@ -73,7 +73,7 @@ class ImageOptimizerTests(TestCase):
 
         self.assertEqual(len(results), 4)
         large_res = next(r for r in results if r["name"] == "large.jpg")
-        self.assertEqual(large_res["status"], "Thành công (Compressed)")
+        self.assertEqual(large_res["status"], "Success")
         skipped_names = {r["name"] for r in results if r["status"] == "Skipped"}
         self.assertEqual(skipped_names, {"test.txt", "clip.mp4", "small.jpg"})
         self.assertTrue((self.dest_dir / "small.jpg").exists())
