@@ -2954,7 +2954,7 @@ class TransferJobTests(TestCase):
         self.assertEqual(parent, "/photos/results")
         self.assertFalse(any(call[1].startswith("create folder /photos/results") for call in s.calls))
 
-    def test_terabox_replace_uploads_old_name_then_renames_converted_jpg(self):
+    def test_terabox_replace_uploads_old_name_without_rename_for_converted_jpg(self):
         with __import__("tempfile").TemporaryDirectory() as tmp:
             provider = TeraBoxProvider()
             local = Path(tmp) / "photo.jpg"
@@ -2975,10 +2975,8 @@ class TransferJobTests(TestCase):
                     return {}
 
                 async def request_json(self, method, url, **kwargs):
-                    if kwargs.get("context", "").startswith("list "):
-                        return {"list": [{"isdir": 0, "server_filename": "photo.png", "path": "/root/photo.png"}]}
                     events.append(("rename", kwargs["data"]))
-                    return {"errno": 0}
+                    raise AssertionError("replace must not call rename")
 
             async def session(credentials):
                 return Session()
@@ -2989,8 +2987,10 @@ class TransferJobTests(TestCase):
             out = asyncio.run(provider.replace_file({}, local, {"path": "/root/photo.png", "name": "photo.jpg"}, JobState("tb-replace", {})))
 
         self.assertTrue(out["ok"])
+        self.assertEqual(out["new_name"], "photo.png")
+        self.assertFalse(out["renamed"])
         self.assertEqual(events[0], ("upload", {"id": "/root", "relative_path": "photo.png"}))
-        self.assertEqual(json.loads(events[1][1]["filelist"]), [{"path": "/root/photo.png", "newname": "photo.jpg"}])
+        self.assertEqual(len(events), 1)
 
     def test_terabox_rename_api_error_is_upload_failed(self):
         class Response:
@@ -3011,7 +3011,7 @@ class TransferJobTests(TestCase):
             asyncio.run(s.request_json("POST", "https://www.terabox.com/api/filemanager", context="rename /root/photo.png"))
         self.assertEqual(ctx.exception.code, "UPLOAD_FAILED")
 
-    def test_terabox_replace_retries_rename_without_reupload(self):
+    def test_terabox_replace_does_not_rename_when_output_name_differs(self):
         with __import__("tempfile").TemporaryDirectory() as tmp:
             provider = TeraBoxProvider()
             local = Path(tmp) / "photo.jpg"
@@ -3032,32 +3032,19 @@ class TransferJobTests(TestCase):
                     return {}
 
                 async def request_json(self, method, url, **kwargs):
-                    context = kwargs.get("context", "")
-                    if context.startswith("list "):
-                        return {"list": [{"isdir": 0, "server_filename": "photo.png", "path": "/root/photo.png"}]}
                     events.append(("rename", kwargs["data"]))
-                    if len([event for event in events if event[0] == "rename"]) < 3:
-                        raise ProviderFailure("UPLOAD_FAILED", "temporary rename failure")
-                    return {"errno": 0}
+                    raise AssertionError("replace must not call rename")
 
             async def session(credentials):
                 return Session()
 
-            async def no_sleep(delay):
-                return None
-
-            old_sleep = terabox_mod.asyncio.sleep
             provider.upload_file = upload_file
             provider._session = session
-            terabox_mod.asyncio.sleep = no_sleep
-            try:
-                out = asyncio.run(provider.replace_file({}, local, {"path": "/root/photo.png", "name": "photo.jpg"}, JobState("tb-rename-retry", {})))
-            finally:
-                terabox_mod.asyncio.sleep = old_sleep
+            out = asyncio.run(provider.replace_file({}, local, {"path": "/root/photo.png", "name": "photo.jpg"}, JobState("tb-no-rename", {})))
 
         self.assertTrue(out["ok"])
         self.assertEqual(len([event for event in events if event[0] == "upload"]), 1)
-        self.assertEqual(len([event for event in events if event[0] == "rename"]), 3)
+        self.assertEqual(len([event for event in events if event[0] == "rename"]), 0)
 
     def test_terabox_replace_accepts_relay_source_path(self):
         with __import__("tempfile").TemporaryDirectory() as tmp:

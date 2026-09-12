@@ -513,12 +513,6 @@ class TeraBoxProvider(BaseProvider):
         parent = str(PurePosixPath(source_path).parent)
         parent = "/" if parent == "." else parent
         old_name = PurePosixPath(source_path).name
-        new_name = safe_name(source_ref.get("name") or local_path.name)
-        s = await self._session(credentials)
-        if new_name != old_name:
-            listing = await s.request_json("GET", f"{s.base}/api/list", context=f"list {parent}", params=s.params(order="time", desc=1, dir=parent, num=1000, page=1, showempty=0), headers=s.headers())
-            if any(not i.get("isdir") and i.get("server_filename") == new_name and i.get("path") != source_path for i in listing.get("list") or []):
-                raise ProviderFailure("UPLOAD_FAILED", "Replacement target name already exists")
         options = progress.payload.setdefault("options", {})
         old_replace = options.get("replace")
         options["replace"] = True
@@ -529,17 +523,4 @@ class TeraBoxProvider(BaseProvider):
                 options.pop("replace", None)
             else:
                 options["replace"] = old_replace
-        if new_name != old_name:
-            for attempt in range(3):
-                progress.check_cancelled()
-                try:
-                    await s.request_json("POST", f"{s.base}/api/filemanager", context=f"rename {source_path}", params=s.params(opera="rename", ondup="fail"), data={
-                        "filelist": json.dumps([{"path": source_path, "newname": new_name}], ensure_ascii=False),
-                    }, headers={**s.headers(), "Content-Type": "application/x-www-form-urlencoded"})
-                    break
-                except ProviderFailure as exc:
-                    if exc.code != "UPLOAD_FAILED" or attempt == 2:
-                        raise
-                    progress.log(f"[RETRY {attempt + 1}/2] Rename failed ({exc.message}); retrying {new_name}")
-                    await asyncio.sleep(0.5 * (attempt + 1))
-        return {"ok": True, "old_path": source_path, "new_name": new_name}
+        return {"ok": True, "old_path": source_path, "new_name": old_name, "renamed": False}
