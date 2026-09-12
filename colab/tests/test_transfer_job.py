@@ -818,6 +818,59 @@ def test_optimize_queue_unzip_fallback_uploads_archive_and_passwords(monkeypatch
     assert seen_passwords == [["pw1", "pw2"]]
     assert [call[1].name for call in dst.calls] == ["a.zip", "b.zip"]
 
+def test_upload_new_after_batch_unzip_keeps_selected_target_folder(monkeypatch):
+    class Source:
+        async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
+            path = local_dir / str(file_ref["path"]).strip("/")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("zip")
+            return path
+
+    dst = UploadRecorder()
+    old = dict(PROVIDERS)
+
+    async def fake_extract(input_dir, output_dir, progress, password=None, delete_archive=False):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out = []
+        for archive in sorted(input_dir.rglob("*.zip")):
+            target = output_dir / archive.parent.relative_to(input_dir) / archive.stem / "img.jpg"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("img")
+            out.append(target)
+        return out
+
+    def fake_optimize(input_dir, output_dir, options, job_state, cancel_check=None):
+        results = []
+        for path in sorted(input_dir.rglob("*.jpg")):
+            rel = path.relative_to(input_dir)
+            target = output_dir / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            results.append({"name": rel.as_posix(), "source_name": rel.as_posix(), "original_size": 1, "optimized_size": 1, "status": "ok", "quality": 95})
+        return results
+
+    PROVIDERS.update({"fake-source": Source(), "fake-dst": dst})
+    monkeypatch.setattr(transfer_job_mod, "extract_archives", fake_extract)
+    monkeypatch.setattr(image_optimizer, "optimize_directory", fake_optimize)
+    try:
+        job = JobState("opt-unzip-upload-new-target", {
+            "source": {"provider": "fake-source", "items": [
+                {"type": "file", "id": "/A/a.zip", "path": "/A/a.zip", "name": "a.zip"},
+                {"type": "file", "id": "/B/b.zip", "path": "/B/b.zip", "name": "b.zip"},
+            ]},
+            "target": {"provider": "fake-dst", "folder": {"id": "/selected", "path": "/selected"}},
+            "options": {"cleanupAfterFinish": False, "optimize_image": True, "extract": True, "confirm_action": "upload_new"},
+        })
+        asyncio.run(run_transfer(job))
+    finally:
+        PROVIDERS.clear()
+        PROVIDERS.update(old)
+        __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("opt-unzip-upload-new-target")
+
+    assert job.status == "completed", job.error
+    assert [ref["id"] for ref in dst.target_refs] == ["/selected", "/selected"]
+    assert [ref["relative_path"] for ref in dst.target_refs] == ["results/A/a/img.jpg", "results/B/b/img.jpg"]
+
 def test_optimize_archive_without_extract_skips_download_and_upload():
     class Source:
         async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):

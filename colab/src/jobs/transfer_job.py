@@ -547,8 +547,11 @@ def _item_upload_target(source: dict[str, Any], target: dict[str, Any], dst: Any
     source_provider, source_account = _item_scope({}, source)
     target_provider = str(target.get("provider") or "").lower()
     target_account = str(target.get("accountId") or target.get("account_id") or "")
+    mixed_source_scope = len({_item_scope(source, it) for it in source.get("items") or []}) > 1
     if target_provider != source_provider or target_account != source_account:
         return target, dst
+    if mixed_source_scope and provider == target_provider and account == target_account:
+        return {**target, "folder": _item_target_folder(target.get("folder") or {}, item)}, dst
     if provider == target_provider and account == target_account:
         return target, dst
     return {
@@ -557,6 +560,7 @@ def _item_upload_target(source: dict[str, Any], target: dict[str, Any], dst: Any
         "accountId": account,
         "account_id": account,
         "credentials": item.get("credentials") or target.get("credentials") or {},
+        "folder": _item_target_folder(target.get("folder") or {}, item),
     }, PROVIDERS.get(provider, dst)
 
 def _mark_item_skipped(job: JobState, source: dict[str, Any], item: dict[str, Any], reason: str) -> None:
@@ -696,7 +700,7 @@ async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options
             if gate.abort is not None:
                 return
             attempt_gen = gate.generation
-        folder = _item_target_folder(target.get("folder") or {}, item)
+        folder = _item_target_folder(target.get("folder") or {}, item) if options.get("replace") else (target.get("folder") or {})
         target_ref = _upload_target(folder, rel, options)
         try:
             source_ref = _replacement_source_ref(item, path, rel) if options.get("replace") and hasattr(dst, "replace_file") else None
