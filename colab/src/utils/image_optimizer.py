@@ -193,8 +193,13 @@ def copy_or_convert_image(src_path: Path, dest_path: Path, q: int) -> None:
     if src_path.suffix.lower() in (".jpg", ".jpeg") and dest_path.suffix.lower() in (".jpg", ".jpeg"):
         shutil.copy2(src_path, dest_path)
         return
-    if not compress_image(src_path, dest_path, q):
-        raise RuntimeError(f"Failed to convert image to JPEG: {src_path}")
+    for attempt in range(3):
+        dest_path.unlink(missing_ok=True)
+        if compress_image(src_path, dest_path, q):
+            return
+        if attempt < 2:
+            time.sleep(0.2)
+    raise RuntimeError(f"Failed to convert image to JPEG: {src_path}")
 
 def copy_original_image(src_path: Path, dest_dir: Path) -> Path:
     dest_path = dest_dir / src_path.name
@@ -215,7 +220,7 @@ def _valid_optimized_output(src_path: Path, out_path: Path, scale: float) -> boo
     except Exception:
         return False
 
-def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any], adaptive_quality: int) -> tuple[Path, int, str]:
+def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any], adaptive_quality: int) -> tuple[Path | None, int, str]:
     """
     Optimizes a single image file based on size target.
     Returns: (output_path, final_quality, status_message)
@@ -244,12 +249,10 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
             try:
                 copy_or_convert_image(src_path, dest_path, quality)
             except RuntimeError:
-                dest_path = copy_original_image(src_path, dest_dir)
-                return dest_path, quality, "Giữ nguyên"
+                return None, quality, "Skipped (Convert failed)"
             if not _valid_optimized_output(src_path, dest_path, 1.0):
                 dest_path.unlink(missing_ok=True)
-                dest_path = copy_original_image(src_path, dest_dir)
-                return dest_path, quality, "Giữ nguyên (Lỗi convert)"
+                return None, quality, "Skipped (Convert failed)"
             return dest_path, quality, "Thành công (Converted)"
         dest_path = copy_original_image(src_path, dest_dir)
         return dest_path, quality, "Giữ nguyên"
@@ -277,12 +280,10 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
             try:
                 copy_or_convert_image(src_path, dest_path, quality)
             except RuntimeError:
-                dest_path = copy_original_image(src_path, dest_dir)
-                return dest_path, quality, "Giữ nguyên (Lỗi convert)"
+                return None, quality, "Skipped (Convert failed)"
             if not _valid_optimized_output(src_path, dest_path, 1.0):
                 dest_path.unlink(missing_ok=True)
-                dest_path = copy_original_image(src_path, dest_dir)
-                return dest_path, quality, "Giữ nguyên (Lỗi convert)"
+                return None, quality, "Skipped (Convert failed)"
             return dest_path, quality, "Success"
         dest_path = copy_original_image(src_path, dest_dir)
         return dest_path, quality, "Giữ nguyên (Upscale tắt hoặc lỗi)"
@@ -339,7 +340,10 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
             if invalid_output_seen:
                 dest_path = copy_original_image(src_path, dest_dir)
             else:
-                copy_or_convert_image(src_path, dest_path, quality)
+                try:
+                    copy_or_convert_image(src_path, dest_path, quality)
+                except RuntimeError:
+                    return None, final_q, "Skipped (Convert failed)"
             status = "Giữ nguyên (Lỗi nén)"
     finally:
         temp_path.unlink(missing_ok=True)
@@ -409,6 +413,17 @@ def optimize_directory(
             job_state.log(f"Đang tối ưu ảnh ({index + 1}/{total_images}): {p.name}")
             orig_size = p.stat().st_size
             out_path, final_q, status = optimize_image_file(p, output_dir / relative_path.parent, options, start_quality)
+            if out_path is None:
+                job_state.log(f"[TỐI ƯU] Bỏ qua ảnh lỗi convert: {relative_path}")
+                rel = str(relative_path).replace("\\", "/")
+                return index, {
+                    "name": rel,
+                    "source_name": rel,
+                    "original_size": orig_size,
+                    "optimized_size": 0,
+                    "status": status,
+                    "quality": final_q
+                }
             return index, {
                 "name": str(out_path.relative_to(output_dir)),
                 "source_name": str(relative_path),
@@ -465,6 +480,19 @@ def optimize_directory(
             job_state.log(f"Đang tối ưu ảnh ({current}/{total_images}): {p.name}")
             orig_size = p.stat().st_size
             out_path, final_q, status = optimize_image_file(p, output_dir / relative_path.parent, options, adaptive_quality)
+            if out_path is None:
+                job_state.log(f"[TỐI ƯU] Bỏ qua ảnh lỗi convert: {relative_path}")
+                rel = str(relative_path).replace("\\", "/")
+                group_results.append({
+                    "name": rel,
+                    "source_name": rel,
+                    "original_size": orig_size,
+                    "optimized_size": 0,
+                    "status": status,
+                    "quality": final_q
+                })
+                set_optimize_progress(current)
+                continue
             new_size = out_path.stat().st_size
             if options.get("auto_size", True) and (start_quality - final_q) >= 10 and new_size >= 0.8 * max_target:
                 new_start = min(start_quality, max(min_quality, final_q + 5))

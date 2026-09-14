@@ -194,6 +194,59 @@ class ImageOptimizerTests(TestCase):
         with Image.open(out) as img:
             self.assertEqual(img.format, "JPEG")
 
+    def test_failed_png_convert_is_skipped_and_next_file_continues(self) -> None:
+        bad = self.src_dir / "bad.png"
+        good = self.src_dir / "good.jpg"
+        Image.new("RGB", (20, 20), color="red").save(bad, "PNG")
+        Image.new("RGB", (20, 20), color="blue").save(good, "JPEG")
+
+        old = image_optimizer.compress_image
+        def fake_compress(src_path, dest_path, q, scale=1.0):
+            if src_path.name == "bad.png":
+                return False
+            return old(src_path, dest_path, q, scale)
+        image_optimizer.compress_image = fake_compress
+        try:
+            job = MockJobState()
+            results = optimize_directory(self.src_dir, self.dest_dir, {
+                "min_target_mb": 0.0,
+                "max_target_mb": 0.0,
+                "optimize_workers": 1,
+            }, job)
+        finally:
+            image_optimizer.compress_image = old
+
+        self.assertEqual(next(r for r in results if r["source_name"] == "bad.png")["status"], "Skipped (Convert failed)")
+        self.assertFalse((self.dest_dir / "bad.jpg").exists())
+        self.assertTrue((self.dest_dir / "good.jpg").exists())
+        self.assertTrue(any("Bỏ qua ảnh lỗi convert: bad.png" in line for line in job.logs))
+
+    def test_png_convert_retries_before_skip(self) -> None:
+        src = self.src_dir / "retry.png"
+        Image.new("RGB", (20, 20), color="red").save(src, "PNG")
+
+        calls = 0
+        old = image_optimizer.compress_image
+        def flaky_compress(src_path, dest_path, q, scale=1.0):
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                return False
+            return old(src_path, dest_path, q, scale)
+        image_optimizer.compress_image = flaky_compress
+        try:
+            results = optimize_directory(self.src_dir, self.dest_dir, {
+                "min_target_mb": 0.0,
+                "max_target_mb": 0.0,
+                "optimize_workers": 1,
+            }, MockJobState())
+        finally:
+            image_optimizer.compress_image = old
+
+        self.assertEqual(calls, 3)
+        self.assertEqual(results[0]["name"], "retry.jpg")
+        self.assertTrue((self.dest_dir / "retry.jpg").exists())
+
     def test_invalid_tiny_compressed_output_is_not_selected(self) -> None:
         src = self.src_dir / "large.jpg"
         Image.new("RGB", (1600, 1600), color="blue").save(src, "JPEG", quality=100)
@@ -220,7 +273,7 @@ class ImageOptimizerTests(TestCase):
         with Image.open(out) as img:
             self.assertEqual(img.size, (1600, 1600))
 
-    def test_invalid_tiny_conversion_falls_back_to_original_file(self) -> None:
+    def test_invalid_tiny_conversion_is_skipped(self) -> None:
         src = self.src_dir / "small.png"
         Image.new("RGB", (20, 20), color="blue").save(src, "PNG")
 
@@ -239,12 +292,10 @@ class ImageOptimizerTests(TestCase):
         finally:
             image_optimizer.compress_image = old
 
-        out = self.dest_dir / "small.png"
         self.assertEqual(results[0]["name"], "small.png")
-        self.assertTrue(out.exists())
-        self.assertEqual(out.read_bytes(), src.read_bytes())
-        with Image.open(out) as img:
-            self.assertEqual(img.format, "PNG")
+        self.assertEqual(results[0]["status"], "Skipped (Convert failed)")
+        self.assertFalse((self.dest_dir / "small.png").exists())
+        self.assertFalse((self.dest_dir / "small.jpg").exists())
 
     def test_auto_size_processes_folder_images_small_to_large(self) -> None:
         for name, size in (("large.jpg", 30), ("small.jpg", 10), ("mid.jpg", 20)):

@@ -3155,7 +3155,7 @@ class TransferJobTests(TestCase):
 
         self.assertEqual(ref["path"], "/root/2.png")
 
-    def test_png_within_optimize_range_keeps_png_name(self):
+    def test_bad_png_within_optimize_range_is_skipped(self):
         with __import__("tempfile").TemporaryDirectory() as tmp:
             root = Path(tmp)
             src = root / "2.png"
@@ -3164,8 +3164,8 @@ class TransferJobTests(TestCase):
 
             path, _, status = image_optimizer.optimize_image_file(src, out, {"min_target_mb": 0, "max_target_mb": 1}, 95)
 
-        self.assertEqual(path.name, "2.png")
-        self.assertEqual(status, "Giữ nguyên")
+        self.assertIsNone(path)
+        self.assertEqual(status, "Skipped (Convert failed)")
 
     def test_terabox_refreshes_token_and_retries_on_need_verify_errno(self):
         bodies = [{"errno": 4000023, "errmsg": "need verify"}, {"errno": 0, "list": []}]
