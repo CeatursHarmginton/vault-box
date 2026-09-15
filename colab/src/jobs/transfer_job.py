@@ -781,6 +781,9 @@ def _fallback_auto_upload_new_to_replace(job: JobState, options: dict[str, Any],
     if not options.get("_auto_confirm_upload_new") or options.get("replace"):
         return False
     options["_auto_confirm_upload_new"] = False
+    if options.get("extract"):
+        job.log(f"Auto upload_new failed ({exc.message}); keeping upload_new for extracted archive outputs.")
+        return False
     options["replace"] = True
     options.pop("upload_prefix", None)
     job.log(f"Auto upload_new failed ({exc.message}); retrying with replace.")

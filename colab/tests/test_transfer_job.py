@@ -3703,6 +3703,16 @@ class TransferJobPathSafetyTests(TestCase):
         self.assertEqual(job.payload["options"].get("upload_prefix"), "results")
 
 
+    def test_upload_new_extract_never_falls_back_to_replace(self):
+        job = JobState("opt-archive-upload-new-fallback", {})
+        options = {"_auto_confirm_upload_new": True, "extract": True, "upload_prefix": "results"}
+        exc = ProviderFailure("UPLOAD_FAILED", "quota full")
+
+        self.assertFalse(transfer_job_mod._fallback_auto_upload_new_to_replace(job, options, exc))
+        self.assertFalse(options.get("replace"))
+        self.assertEqual(options.get("upload_prefix"), "results")
+        self.assertTrue(any("keeping upload_new" in line for line in job.logs))
+
 def test_relay_monitor_swallows_dead_socket_and_stop_cancels_tasks():
     """A dropped relay socket must not surface as an unretrieved task exception."""
     from src import relay_client
