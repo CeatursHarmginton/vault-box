@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shutil
 from pathlib import Path
@@ -81,7 +82,7 @@ def _archive_output_dir(archive: Path, input_dir: Path, output_dir: Path) -> Pat
             if base.lower().endswith(suffix):
                 base = base[:-len(suffix)]
                 break
-    return output_dir / archive.parent.relative_to(input_dir) / safe_name(base)
+    return output_dir / archive.parent.relative_to(input_dir) / safe_name(base, is_dir=True)
 
 def _extract_cmd(tool: str, archive: Path, output_dir: Path, pw: str | None) -> list[str]:
     if tool == "unrar":
@@ -101,15 +102,64 @@ def _flatten_same_name_root(extract_dir: Path) -> None:
         shutil.move(str(child), str(extract_dir / child.name))
     nested.rmdir()
 
+def sanitize_extracted_tree(root_dir: Path) -> None:
+    """Traverse tree bottom-up and sanitize directory/file names (strip emojis & illegal chars)."""
+    if not root_dir.exists() or not root_dir.is_dir():
+        return
+    for dirpath, dirnames, filenames in os.walk(root_dir, topdown=False):
+        current_dir = Path(dirpath)
+
+        # 1. Rename files in this directory
+        for fname in filenames:
+            new_fname = safe_name(fname, is_dir=False)
+            if new_fname != fname:
+                src = current_dir / fname
+                dest = current_dir / new_fname
+                if dest.exists() and dest != src:
+                    idx = 1
+                    stem = dest.stem
+                    suffix = dest.suffix
+                    while dest.exists() and dest != src:
+                        dest = current_dir / f"{stem}_{idx}{suffix}"
+                        idx += 1
+                try:
+                    src.rename(dest)
+                except Exception:
+                    pass
+
+        # 2. Rename directories
+        for dname in dirnames:
+            new_dname = safe_name(dname, is_dir=True)
+            if new_dname != dname:
+                src = current_dir / dname
+                dest = current_dir / new_dname
+                if dest.exists() and dest != src:
+                    idx = 1
+                    while dest.exists() and dest != src:
+                        dest = current_dir / f"{new_dname}_{idx}"
+                        idx += 1
+                try:
+                    src.rename(dest)
+                except Exception:
+                    pass
+
 async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState, password: str | list[str] | None = None, delete_archive: bool = False) -> list[Path]:
     if not shutil.which("7z"):
         progress.log("[SKIP] 7z not installed, uploading original files without extract.")
         output_dir.mkdir(parents=True, exist_ok=True)
-        return [_copy_to_output(p, input_dir, output_dir) for p in input_dir.rglob("*") if p.is_file()]
+        for p in input_dir.rglob("*"):
+            if p.is_file():
+                _copy_to_output(p, input_dir, output_dir)
+        sanitize_extracted_tree(output_dir)
+        return [p for p in output_dir.rglob("*") if p.is_file()]
     found = archives(input_dir)
     if not found:
         output_dir.mkdir(parents=True, exist_ok=True)
-        return [_copy_to_output(p, input_dir, output_dir) for p in input_dir.rglob("*") if p.is_file()]
+        for p in input_dir.rglob("*"):
+            if p.is_file():
+                _copy_to_output(p, input_dir, output_dir)
+        sanitize_extracted_tree(output_dir)
+        return [p for p in output_dir.rglob("*") if p.is_file()]
     output_dir.mkdir(parents=True, exist_ok=True)
     total = len(found)
     archive_originals = {p for archive in found for p in _archive_originals(archive)}
@@ -170,6 +220,7 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
             continue
 
         _flatten_same_name_root(extract_dir)
+        sanitize_extracted_tree(extract_dir)
         progress.progress.extract = i / total * 100
         if delete_archive:
             for p in _archive_originals(archive):
@@ -177,4 +228,5 @@ async def extract_archives(input_dir: Path, output_dir: Path, progress: JobState
     for p in input_dir.rglob("*"):
         if p.is_file() and p not in archive_originals:
             _copy_to_output(p, input_dir, output_dir)
+    sanitize_extracted_tree(output_dir)
     return [p for p in output_dir.rglob("*") if p.is_file()]

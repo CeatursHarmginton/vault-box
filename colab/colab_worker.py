@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -59,9 +60,68 @@ def check_token(x_api_token: str | None) -> None:
         raise HTTPException(status_code=401, detail="Invalid API token")
 
 
-def safe_name(name: str) -> str:
-    cleaned = "".join("_" if ch in '<>:"/\\|?*' else ch for ch in name).strip()
-    return cleaned or "pikpak-download"
+EMOJI_PATTERN = re.compile(
+    r'['
+    r'\U0001F600-\U0001F64F'
+    r'\U0001F300-\U0001F5FF'
+    r'\U0001F680-\U0001F6FF'
+    r'\U0001F700-\U0001F77F'
+    r'\U0001F780-\U0001F7FF'
+    r'\U0001F800-\U0001F8FF'
+    r'\U0001F900-\U0001F9FF'
+    r'\U0001FA00-\U0001FA6F'
+    r'\U0001FA70-\U0001FAFF'
+    r'\U0001FB00-\U0001FBFF'
+    r'\U0001F000-\U0001F02F'
+    r'\U0001F0A0-\U0001F0FF'
+    r'\U0001F100-\U0001F2FF'
+    r'\u2600-\u27BF'
+    r'\u2300-\u23FF'
+    r'\u2B00-\u2BFF'
+    r'\u2190-\u21FF'
+    r'\u203C\u2049'
+    r'\u25AA-\u25AB\u25B6\u25C0\u25FB-\u25FE'
+    r'\u2934-\u2935'
+    r'\u3030\u303D\u3297\u3299'
+    r'\uFE0E\uFE0F'
+    r'\u200D'
+    r'\u20E3'
+    r'\U000E0020-\U000E007F'
+    r']+',
+    flags=re.UNICODE,
+)
+
+
+def strip_emoji(name: str) -> str:
+    cleaned = re.sub(r'[0-9#*]\uFE0F?\u20E3', '', str(name or ''))
+    return EMOJI_PATTERN.sub('', cleaned)
+
+
+def safe_name(name: str, is_dir: bool = False) -> str:
+    clean = strip_emoji(str(name or ('folder' if is_dir else 'pikpak-download')))
+    clean = ''.join(c for c in clean if c not in '<>:"/\\|?*')
+    if is_dir:
+        clean = re.sub(r'\s+', ' ', clean).strip().strip('.')
+        return clean or 'folder'
+
+    idx = clean.rfind('.')
+    if idx > 0:
+        stem, ext = clean[:idx], clean[idx:]
+    elif idx == 0:
+        stem, ext = '', clean
+    else:
+        stem, ext = clean, ''
+
+    stem = re.sub(r'\s+', ' ', stem).strip().strip('.')
+    ext = ext.strip()
+
+    if not stem and not ext:
+        return 'pikpak-download'
+    if not stem:
+        if ext.startswith('.'):
+            return f'pikpak-download{ext}'
+        return ext
+    return f'{stem}{ext}'
 
 
 @app.get("/health")

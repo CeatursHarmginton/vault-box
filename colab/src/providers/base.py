@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
+import re
 import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -348,9 +349,66 @@ def _download_error_payload(path: Path, content_type: str, strict: bool) -> dict
         return None
     return payload
 
-def safe_name(name: str) -> str:
-    clean = "".join(c for c in str(name or "file") if c not in '<>:"/\\|?*').strip().strip(".")
-    return clean or "file"
+EMOJI_PATTERN = re.compile(
+    r'['
+    r'\U0001F600-\U0001F64F'  # Emoticons
+    r'\U0001F300-\U0001F5FF'  # Misc Symbols and Pictographs
+    r'\U0001F680-\U0001F6FF'  # Transport and Map
+    r'\U0001F700-\U0001F77F'  # Alchemical Symbols
+    r'\U0001F780-\U0001F7FF'  # Geometric Shapes Extended
+    r'\U0001F800-\U0001F8FF'  # Supplemental Arrows-C
+    r'\U0001F900-\U0001F9FF'  # Supplemental Symbols and Pictographs
+    r'\U0001FA00-\U0001FA6F'  # Chess Symbols
+    r'\U0001FA70-\U0001FAFF'  # Symbols and Pictographs Extended-A
+    r'\U0001FB00-\U0001FBFF'  # Symbols for Legacy Computing
+    r'\U0001F000-\U0001F02F'  # Mahjong Tiles
+    r'\U0001F0A0-\U0001F0FF'  # Playing Cards
+    r'\U0001F100-\U0001F2FF'  # Enclosed Alphanumeric / Ideographic Supplement / Flags
+    r'\u2600-\u27BF'          # Misc Symbols & Dingbats
+    r'\u2300-\u23FF'          # Misc Technical
+    r'\u2B00-\u2BFF'          # Misc Symbols and Arrows
+    r'\u2190-\u21FF'          # Arrows
+    r'\u203C\u2049'          # ‼, ⁉
+    r'\u25AA-\u25AB\u25B6\u25C0\u25FB-\u25FE'  # Geometric shapes
+    r'\u2934-\u2935'          # ⤴, ⤵
+    r'\u3030\u303D\u3297\u3299'  # CJK symbols used as emoji
+    r'\uFE0E\uFE0F'          # Variation Selectors
+    r'\u200D'                # Zero Width Joiner
+    r'\u20E3'                # Combining Enclosing Keycap
+    r'\U000E0020-\U000E007F'  # Tag characters
+    r']+',
+    flags=re.UNICODE,
+)
+
+def strip_emoji(name: str) -> str:
+    cleaned = re.sub(r'[0-9#*]\uFE0F?\u20E3', '', str(name or ''))
+    return EMOJI_PATTERN.sub('', cleaned)
+
+def safe_name(name: str, is_dir: bool = False) -> str:
+    clean = strip_emoji(str(name or ('folder' if is_dir else 'file')))
+    clean = ''.join(c for c in clean if c not in '<>:"/\\|?*')
+    if is_dir:
+        clean = re.sub(r'\s+', ' ', clean).strip().strip('.')
+        return clean or 'folder'
+
+    idx = clean.rfind('.')
+    if idx > 0:
+        stem, ext = clean[:idx], clean[idx:]
+    elif idx == 0:
+        stem, ext = '', clean
+    else:
+        stem, ext = clean, ''
+
+    stem = re.sub(r'\s+', ' ', stem).strip().strip('.')
+    ext = ext.strip()
+
+    if not stem and not ext:
+        return 'file'
+    if not stem:
+        if ext.startswith('.'):
+            return f'file{ext}'
+        return ext
+    return f'{stem}{ext}'
 
 _safe_name = safe_name
 
