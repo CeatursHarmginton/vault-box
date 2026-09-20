@@ -174,11 +174,12 @@ async def run_transfer(job: JobState) -> None:
             # Only ask for confirmation if there are actual optimized image results
             actual_compressed = [f for f in (job.optimized_files or []) if f.get("status") != "Skipped"]
             if actual_compressed:
+                is_opt_page = bool(options.get("is_optimize_page") or payload.get("is_optimize_page") or payload.get("mode") == "optimize" or payload.get("job_type") == "optimize")
                 conf_mode = options.get("confirm_action") or options.get("confirmation_mode")
                 if conf_mode == "replace":
                     action = "replace"
                     job.log("Confirmation strategy: replace original files directly.")
-                elif conf_mode in ("upload_new", "auto"):
+                elif conf_mode in ("upload_new", "auto") or options.get("_auto_confirm_upload_new") or options.get("is_optimize_page") is False:
                     action = "upload_new"
                     options["_auto_confirm_upload_new"] = True
                     job.log("Confirmation strategy: auto upload as new (fallback to replace if failed).")
@@ -218,7 +219,18 @@ async def run_transfer(job: JobState) -> None:
                     upload_item = {"_replace_refs": _optimized_replace_refs(job, job.optimized_files, out_root, upload_root, opt_input)}
                     result = await _upload_outputs_with_retry(job, target, options, dst, upload_root, upload_item)
                 else:
-                    result = await dst.upload_folder(target.get("credentials") or {}, upload_root, _upload_target(target.get("folder") or {}, "", options), job)
+                    while True:
+                        try:
+                            result = await dst.upload_folder(target.get("credentials") or {}, upload_root, _upload_target(target.get("folder") or {}, "", options), job)
+                            job.error = None
+                            break
+                        except ProviderFailure as exc:
+                            if exc.code != "UPLOAD_FAILED":
+                                raise
+                            if _fallback_auto_upload_new_to_replace(job, options, exc):
+                                continue
+                            await _wait_for_retry_account(job, target, exc)
+                            continue
         _mark_remaining_items_completed(job, source)
         job.log(f"Done: Downloaded {job.files_downloaded}/{job.files_to_download} file(s), Uploaded {job.files_uploaded}/{job.files_to_upload} file(s) (skipped {job.files_skipped} file(s))")
         _log_skip_summary(job)
@@ -355,11 +367,12 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
             continue
 
         if batch_results and action is None:
+            is_opt_page = bool(options.get("is_optimize_page") or (job.payload or {}).get("is_optimize_page") or (job.payload or {}).get("mode") == "optimize" or (job.payload or {}).get("job_type") == "optimize")
             conf_mode = options.get("confirm_action") or options.get("confirmation_mode")
             if conf_mode == "replace":
                 action = "replace"
                 job.log("Confirmation strategy: replace original files directly.")
-            elif conf_mode in ("upload_new", "auto"):
+            elif conf_mode in ("upload_new", "auto") or options.get("_auto_confirm_upload_new") or options.get("is_optimize_page") is False:
                 action = "upload_new"
                 options["_auto_confirm_upload_new"] = True
                 job.log("Confirmation strategy: auto upload as new (fallback to replace if failed).")
