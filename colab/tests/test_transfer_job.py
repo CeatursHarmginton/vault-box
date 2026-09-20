@@ -114,6 +114,69 @@ def test_links_provider_treats_gofile_direct_download_as_direct(tmp_path, monkey
     assert seen["url"] == [url]
     assert out.name == "file.rar"
 
+def test_links_provider_resolves_and_downloads_sorafolder(tmp_path, monkeypatch):
+    provider = LinksProvider()
+    seen = {}
+
+    class ResponsePage:
+        text = '<html><script>const keyEncrypte = "test_key_123"; const fileName = "Cosplay_Album.rar";</script></html>'
+
+        def raise_for_status(self):
+            return None
+
+    class ResponseApi:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"url": "U2FsdGVkX1/7wF5AgAaHSFtFpkXETZBiYwNpnc9iD6vDc1qRGzo1k9ew/tovyYmDU0ZahcOkhVdBSmwBPgMCfgviBJxpOWqCcyA/uqXAVvnCh8K/qF1qbxtSHWpJyUO6jZnmqTFZH30ZWaaU5HZvOAe339i9nKADJFVZMEdQz+ln+hZbftwzEO8TNRkwXUmW"}
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url):
+            seen["get_url"] = url
+            return ResponsePage()
+
+        async def post(self, url, json=None, headers=None):
+            seen["post_url"] = url
+            seen["post_json"] = json
+            seen["post_headers"] = headers
+            return ResponseApi()
+
+    async def no_deps():
+        return None
+
+    async def fake_aria2(url, dest_dir, name, progress, headers=None):
+        seen["aria2_url"] = url
+        seen["aria2_name"] = name
+        seen["aria2_headers"] = headers
+        out = dest_dir / name
+        out.write_text("ok")
+        return [out]
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr("src.providers.links.httpx.AsyncClient", Client)
+    monkeypatch.setattr(provider, "_download_aria2", fake_aria2)
+
+    sora_url = "https://sorafolder.com/d/rhqhCS3pTdXwJiD5HkyphQ"
+    out = asyncio.run(provider.download_file({}, {"id": sora_url, "name": "rhqhCS3pTdXwJiD5HkyphQ"}, tmp_path, JobState("sorafolder", {})))
+
+    assert seen["get_url"] == sora_url
+    assert seen["post_url"] == "https://sorafolder.com/file-down"
+    assert seen["post_json"] == {"keyEncrypte": "test_key_123"}
+    assert seen["aria2_url"].startswith("https://cdn.sorafolder.com/")
+    assert seen["aria2_name"] == "Cosplay_Album.rar"
+    assert seen["aria2_headers"]["Referer"] == "https://sorafolder.com/"
+    assert out.name == "Cosplay_Album.rar"
+
 def test_links_provider_passes_multiple_urls_to_aria2(tmp_path, monkeypatch):
     provider = LinksProvider()
     cmd_seen = []

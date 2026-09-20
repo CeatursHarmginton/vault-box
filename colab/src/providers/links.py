@@ -1,6 +1,9 @@
 from __future__ import annotations
 import asyncio
+import base64
+import hashlib
 import html
+import json
 import os
 import re
 import shutil
@@ -42,6 +45,14 @@ class LinksProvider(BaseProvider):
         except ImportError:
             missing.append("gdown")
             
+        try:
+            from cryptography.hazmat.primitives.ciphers import Cipher
+        except ImportError:
+            try:
+                import Crypto.Cipher.AES
+            except ImportError:
+                missing.append("cryptography")
+            
         if missing:
             subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q'] + missing)
             
@@ -58,6 +69,9 @@ class LinksProvider(BaseProvider):
             
         if "mediafire.com" in url_lower:
             return "mediafire"
+
+        if "sorafolder.com" in url_lower:
+            return "sorafolder"
 
         ytdlp_domains = [
             "youtube", "youtu.be", "tiktok", "bilibili", "vimeo", 
@@ -386,6 +400,107 @@ class LinksProvider(BaseProvider):
         progress.log("Resolved MediaFire direct download URL")
         return await self._download_aria2(direct, dest_dir, name, progress)
 
+    @staticmethod
+    def _evp_bytes_to_key(password: bytes, salt: bytes, key_len: int = 32, iv_len: int = 16) -> tuple[bytes, bytes]:
+        d = b""
+        d_i = b""
+        while len(d) < (key_len + iv_len):
+            d_i = hashlib.md5(d_i + password + salt).digest()
+            d += d_i
+        return d[:key_len], d[key_len:key_len + iv_len]
+
+    @classmethod
+    def _decrypt_sorafolder_ciphertext(cls, encrypted_b64: str) -> str:
+        raw = base64.b64decode(encrypted_b64)
+        if not raw.startswith(b"Salted__"):
+            raise ValueError("Invalid OpenSSL ciphertext header")
+        salt = raw[8:16]
+        ciphertext = raw[16:]
+        password = b"Ak7qrvvH4WKYxV2OgaeHAEg2a5eh16vE"
+        key, iv = cls._evp_bytes_to_key(password, salt, 32, 16)
+
+        try:
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            from cryptography.hazmat.backends import default_backend
+            cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+            decryptor = cipher.decryptor()
+            padded = decryptor.update(ciphertext) + decryptor.finalize()
+        except ImportError:
+            try:
+                from Crypto.Cipher import AES
+                cipher = AES.new(key, AES.MODE_CBC, iv)
+                padded = cipher.decrypt(ciphertext)
+            except ImportError:
+                raise ProviderFailure("DOWNLOAD_FAILED", "Neither cryptography nor pycryptodome is installed for SoraFolder decryption")
+
+        pad_len = padded[-1]
+        if pad_len < 1 or pad_len > 16:
+            raise ValueError("Invalid PKCS7 padding")
+        return padded[:-pad_len].decode("utf-8")
+
+    async def _resolve_sorafolder_url(self, url: str) -> tuple[str, str | None, dict[str, str]]:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            text = resp.text
+
+            m_key = re.search(r'keyEncrypte\s*[:=]\s*[\x22\x27]([^\x22\x27]+)[\x22\x27]', text)
+            m_name = re.search(r'fileName\s*[:=]\s*[\x22\x27]([^\x22\x27]+)[\x22\x27]', text)
+            if not m_key:
+                raise ProviderFailure("DOWNLOAD_FAILED", "Could not extract encryption key from SoraFolder page")
+
+            key_enc = m_key.group(1)
+            file_name = m_name.group(1) if m_name else None
+
+            post_headers = {
+                **headers,
+                "Content-Type": "application/json",
+                "Referer": url,
+                "Origin": "https://sorafolder.com",
+            }
+            api_resp = await client.post("https://sorafolder.com/file-down", json={"keyEncrypte": key_enc}, headers=post_headers)
+            api_resp.raise_for_status()
+            data = api_resp.json()
+            if not data or "url" not in data:
+                raise ProviderFailure("DOWNLOAD_FAILED", "Invalid response from SoraFolder API")
+
+            cdn_url = self._decrypt_sorafolder_ciphertext(data["url"])
+            if not file_name:
+                try:
+                    token_part = urlparse(cdn_url).path.strip("/").split("/")[-1]
+                    parts = token_part.split(".")
+                    if len(parts) >= 2:
+                        payload = parts[1]
+                        pad = len(payload) % 4
+                        if pad:
+                            payload += "=" * (4 - pad)
+                        jwt_data = json.loads(base64.urlsafe_b64decode(payload))
+                        file_name = jwt_data.get("filename")
+                except Exception:
+                    pass
+
+            download_headers = {
+                "User-Agent": headers["User-Agent"],
+                "Referer": "https://sorafolder.com/",
+            }
+            return cdn_url, file_name, download_headers
+
+    async def _download_sorafolder(self, url: str, dest_dir: Path, name: str | None, progress: JobState) -> list[Path]:
+        progress.log(f"Resolving SoraFolder URL: {url}")
+        direct_url, resolved_name, headers = await self._resolve_sorafolder_url(url)
+        if not name or name == "file" or name.startswith("download_") or "." not in name:
+            name = safe_name(resolved_name) if resolved_name else name
+        progress.log(f"Resolved SoraFolder direct URL for file: {name or 'unknown'}")
+        try:
+            return await self._download_aria2(direct_url, dest_dir, name, progress, headers=headers)
+        except Exception as exc:
+            progress.log(f"aria2c download failed ({exc}); re-resolving fresh token and retrying with HTTP stream")
+            direct_url, resolved_name, headers = await self._resolve_sorafolder_url(url)
+            return await self._download_http_stream(direct_url, dest_dir, name, progress, headers=headers)
+
     async def validate_credentials(self, credentials: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True}
 
@@ -426,6 +541,8 @@ class LinksProvider(BaseProvider):
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Gofile page links are not direct downloads. Click Download in browser, stop it, copy the store-*.gofile.io/download/web/... URL, then paste that link.")
         elif link_type == "mediafire":
             downloaded = await self._download_mediafire(url, dest_dir, name, progress)
+        elif link_type == "sorafolder":
+            downloaded = await self._download_sorafolder(url, dest_dir, name, progress)
         elif link_type == "ytdlp":
             try:
                 downloaded = await self._download_ytdlp(url, dest_dir, name, progress, headers=headers)
