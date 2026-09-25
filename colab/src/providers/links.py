@@ -490,11 +490,7 @@ class LinksProvider(BaseProvider):
     ) -> list[Path]:
         if not shutil.which("N_m3u8DL-RE"):
             progress.log("N_m3u8DL-RE not found in PATH, falling back to yt-dlp...")
-            target_fallback = page_url if page_url and page_url != url else url
-            try:
-                return await self._download_ytdlp(target_fallback, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
-            except TypeError:
-                return await self._download_ytdlp(target_fallback, dest_dir, name, progress, headers=headers)
+            return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
 
         dest_dir.mkdir(parents=True, exist_ok=True)
         before = set(dest_dir.iterdir()) if dest_dir.exists() else set()
@@ -610,12 +606,17 @@ class LinksProvider(BaseProvider):
 
         if not new_files or process.returncode != 0:
             err_detail = f" (code {process.returncode}: {' | '.join(last_lines[-2:])})" if (last_lines and process.returncode != 0) else ""
-            target_fallback = page_url if page_url and page_url != url else url
-            progress.log(f"N_m3u8DL-RE produced no output file on disk{err_detail}, falling back to yt-dlp ({target_fallback[:80]})...")
+            progress.log(f"N_m3u8DL-RE produced no output file on disk{err_detail}, falling back to yt-dlp for direct stream...")
             try:
-                return await self._download_ytdlp(target_fallback, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
-            except TypeError:
-                return await self._download_ytdlp(target_fallback, dest_dir, name, progress, headers=headers)
+                return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
+            except Exception as direct_err:
+                if page_url and page_url != url:
+                    progress.log(f"[Fallback] Direct stream download failed ({direct_err}). Retrying download from canonical page URL with yt-dlp: {page_url[:80]}...")
+                    try:
+                        return await self._download_ytdlp(page_url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
+                    except Exception:
+                        pass
+                raise ProviderFailure("DOWNLOAD_FAILED", f"Stream download failed: N_m3u8DL-RE error{err_detail}; yt-dlp direct error: {direct_err}")
 
         return new_files
 
@@ -1130,17 +1131,6 @@ class LinksProvider(BaseProvider):
         name = safe_name(raw_name) if raw_name else None
         link_type = self._classify_link(url)
 
-        # Check if URL belongs to known client-IP bound / HMAC-locked CDNs that return 410 on Colab
-        url_lower = url.lower()
-        is_ip_bound_cdn = any(cdn in url_lower for cdn in [
-            "phncdn.com", "pornhub.com/hls", "xhcdn.com", "xvideos-cdn.com", "xv-cdn.com"
-        ])
-        if is_ip_bound_cdn and page_url:
-            progress.log(f"[links] CDN stream has client-IP bound HMAC token (returns 410 Gone on datacenter IP). Routing to canonical page URL via yt-dlp: {page_url}")
-            url = page_url
-            urls = [page_url]
-            link_type = "ytdlp"
-
         progress.log(f"[links] {link_type}: {url[:120]}")
 
         dest_dir = local_path.parent if local_path.suffix else local_path
@@ -1185,9 +1175,41 @@ class LinksProvider(BaseProvider):
             )
         except ProviderFailure as exc:
             msg = str(exc.message).lower()
-            # Fallback 1: If stream failed with 410/403/failure and we have page_url, try page_url with yt-dlp!
-            if page_url and page_url != url:
-                progress.log(f"[Fallback] Direct stream download failed ({exc.message}). Retrying download from canonical page URL with yt-dlp: {page_url}...")
+            is_blocked = (
+                exc.code in ("DOWNLOAD_FAILED",)
+                and any(err in msg for err in ("403", "forbidden", "429", "410", "gone", "blocked"))
+            )
+
+            # Fallback 1: If blocked or failed, retry with SOCKS5 Proxy
+            if is_blocked:
+                progress.log(f"[Proxy] Download blocked ({exc.message}). Activating TCP SOCKS5 proxy and retrying...")
+                proxy = await self._ensure_tor_proxy(progress)
+                if proxy:
+                    progress.log(f"[Proxy] Retrying direct stream via {proxy}...")
+                    try:
+                        downloaded = await self._dispatch_download(
+                            link_type, is_stream, url, urls, dest_dir, name, progress,
+                            headers=headers, cookies=cookies, dec_key=dec_key, file_ref=file_ref, proxy=proxy,
+                            page_url=page_url,
+                        )
+                    except Exception as stream_proxy_exc:
+                        if page_url and page_url != url:
+                            progress.log(f"[Proxy] Direct stream via proxy failed ({stream_proxy_exc}). Retrying canonical page URL via yt-dlp: {page_url}...")
+                            try:
+                                downloaded = await self._download_ytdlp(
+                                    page_url, dest_dir, name, progress,
+                                    headers=headers, cookies=cookies, proxy=proxy,
+                                )
+                            except Exception:
+                                downloaded = None
+                        if not downloaded:
+                            raise exc
+                else:
+                    progress.log("[Proxy] Proxy unavailable.")
+
+            # Fallback 2: If stream failed and we have page_url, try page_url with yt-dlp as last resort
+            if not downloaded and page_url and page_url != url:
+                progress.log(f"[Fallback] Retrying download from canonical page URL with yt-dlp: {page_url}...")
                 try:
                     downloaded = await self._download_ytdlp(
                         page_url, dest_dir, name, progress,
@@ -1197,28 +1219,8 @@ class LinksProvider(BaseProvider):
                     progress.log(f"[Fallback] Page URL download failed: {page_exc}")
                     downloaded = None
 
-            # Fallback 2: Proxy retry if blocked (403, 410, 429, forbidden, gone)
             if not downloaded:
-                is_blocked = (
-                    exc.code in ("DOWNLOAD_FAILED",)
-                    and any(err in msg for err in ("403", "forbidden", "429", "410", "gone", "blocked"))
-                )
-                if not is_blocked:
-                    raise exc
-                progress.log(f"[Proxy] Download blocked ({exc.message}). Activating TCP SOCKS5 proxy and retrying...")
-                proxy = await self._ensure_tor_proxy(progress)
-                if not proxy:
-                    progress.log("[Proxy] Proxy unavailable. Skipping retry.")
-                    raise exc
-                progress.log(f"[Proxy] Retrying download via {proxy}...")
-                retry_url = page_url if page_url else url
-                retry_type = "ytdlp" if page_url else link_type
-                retry_stream = False if page_url else is_stream
-                downloaded = await self._dispatch_download(
-                    retry_type, retry_stream, retry_url, [retry_url], dest_dir, name, progress,
-                    headers=headers, cookies=cookies, dec_key=dec_key, file_ref=file_ref, proxy=proxy,
-                    page_url=page_url,
-                )
+                raise exc
 
         if not downloaded:
             raise ProviderFailure("DOWNLOAD_FAILED", "Download completed but no files found on disk")
