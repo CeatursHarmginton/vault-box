@@ -209,31 +209,42 @@ class LinksProvider(BaseProvider):
 
     def _update_stream_progress(self, line: str, progress: JobState, default_size: int = 0) -> None:
         """Parse real speed, percentage, and size from N_m3u8DL-RE / yt-dlp stdout."""
-        m_pct = re.search(r'([0-9.]+)%', line)
-        m_spd = re.search(r'([0-9.]+)\s*([KMGT]?i?B)/s', line, re.IGNORECASE)
-        m_sz = re.search(r'of\s*~?\s*([0-9.]+)\s*([KMGT]?i?B)', line, re.IGNORECASE)
+        try:
+            m_sz = re.search(r'of\s*~?\s*(\d+(?:\.\d+)?)\s*([KMGT]?i?B)', line, re.IGNORECASE)
+            if m_sz:
+                try:
+                    val = float(m_sz.group(1))
+                    unit = m_sz.group(2).upper().replace('I', '')
+                    mult = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}.get(unit, 1024**2)
+                    progress.bytes_total = int(val * mult)
+                except (ValueError, TypeError):
+                    pass
+            elif not progress.bytes_total and default_size:
+                progress.bytes_total = default_size
 
-        if m_sz:
-            val = float(m_sz.group(1))
-            unit = m_sz.group(2).upper().replace('I', '')
-            mult = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}.get(unit, 1024**2)
-            progress.bytes_total = int(val * mult)
-        elif not progress.bytes_total and default_size:
-            progress.bytes_total = default_size
+            m_pct = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
+            if m_pct:
+                try:
+                    pct = float(m_pct.group(1))
+                    progress.progress.download = min(100.0, pct)
+                    if progress.bytes_total:
+                        progress.bytes_done = int(progress.bytes_total * (pct / 100.0))
+                except (ValueError, TypeError):
+                    pass
 
-        if m_pct:
-            pct = float(m_pct.group(1))
-            progress.progress.download = min(100.0, pct)
-            if progress.bytes_total:
-                progress.bytes_done = int(progress.bytes_total * (pct / 100.0))
+            m_spd = re.search(r'(\d+(?:\.\d+)?)\s*([KMGT]?i?B)/s', line, re.IGNORECASE)
+            if m_spd:
+                try:
+                    val = float(m_spd.group(1))
+                    unit = m_spd.group(2).upper().replace('I', '')
+                    mult = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}.get(unit, 1024**2)
+                    progress.speed = val * mult
+                except (ValueError, TypeError):
+                    pass
 
-        if m_spd:
-            val = float(m_spd.group(1))
-            unit = m_spd.group(2).upper().replace('I', '')
-            mult = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}.get(unit, 1024**2)
-            progress.speed = val * mult
-
-        progress.updated_at = time.time()
+            progress.updated_at = time.time()
+        except Exception:
+            pass
 
     def _http_headers(self, headers: dict[str, str] | None, *, range_header: str | None = None, cookies: str | None = None) -> dict[str, str]:
         out = {str(k): str(v) for k, v in (headers or {}).items() if v and str(k).lower() not in ("host", "content-length", "accept-encoding", "connection", "transfer-encoding")}
@@ -482,7 +493,6 @@ class LinksProvider(BaseProvider):
             "--del-after-done",
             "--no-ansi-color",
             "--auto-select",
-            "-sv", "best",
             "--binary-merge",
         ]
         if shutil.which("ffmpeg"):
@@ -552,6 +562,8 @@ class LinksProvider(BaseProvider):
                 and p.stat().st_size > 0
             ]
 
+        if not new_files or process.returncode != 0:
+            progress.log("N_m3u8DL-RE produced no output file on disk, falling back to yt-dlp...")
             try:
                 return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
             except TypeError:
@@ -606,6 +618,9 @@ class LinksProvider(BaseProvider):
             cmd.extend(["--user-agent", default_ua])
         if not has_ref and default_ref:
             cmd.extend(["--referer", default_ref])
+
+        if shutil.which("ffmpeg"):
+            cmd.extend(["--remux-video", "mp4"])
 
         skip_hdrs = ("host", "content-length", "accept-encoding", "connection", "range", "transfer-encoding")
         if req_headers:

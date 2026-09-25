@@ -247,14 +247,17 @@ async def run_transfer(job: JobState) -> None:
         job.set(status="completed", step="completed")
     except JobCancelled:
         job.error = {"code": "JOB_CANCELLED", "message": "Job cancelled", "details": {}}
+        _mark_remaining_items_failed(job, source, "Cancelled")
         job.set(status="cancelled", step="cancelled")
     except ProviderFailure as exc:
         job.error = {"code": exc.code, "message": exc.message, "details": exc.details}
         job.log(f"Failed: {exc.code} {exc.message}")
+        _mark_remaining_items_failed(job, source, f"{exc.code}: {exc.message}")
         job.set(status="failed", step="failed")
     except Exception as exc:
         job.error = {"code": "TRANSFER_FAILED", "message": str(exc), "details": {"type": exc.__class__.__name__}}
         job.log(f"Failed: {exc}")
+        _mark_remaining_items_failed(job, source, str(exc))
         job.set(status="failed", step="failed")
     finally:
         # Nested finally: an await here can be interrupted by cancellation, and the credential
@@ -640,6 +643,26 @@ def _mark_remaining_items_completed(job: JobState, source: dict[str, Any]) -> No
             "endTime": timing.get("endTime"),
             "duration": timing.get("duration"),
         })
+
+def _mark_remaining_items_failed(job: JobState, source: dict[str, Any], reason: str) -> None:
+    """Mark any uncompleted item as failed in job.failed_items when a job fails."""
+    seen = {(str(entry.get("provider") or ""), str(entry.get("accountId") or entry.get("account_id") or ""), str(entry.get("id") or "")) for entry in (*job.failed_items, *job.completed_items)}
+    for item in (source.get("items") or []):
+        ref = _queue_item_ref(source, item)
+        key = (str(ref.get("provider") or ""), str(ref.get("accountId") or ref.get("account_id") or ""), str(ref.get("id") or ""))
+        if key not in seen:
+            item_k = _queue_item_key(source, item)
+            job.finish_item(item_k, status="failed", name=_item_name(item))
+            timing = job.item_timings.get(item_k) or {}
+            job.failed_items.append({
+                **ref,
+                "name": _item_name(item),
+                "reason": reason,
+                "startTime": timing.get("startTime"),
+                "endTime": timing.get("endTime"),
+                "duration": timing.get("duration"),
+            })
+            seen.add(key)
 
 def _log_skip_summary(job: JobState) -> None:
     if not job.failed_items:
