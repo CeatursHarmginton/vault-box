@@ -63,28 +63,42 @@ def calculate_thumbnail_timestamp(
     """
     Calculate optimal frame timestamp deep within video to bypass identical intros/logos/bumpers.
 
-    - Custom offset/percent if provided by user options.
-    - Duration <= 5s: seek to 50%
-    - Duration <= 30s: seek to 30%
-    - Duration <= 120s: seek to max(15s, 20%)
-    - Duration > 120s: seek to max(30s, min(duration * 15%, 300s))
+    - Custom offset if provided by user (seconds).
+    - Percentage-based: defaults to 20.0% of total video duration.
+    - Accepts custom_percent in range 0.0-1.0 (e.g. 0.20) or 1.0-100.0 (e.g. 20.0).
+    - Clamped safely to guarantee skipping intro while avoiding outro/credits.
     """
     if custom_offset is not None and 0 < custom_offset < duration:
         return custom_offset
-    if custom_percent is not None and 0 < custom_percent < 1.0:
-        return duration * custom_percent
 
-    if duration <= 5.0:
-        return max(0.5, duration * 0.5)
-    elif duration <= 30.0:
-        return max(2.0, duration * 0.3)
-    elif duration <= 120.0:
-        return max(15.0, min(duration * 0.2, duration - 5.0))
+    pct = 0.20  # Default 20%
+    if custom_percent is not None:
+        try:
+            val = float(custom_percent)
+            if val > 1.0:
+                pct = val / 100.0
+            elif val > 0.0:
+                pct = val
+        except (ValueError, TypeError):
+            pct = 0.20
+
+    pct = max(0.01, min(pct, 0.95))
+    target = duration * pct
+
+    # Guardrails: skip intro while avoiding outro
+    if duration > 60.0:
+        target = max(15.0, target)
+    elif duration > 15.0:
+        target = max(5.0, target)
+
+    if duration > 20.0:
+        target = min(target, duration - 5.0)
+    elif duration > 3.0:
+        target = min(target, duration - 1.0)
     else:
-        # Default for longer videos: 15% depth, minimum 30s in to skip intro/sponsor/bumper, max 5 minutes in
-        target = duration * 0.15
-        target = max(30.0, min(target, 300.0))
-        return min(target, duration - 10.0)
+        target = duration * 0.5
+
+    return round(target, 2)
 
 
 def is_frame_bright_enough(image_path: Path, min_brightness: float = 18.0) -> bool:
@@ -129,12 +143,13 @@ def extract_deep_frame(
 
     # Candidate timestamps to try if first one is too dark
     candidates = [base_ts]
-    if base_ts + 15.0 < duration - 5.0:
-        candidates.append(base_ts + 15.0)
-    if base_ts + 35.0 < duration - 5.0:
-        candidates.append(base_ts + 35.0)
-    if duration * 0.4 < duration - 5.0 and duration * 0.4 not in candidates:
-        candidates.append(duration * 0.4)
+    for delta in (15.0, 35.0):
+        alt = base_ts + delta
+        if alt < duration - 3.0 and alt > base_ts + 2.0:
+            candidates.append(round(alt, 2))
+    alt_pct = duration * 0.35
+    if alt_pct < duration - 3.0 and alt_pct > base_ts + 5.0 and round(alt_pct, 2) not in candidates:
+        candidates.append(round(alt_pct, 2))
 
     for ts in candidates:
         try:
@@ -202,7 +217,7 @@ def embed_thumbnail(video_path: Path, thumb_path: Path, progress: JobState | Non
         res = subprocess.run(cmd, capture_output=True, timeout=120)
         if res.returncode == 0 and temp_out.exists() and temp_out.stat().st_size > 0:
             # Overwrite original atomically
-            shutil.move(str(temp_out), str(video_path))
+            os.replace(str(temp_out), str(video_path))
             return True
         else:
             if progress:
@@ -228,8 +243,9 @@ def process_video_thumbnails(
 ) -> list[Path]:
     """
     Process downloaded files:
-    For each video (.mp4, .m4v, .mov, .mkv), extracts a representative deep frame,
-    embeds it into the container as attached_pic, and caches thumbnail bytes for Drive API upload.
+    For each video, extracts a representative deep frame at configured percentage (default 20%),
+    embeds it into the container as attached_pic (for MP4/MKV/MOV/M4V), and caches thumbnail
+    bytes for cloud upload metadata (e.g. Google Drive contentHints).
     Runs fast with zero re-encoding (-c copy).
     """
     if not options.get("set_video_thumbnail", True):
@@ -240,7 +256,7 @@ def process_video_thumbnails(
             progress.log("[Thumbnail] ffmpeg/ffprobe not found; skipping video thumbnailing.")
         return files
 
-    supported_exts = {".mp4", ".m4v", ".mov", ".mkv"}
+    supported_exts = {".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".ts"}
     video_files = [p for p in files if p.suffix.lower() in supported_exts and p.is_file()]
 
     if not video_files:
@@ -276,12 +292,14 @@ def process_video_thumbnails(
                 thumb_bytes = thumb_file.read_bytes()
                 set_cached_thumbnail(video_path, thumb_bytes)
 
-                # Embed thumbnail into video container
+                # Embed thumbnail into video container (MP4, M4V, MOV, MKV)
                 success = embed_thumbnail(video_path, thumb_file, progress)
-                if success and progress:
+                if progress:
                     mins = int(used_ts // 60)
                     secs = int(used_ts % 60)
-                    progress.log(f"[Thumbnail] Set deep frame thumbnail at {mins:02d}:{secs:02d} ({used_ts:.1f}s) for {video_path.name}")
+                    pct_val = (used_ts / duration) * 100.0
+                    action_desc = "embedded cover" if success else "cached for Drive"
+                    progress.log(f"[Thumbnail] Set deep frame ({pct_val:.0f}%, {mins:02d}:{secs:02d} / {used_ts:.1f}s, {action_desc}) for {video_path.name}")
             except Exception as exc:
                 if progress:
                     progress.log(f"[Thumbnail] Failed for {video_path.name}: {exc}")

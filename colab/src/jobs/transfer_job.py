@@ -274,6 +274,11 @@ async def run_transfer(job: JobState) -> None:
         try:
             await close_shared_clients()
         finally:
+            try:
+                from ..utils.video_thumbnail import clear_cached_thumbnails
+                clear_cached_thumbnails()
+            except Exception:
+                pass
             if job.status == "completed" and (payload.get("options") or {}).get("cleanupAfterFinish", True):
                 cleanup_job(job.job_id)
             # Drop provider credential refs after run.
