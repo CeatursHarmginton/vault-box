@@ -438,6 +438,24 @@ class LinksProvider(BaseProvider):
         clean_name = (name or safe_name(unquote(Path(urlparse(url).path).name) or "stream")).replace(".mp4", "").replace(".ts", "")
         dest_dir.mkdir(parents=True, exist_ok=True)
         tmp_dir = dest_dir / f".tmp-{uuid.uuid4().hex[:8]}"
+        progress.current_file = clean_name
+
+        parsed_url = urlparse(url)
+        default_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        default_ref = f"{parsed_url.scheme}://{parsed_url.netloc}/" if parsed_url.netloc else ""
+        default_origin = f"{parsed_url.scheme}://{parsed_url.netloc}" if parsed_url.netloc else ""
+
+        req_headers = dict(headers or {})
+        has_ua = any(k.lower() == "user-agent" for k in req_headers)
+        has_ref = any(k.lower() == "referer" for k in req_headers)
+        has_origin = any(k.lower() == "origin" for k in req_headers)
+
+        if not has_ua:
+            req_headers["User-Agent"] = default_ua
+        if not has_ref and default_ref:
+            req_headers["Referer"] = default_ref
+        if not has_origin and default_origin:
+            req_headers["Origin"] = default_origin
 
         cmd = [
             "N_m3u8DL-RE",
@@ -448,20 +466,22 @@ class LinksProvider(BaseProvider):
             "--thread-count", "32",
             "--download-retry-count", "5",
             "--http-request-timeout", "15",
+            "--check-segments-count", "false",
+            "--del-after-done",
             "--no-ansi-color",
             "--auto-select",
+            "-sv", "best",
             "--binary-merge",
         ]
         if shutil.which("ffmpeg"):
             cmd.extend(["-M", "format=mp4:muxer=ffmpeg"])
 
-        if headers:
-            for k, v in headers.items():
-                low = str(k).lower()
-                if v and low not in ("host", "content-length", "accept-encoding", "connection", "range", "transfer-encoding"):
-                    cmd.extend(["-H", f"{k}: {v}"])
+        for k, v in req_headers.items():
+            low = str(k).lower()
+            if v and low not in ("host", "content-length", "accept-encoding", "connection", "range", "transfer-encoding"):
+                cmd.extend(["-H", f"{k}: {v}"])
 
-        if cookies:
+        if cookies and "cookie" not in {str(k).lower() for k in req_headers}:
             cmd.extend(["-H", f"Cookie: {cookies}"])
 
         if dec_key and isinstance(dec_key, dict):
@@ -480,12 +500,15 @@ class LinksProvider(BaseProvider):
             stderr=asyncio.subprocess.STDOUT,
         )
 
+        last_lines: list[str] = []
         if process.stdout:
             while True:
                 line_bytes = await process.stdout.readline()
                 if not line_bytes:
                     break
                 line = line_bytes.decode("utf-8", errors="ignore").strip()
+                if line:
+                    last_lines = (last_lines + [line])[-5:]
                 progress.check_cancelled()
                 self._update_stream_progress(line, progress)
 
@@ -496,7 +519,8 @@ class LinksProvider(BaseProvider):
             new_files = [p for p in dest_dir.iterdir() if p.is_file() and p.name.startswith(clean_name)]
 
         if not new_files or process.returncode != 0:
-            progress.log("N_m3u8DL-RE produced no output file on disk, falling back to yt-dlp...")
+            err_detail = f" (exit code {process.returncode}: {' | '.join(last_lines)})" if last_lines else ""
+            progress.log(f"N_m3u8DL-RE produced no output file on disk{err_detail}, falling back to yt-dlp...")
             try:
                 return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
             except TypeError:
@@ -518,6 +542,17 @@ class LinksProvider(BaseProvider):
         out_tpl = str(dest_dir / "%(title)s.%(ext)s")
         if name:
             out_tpl = str(dest_dir / name)
+            progress.current_file = name
+        else:
+            progress.current_file = Path(urlparse(url).path).name or "stream.mp4"
+
+        parsed_url = urlparse(url)
+        default_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        default_ref = f"{parsed_url.scheme}://{parsed_url.netloc}/" if parsed_url.netloc else ""
+
+        req_headers = dict(headers or {})
+        has_ua = any(k.lower() == "user-agent" for k in req_headers)
+        has_ref = any(k.lower() == "referer" for k in req_headers)
 
         cmd = [
             "yt-dlp",
@@ -527,14 +562,20 @@ class LinksProvider(BaseProvider):
             "-N", "16",
             "--concurrent-fragments", "16",
             "--socket-timeout", "15",
-            "--fragment-retries", "5",
-            "--retries", "5",
+            "--fragment-retries", "10",
+            "--retries", "10",
+            "--hls-use-mpegts",
             "-o",
             out_tpl,
         ]
 
-        if headers:
-            for k, v in headers.items():
+        if not has_ua:
+            cmd.extend(["--user-agent", default_ua])
+        if not has_ref and default_ref:
+            cmd.extend(["--referer", default_ref])
+
+        if req_headers:
+            for k, v in req_headers.items():
                 if not v:
                     continue
                 k_low = str(k).lower()
@@ -545,14 +586,14 @@ class LinksProvider(BaseProvider):
                 elif k_low not in ("host", "content-length", "accept-encoding", "connection", "range", "transfer-encoding"):
                     cmd.extend(["--add-header", f"{k}: {v}"])
 
-        if cookies and "cookie" not in {str(k).lower() for k in (headers or {})}:
+        if cookies and "cookie" not in {str(k).lower() for k in req_headers}:
             cmd.extend(["--add-header", f"Cookie: {cookies}"])
 
         if proxy:
             cmd.extend(["--proxy", proxy])
 
         cmd.append(url)
-        progress.log(f"Starting yt-dlp download for: {url}")
+        progress.log(f"Starting yt-dlp multi-fragment download for: {url}")
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -712,7 +753,13 @@ class LinksProvider(BaseProvider):
             name = safe_name(resolved_name) if resolved_name else name
         progress.log(f"Resolved SoraFolder direct URL for file: {name or 'unknown'}")
         try:
-            return await self._download_aria2(direct_url, dest_dir, name, progress, headers=headers)
+            try:
+                if headers:
+                    return await self._download_aria2(direct_url, dest_dir, name, progress, headers=headers)
+                else:
+                    return await self._download_aria2(direct_url, dest_dir, name, progress)
+            except TypeError:
+                return await self._download_aria2(direct_url, dest_dir, name, progress)
         except Exception as exc:
             progress.log(f"aria2c download failed ({exc}); re-resolving fresh token and retrying with HTTP stream")
             direct_url, resolved_name, headers = await self._resolve_sorafolder_url(url)
@@ -821,7 +868,15 @@ class LinksProvider(BaseProvider):
 
         progress.log(f"Downloading MixDrop stream via aria2c (16 connections)...")
         try:
-            return await self._download_aria2(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=proxy)
+            try:
+                if proxy:
+                    return await self._download_aria2(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=proxy)
+                elif dl_headers:
+                    return await self._download_aria2(resolved_url, dest_dir, final_name, progress, headers=dl_headers)
+                else:
+                    return await self._download_aria2(resolved_url, dest_dir, final_name, progress)
+            except TypeError:
+                return await self._download_aria2(resolved_url, dest_dir, final_name, progress)
         except Exception as exc:
             progress.log(f"aria2c failed ({exc}); falling back to HTTP stream downloader")
             return await self._download_http_stream(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=proxy)
@@ -857,7 +912,18 @@ class LinksProvider(BaseProvider):
         else:
             progress.log("Downloading via aria2c (16 connections)...")
             try:
-                return await self._download_aria2(urls, dest_dir, name, progress, headers=headers, proxy=proxy, cookies=cookies)
+                try:
+                    if proxy or cookies:
+                        return await self._download_aria2(urls, dest_dir, name, progress, headers=headers, proxy=proxy, cookies=cookies)
+                    elif headers:
+                        return await self._download_aria2(urls, dest_dir, name, progress, headers=headers)
+                    else:
+                        return await self._download_aria2(urls, dest_dir, name, progress)
+                except TypeError:
+                    try:
+                        return await self._download_aria2(urls, dest_dir, name, progress, headers=headers)
+                    except TypeError:
+                        return await self._download_aria2(urls, dest_dir, name, progress)
             except Exception as exc:
                 progress.log(f"aria2c failed ({exc}); falling back to browser-compatible HTTP stream downloader...")
                 return await self._download_http_stream(urls, dest_dir, name, progress, headers=headers, proxy=proxy, cookies=cookies)
