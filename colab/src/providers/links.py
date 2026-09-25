@@ -633,7 +633,11 @@ class LinksProvider(BaseProvider):
             try:
                 return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
             except Exception as direct_err:
-                if page_url and page_url != url:
+                has_page_extractor = any(d in (page_url or "").lower() for d in [
+                    "pornhub", "youtube", "youtu.be", "tiktok", "bilibili", "vimeo", 
+                    "dailymotion", "twitch", "xvideos", "xhamster", "spankbang", "redtube"
+                ])
+                if page_url and page_url != url and has_page_extractor:
                     clean_page_url = page_url
                     if "pornhub.com" in clean_page_url:
                         clean_page_url = re.sub(r'https?://[a-zA-Z0-9_-]+\.pornhub\.com', 'https://www.pornhub.com', clean_page_url)
@@ -1243,11 +1247,15 @@ class LinksProvider(BaseProvider):
             msg = str(exc.message).lower()
             is_blocked = (
                 exc.code in ("DOWNLOAD_FAILED",)
-                and any(err in msg for err in ("403", "forbidden", "429", "410", "gone", "blocked"))
+                and any(err in msg for err in ("403", "forbidden", "429", "blocked"))
             )
 
-            # Fallback 1: If stream failed and we have canonical page_url, retry with yt-dlp first
-            if not downloaded and page_url and page_url != url:
+            # Fallback 1: If stream failed and we have canonical page_url on a supported site, retry with yt-dlp
+            has_page_extractor = any(d in (page_url or "").lower() for d in [
+                "pornhub", "youtube", "youtu.be", "tiktok", "bilibili", "vimeo", 
+                "dailymotion", "twitch", "xvideos", "xhamster", "spankbang", "redtube"
+            ])
+            if not downloaded and page_url and page_url != url and has_page_extractor:
                 clean_page_url = page_url
                 if "pornhub.com" in clean_page_url:
                     clean_page_url = re.sub(r'https?://[a-zA-Z0-9_-]+\.pornhub\.com', 'https://www.pornhub.com', clean_page_url)
@@ -1260,6 +1268,19 @@ class LinksProvider(BaseProvider):
                 except Exception as page_exc:
                     progress.log(f"[Fallback] Page URL download failed: {page_exc}")
                     downloaded = None
+
+            # Check if failure was caused by an expired token (HTTP 410 Gone)
+            if not downloaded and exp_val and str(exp_val).isdigit():
+                exp_ts = int(exp_val)
+                now_ts = int(time.time())
+                if exp_ts < now_ts and any(k in msg for k in ("410", "gone", "expired")):
+                    diff_m = max(1, (now_ts - exp_ts) // 60)
+                    raise ProviderFailure(
+                        "DOWNLOAD_FAILED",
+                        f"Link token expired {diff_m} minute(s) ago on {urlparse(url).netloc}. "
+                        "The video hosting CDN strictly rejects expired links with HTTP 410. "
+                        "Please refresh the video page in your browser, press play, and copy/send a fresh link."
+                    )
 
             # Fallback 2: If still blocked and not downloaded, retry with SOCKS5 Proxy
             # (skip Tor for pornhub as Cloudflare blocks Tor exit nodes)
