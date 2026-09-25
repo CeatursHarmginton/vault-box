@@ -44,7 +44,21 @@ class LinksProvider(BaseProvider):
             except Exception:
                 pass
 
-        if not shutil.which("N_m3u8DL-RE") and sys.platform.startswith("linux"):
+        need_nm_install = False
+        nm_bin = shutil.which("N_m3u8DL-RE")
+        if not nm_bin and sys.platform.startswith("linux"):
+            need_nm_install = True
+        elif nm_bin and sys.platform.startswith("linux"):
+            try:
+                res = subprocess.run([nm_bin, "--version"], capture_output=True, text=True, timeout=5)
+                out_ver = (res.stdout or "") + (res.stderr or "")
+                # If older than 0.6.0 or from 2024, upgrade to modern 0.6.0-beta
+                if "2024" in out_ver or "0.2." in out_ver:
+                    need_nm_install = True
+            except Exception:
+                pass
+
+        if need_nm_install:
             try:
                 nm_tar = "/tmp/N_m3u8DL-RE.tar.gz"
                 candidate_urls = [
@@ -222,17 +236,42 @@ class LinksProvider(BaseProvider):
         """Parse real speed, percentage, size, and fragments from N_m3u8DL-RE / yt-dlp stdout."""
         try:
             total_sz = 0
-            m_sz = re.search(r'of\s*~?\s*(\d+(?:\.\d+)?)\s*([KMGT]?i?B)', line, re.IGNORECASE)
-            if m_sz:
+            done_sz = 0
+
+            # Match N_m3u8DL-RE format: 14.35MB/2.20GB
+            m_nm_sz = re.search(r'(\d+(?:\.\d+)?)\s*([KMGT]?i?B)\s*/\s*(\d+(?:\.\d+)?)\s*([KMGT]?i?B)', line, re.IGNORECASE)
+            if m_nm_sz:
                 try:
-                    val = float(m_sz.group(1))
-                    unit = m_sz.group(2).upper().replace('I', '')
-                    mult = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}.get(unit, 1024**2)
-                    total_sz = int(val * mult)
+                    u1 = m_nm_sz.group(2).upper().replace('I', '')
+                    u2 = m_nm_sz.group(4).upper().replace('I', '')
+                    m1 = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}.get(u1, 1024**2)
+                    m2 = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}.get(u2, 1024**2)
+                    done_sz = int(float(m_nm_sz.group(1)) * m1)
+                    total_sz = int(float(m_nm_sz.group(3)) * m2)
                 except (ValueError, TypeError):
                     pass
-            elif not progress.bytes_total and default_size:
-                total_sz = default_size
+            else:
+                m_sz = re.search(r'of\s*~?\s*(\d+(?:\.\d+)?)\s*([KMGT]?i?B)', line, re.IGNORECASE)
+                if m_sz:
+                    try:
+                        val = float(m_sz.group(1))
+                        unit = m_sz.group(2).upper().replace('I', '')
+                        mult = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}.get(unit, 1024**2)
+                        total_sz = int(val * mult)
+                    except (ValueError, TypeError):
+                        pass
+                elif not progress.bytes_total and default_size:
+                    total_sz = default_size
+
+                m_done = re.search(r'\[download\]\s+(\d+(?:\.\d+)?)\s*([KMGT]?i?B)', line, re.IGNORECASE)
+                if m_done:
+                    try:
+                        val = float(m_done.group(1))
+                        unit = m_done.group(2).upper().replace('I', '')
+                        mult = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}.get(unit, 1024**2)
+                        done_sz = int(val * mult)
+                    except (ValueError, TypeError):
+                        pass
 
             pct_val = 0.0
             m_pct = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
@@ -242,7 +281,7 @@ class LinksProvider(BaseProvider):
                 except (ValueError, TypeError):
                     pass
             else:
-                m_frag = re.search(r'(?:frag\s+|^\s*)(\d+)/(\d+)', line, re.IGNORECASE)
+                m_frag = re.search(r'(?:frag\s+|^\s*|\s+)(\d+)/(\d+)', line, re.IGNORECASE)
                 if m_frag:
                     try:
                         cur_frag = int(m_frag.group(1))
@@ -253,24 +292,14 @@ class LinksProvider(BaseProvider):
                         pass
 
             speed_val = 0.0
-            m_spd = re.search(r'(\d+(?:\.\d+)?)\s*([KMGT]?i?B)/s', line, re.IGNORECASE)
+            # Matches both yt-dlp "14.35MiB/s" and N_m3u8DL-RE "14.35MBps"
+            m_spd = re.search(r'(\d+(?:\.\d+)?)\s*([KMGT]?i?B)(?:ps|/s)', line, re.IGNORECASE)
             if m_spd:
                 try:
                     val = float(m_spd.group(1))
                     unit = m_spd.group(2).upper().replace('I', '')
                     mult = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}.get(unit, 1024**2)
                     speed_val = val * mult
-                except (ValueError, TypeError):
-                    pass
-
-            done_sz = 0
-            m_done = re.search(r'\[download\]\s+(\d+(?:\.\d+)?)\s*([KMGT]?i?B)', line, re.IGNORECASE)
-            if m_done:
-                try:
-                    val = float(m_done.group(1))
-                    unit = m_done.group(2).upper().replace('I', '')
-                    mult = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}.get(unit, 1024**2)
-                    done_sz = int(val * mult)
                 except (ValueError, TypeError):
                     pass
 
@@ -544,16 +573,15 @@ class LinksProvider(BaseProvider):
         if not has_origin and default_origin:
             req_headers["Origin"] = default_origin
 
-        clean_name = re.sub(r'[,;:*?"<>|]', '_', clean_name)
+        clean_name = re.sub(r'[,;:*?"<>|/\\`]', '_', clean_name)
         cmd = [
             "N_m3u8DL-RE",
             url,
             "--save-name", clean_name,
             "--save-dir", str(dest_dir),
             "--tmp-dir", str(tmp_dir),
-            "--thread-count", "16",
-            "--download-retry-count", "8",
-            "--http-request-timeout", "20",
+            "--thread-count", "8",
+            "--download-retry-count", "5",
             "--check-segments-count", "false",
             "--del-after-done",
             "--no-ansi-color",
@@ -602,14 +630,18 @@ class LinksProvider(BaseProvider):
         last_lines: list[str] = []
         if process.stdout:
             while True:
-                line_bytes = await process.stdout.readline()
-                if not line_bytes:
+                chunk = await process.stdout.read(2048)
+                if not chunk:
                     break
-                line = line_bytes.decode("utf-8", errors="ignore").strip()
-                if line:
-                    last_lines = (last_lines + [line])[-5:]
-                progress.check_cancelled()
-                self._update_stream_progress(line, progress)
+                text = chunk.decode("utf-8", errors="ignore").replace("\r", "\n")
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if not any(k in line for k in ("Writing meta json", "ANSI colors")):
+                        last_lines = (last_lines + [line])[-10:]
+                    progress.check_cancelled()
+                    self._update_stream_progress(line, progress)
 
         await process.wait()
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -639,8 +671,12 @@ class LinksProvider(BaseProvider):
             ]
 
         if not new_files or process.returncode != 0:
-            err_detail = f" (code {process.returncode}: {' | '.join(last_lines[-2:])})" if (last_lines and process.returncode != 0) else ""
-            progress.log(f"N_m3u8DL-RE produced no output file on disk{err_detail}, falling back to yt-dlp for direct stream...")
+            err_detail = ""
+            if process.returncode != 0:
+                err_detail = f" (exit code {process.returncode}: {' | '.join(last_lines[-2:])})"
+            elif not new_files:
+                err_detail = f" (no output file produced: {' | '.join(last_lines[-2:])})"
+            progress.log(f"N_m3u8DL-RE failed or produced no output file{err_detail}, falling back to yt-dlp for direct stream...")
             try:
                 return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
             except Exception as direct_err:
@@ -738,12 +774,12 @@ class LinksProvider(BaseProvider):
             "--newline",
             "--progress",
             "-f", "bestvideo*+bestaudio/best",
-            "-N", "16",
-            "--concurrent-fragments", "16",
-            "--downloader", "dash,m3u8:native",
+            "-N", "8",
+            "--concurrent-fragments", "8",
             "--socket-timeout", "20",
             "--fragment-retries", "10",
             "--retries", "10",
+            "--retry-sleep", "fragment:exp=1:2:8",
             "--buffer-size", "16M",
             "-o", out_tpl,
         ]
@@ -809,12 +845,16 @@ class LinksProvider(BaseProvider):
 
             if process.stdout:
                 while True:
-                    line_bytes = await process.stdout.readline()
-                    if not line_bytes:
+                    chunk = await process.stdout.read(2048)
+                    if not chunk:
                         break
-                    line = line_bytes.decode('utf-8', errors='ignore').strip()
-                    progress.check_cancelled()
-                    self._update_stream_progress(line, progress)
+                    text = chunk.decode('utf-8', errors='ignore').replace('\r', '\n')
+                    for line in text.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        progress.check_cancelled()
+                        self._update_stream_progress(line, progress)
 
             await process.wait()
             if process.returncode != 0:
