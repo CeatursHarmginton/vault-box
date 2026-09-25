@@ -15,9 +15,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-WARP_PROXY = "socks5://127.0.0.1:40000"
-WARP_SETUP_LOCK: asyncio.Lock | None = None
-_warp_ready = False
+TOR_PROXY = "socks5://127.0.0.1:9050"
+PROXY_SETUP_LOCK: asyncio.Lock | None = None
+_proxy_ready = False
 
 import httpx
 
@@ -72,6 +72,11 @@ class LinksProvider(BaseProvider):
                 import Crypto.Cipher.AES
             except ImportError:
                 missing.append("cryptography")
+
+        try:
+            import httpx_socks
+        except ImportError:
+            missing.append("httpx[socks]")
             
         if missing:
             try:
@@ -82,83 +87,55 @@ class LinksProvider(BaseProvider):
         cls._deps_checked = True
 
     @classmethod
-    async def _ensure_warp_proxy(cls) -> str | None:
-        """Set up Cloudflare WARP as SOCKS5 proxy for IP-blocked sites. Returns proxy URL or None."""
-        global _warp_ready, WARP_SETUP_LOCK
-        if _warp_ready:
-            return WARP_PROXY
-        if WARP_SETUP_LOCK is None:
-            WARP_SETUP_LOCK = asyncio.Lock()
-        async with WARP_SETUP_LOCK:
-            if _warp_ready:
-                return WARP_PROXY
-            # Check if wireproxy is already running
+    async def _ensure_tor_proxy(cls, progress: JobState | None = None) -> str | None:
+        """Set up Tor as SOCKS5 proxy on 127.0.0.1:9050 (pure TCP, works 100% in Colab)."""
+        global _proxy_ready, PROXY_SETUP_LOCK
+        if _proxy_ready:
+            return TOR_PROXY
+        if PROXY_SETUP_LOCK is None:
+            PROXY_SETUP_LOCK = asyncio.Lock()
+        async with PROXY_SETUP_LOCK:
+            if _proxy_ready:
+                return TOR_PROXY
+            if not sys.platform.startswith("linux"):
+                return None
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "curl", "-s", "--socks5", "127.0.0.1:40000", "--connect-timeout", "3", "http://ifconfig.me",
+                    "curl", "-s", "--socks5", "127.0.0.1:9050", "--connect-timeout", "3", "http://ifconfig.me",
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                 )
                 out, _ = await proc.communicate()
                 if proc.returncode == 0 and out.strip():
-                    _warp_ready = True
-                    return WARP_PROXY
+                    _proxy_ready = True
+                    return TOR_PROXY
             except Exception:
                 pass
 
-            if not sys.platform.startswith("linux"):
-                return None
-
             try:
-                # Install wgcf if needed
-                if not shutil.which("wgcf"):
-                    subprocess.check_call([
-                        "bash", "-c",
-                        "curl -fsSL https://github.com/ViRb3/wgcf/releases/download/v2.2.22/wgcf_2.2.22_linux_amd64 -o /usr/local/bin/wgcf && chmod +x /usr/local/bin/wgcf"
-                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if progress:
+                    progress.log("[Proxy] Starting Tor SOCKS5 proxy for IP bypass (TCP-based)...")
+                def _setup():
+                    if not shutil.which("tor"):
+                        subprocess.run(["apt-get", "update", "-qq"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        subprocess.run(["apt-get", "install", "-y", "-qq", "tor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["service", "tor", "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                await asyncio.to_thread(_setup)
 
-                # Install wireproxy if needed
-                if not shutil.which("wireproxy"):
-                    subprocess.check_call([
-                        "bash", "-c",
-                        "curl -fsSL https://github.com/pufferffish/wireproxy/releases/download/v1.0.9/wireproxy_linux_amd64.tar.gz | tar -xzf - -C /tmp && install -m 755 /tmp/wireproxy /usr/local/bin/wireproxy"
-                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-                # Generate WARP config if needed
-                warp_dir = Path("/tmp/vaultbox-warp")
-                warp_dir.mkdir(parents=True, exist_ok=True)
-                wgcf_profile = warp_dir / "wgcf-profile.conf"
-                wireproxy_conf = warp_dir / "wireproxy.conf"
-
-                if not wgcf_profile.exists():
-                    subprocess.check_call(["wgcf", "register", "--accept-tos"], cwd=str(warp_dir), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    subprocess.check_call(["wgcf", "generate"], cwd=str(warp_dir), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-                if wgcf_profile.exists() and not wireproxy_conf.exists():
-                    # Convert WireGuard config to wireproxy config
-                    wg_text = wgcf_profile.read_text()
-                    wp_text = wg_text.rstrip() + "\n\n[Socks5]\nBindAddress = 127.0.0.1:40000\n"
-                    # Remove DNS line (wireproxy doesn't support it the same way)
-                    wp_text = re.sub(r'(?m)^DNS\s*=.*$', '', wp_text)
-                    wireproxy_conf.write_text(wp_text)
-
-                if wireproxy_conf.exists():
-                    subprocess.Popen(
-                        ["wireproxy", "-c", str(wireproxy_conf)],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    )
-                    await asyncio.sleep(3)  # Wait for proxy to start
-
-                    # Verify proxy works
+                for _ in range(8):
+                    await asyncio.sleep(1)
                     proc = await asyncio.create_subprocess_exec(
-                        "curl", "-s", "--socks5", "127.0.0.1:40000", "--connect-timeout", "5", "http://ifconfig.me",
+                        "curl", "-s", "--socks5", "127.0.0.1:9050", "--connect-timeout", "4", "http://ifconfig.me",
                         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                     )
                     out, _ = await proc.communicate()
                     if proc.returncode == 0 and out.strip():
-                        _warp_ready = True
-                        return WARP_PROXY
-            except Exception:
-                pass
+                        _proxy_ready = True
+                        if progress:
+                            progress.log(f"[Proxy] Tor SOCKS5 proxy active (Exit IP: {out.decode().strip()})")
+                        return TOR_PROXY
+            except Exception as exc:
+                if progress:
+                    progress.log(f"[Proxy] Tor setup notice: {exc}")
             return None
 
     def _classify_link(self, url: str) -> str:
@@ -175,6 +152,10 @@ class LinksProvider(BaseProvider):
 
         if "sorafolder.com" in url_lower:
             return "sorafolder"
+
+        # Direct & Embed resolvers for Mixdrop / Mxdrop / Mxcontent
+        if any(h in url_lower for h in ["mxcontent.net", "mxdrop.to", "mxdrop.top", "mixdrop.co", "mixdrop.to", "mixdrop.bz", "mixdrop.ch"]):
+            return "mxdrop"
 
         ytdlp_domains = [
             "youtube", "youtu.be", "tiktok", "bilibili", "vimeo", 
@@ -224,9 +205,12 @@ class LinksProvider(BaseProvider):
                 pass
         return None
 
-    def _http_headers(self, headers: dict[str, str] | None, *, range_header: str | None = None) -> dict[str, str]:
+    def _http_headers(self, headers: dict[str, str] | None, *, range_header: str | None = None, cookies: str | None = None) -> dict[str, str]:
         out = {str(k): str(v) for k, v in (headers or {}).items() if v and str(k).lower() not in ("host", "content-length")}
         out.setdefault("Accept-Encoding", "identity")
+        out.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+        if cookies and "cookie" not in {k.lower() for k in out}:
+            out["Cookie"] = cookies
         if range_header:
             out["Range"] = range_header
         return out
@@ -283,7 +267,7 @@ class LinksProvider(BaseProvider):
         elapsed = max(time.monotonic() - started, 0.001)
         return url, size, read / elapsed
 
-    async def _download_http_stream(self, url: str | list[str], dest_dir: Path, name: str | None, progress: JobState, headers: dict[str, str] | None = None) -> list[Path]:
+    async def _download_http_stream(self, url: str | list[str], dest_dir: Path, name: str | None, progress: JobState, headers: dict[str, str] | None = None, proxy: str | None = None, cookies: str | None = None) -> list[Path]:
         urls = [str(item) for item in (url if isinstance(url, list) else [url]) if str(item or "")]
         last: ProviderFailure | None = None
         for one in urls:
@@ -294,9 +278,10 @@ class LinksProvider(BaseProvider):
                     one,
                     dest_dir / out_name,
                     progress,
-                    headers=self._http_headers(headers),
+                    headers=self._http_headers(headers, cookies=cookies),
                     auth_fail_code="DOWNLOAD_FAILED",
                     auth_fail_message="Direct link rejected Colab; this host likely binds the URL to the original browser/IP",
+                    proxy=proxy,
                 )]
             except ProviderFailure as exc:
                 last = exc
@@ -708,6 +693,99 @@ class LinksProvider(BaseProvider):
             direct_url, resolved_name, headers = await self._resolve_sorafolder_url(url)
             return await self._download_http_stream(direct_url, dest_dir, name, progress, headers=headers)
 
+    @staticmethod
+    def _unpack_dean_edwards(packed_js: str) -> str:
+        """Unpack Dean Edwards / p,a,c,k,e,d JavaScript used by video hosts like MixDrop/MxDrop."""
+        m = re.search(r'}\s*\(\s*[\x27\x22](.*)[\x27\x22]\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*[\x27\x22](.*)[\x27\x22]\.split\([\x27\x22]\|[\x27\x22]\)', packed_js, re.DOTALL)
+        if not m:
+            return ""
+        p, a, c, k = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4).split('|')
+        def unbase(val: str, base: int) -> int:
+            digits = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+            res = 0
+            for char in val:
+                res = res * base + digits.index(char)
+            return res
+        def repl(match: re.Match) -> str:
+            word = match.group(0)
+            try:
+                idx = unbase(word, a)
+                if idx < len(k) and k[idx]:
+                    return k[idx]
+            except Exception:
+                pass
+            return word
+        return re.sub(r'\b[0-9a-zA-Z]+\b', repl, p)
+
+    async def _resolve_mxdrop(self, url: str, file_ref: dict[str, Any], progress: JobState, proxy: str | None = None) -> tuple[str, str | None, dict[str, str]]:
+        """Resolve a dynamic Mixdrop / Mxdrop URL directly on Colab so the security token binds to Colab's IP."""
+        progress.log(f"Resolving fresh stream token on Colab for: {url[:80]}...")
+        headers = file_ref.get("headers") or (file_ref.get("meta") or {}).get("headers") or {}
+        referer = str(headers.get("Referer") or headers.get("referer") or "")
+
+        file_id = ""
+        m_id = re.search(r'([a-zA-Z0-9]{10,25})(?:\.mp4)?', urlparse(url).path)
+        if m_id:
+            file_id = m_id.group(1)
+        if not file_id:
+            raw_name = str(file_ref.get("name") or "")
+            m_id = re.search(r'([a-zA-Z0-9]{10,25})', raw_name)
+            if m_id:
+                file_id = m_id.group(1)
+
+        if not file_id:
+            raise ProviderFailure("DOWNLOAD_FAILED", f"Could not determine Mixdrop file ID from URL {url}")
+
+        embed_domain = "https://mxdrop.top"
+        if "mixdrop" in referer.lower():
+            m_dom = re.search(r'https?://[^/]+', referer)
+            if m_dom:
+                embed_domain = m_dom.group(0)
+        elif "mxdrop" in url.lower():
+            m_dom = re.search(r'https?://[^/]+', url)
+            if m_dom:
+                embed_domain = m_dom.group(0)
+
+        embed_url = f"{embed_domain}/e/{file_id}"
+        progress.log(f"Fetching embed player: {embed_url}")
+
+        fetch_headers = {
+            "User-Agent": str(headers.get("User-Agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
+            "Referer": referer or "https://archivebate.com/",
+        }
+
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=fetch_headers, proxy=proxy) as client:
+            resp = await client.get(embed_url)
+            resp.raise_for_status()
+            html = resp.text
+
+        unpacked = self._unpack_dean_edwards(html)
+        m_wurl = re.search(r'MDCore\.wurl\s*=\s*[\x22\x27]([^\x22\x27]+)[\x22\x27]', unpacked)
+        if not m_wurl:
+            raise ProviderFailure("DOWNLOAD_FAILED", f"Could not extract MDCore.wurl from embed page on {embed_domain}")
+
+        wurl = m_wurl.group(1)
+        if wurl.startswith("//"):
+            wurl = "https:" + wurl
+
+        out_name = f"{file_id}.mp4"
+        m_vfile = re.search(r'MDCore\.vfile\s*=\s*[\x22\x27]([^\x22\x27]+)[\x22\x27]', unpacked)
+        if m_vfile and m_vfile.group(1):
+            out_name = file_ref.get("name") or f"{file_id}.mp4"
+
+        dl_headers = {
+            "User-Agent": fetch_headers["User-Agent"],
+            "Referer": f"{embed_domain}/",
+            "Origin": embed_domain,
+        }
+        progress.log(f"Successfully generated Colab-bound stream URL: {wurl[:80]}...")
+        return wurl, out_name, dl_headers
+
+    async def _download_mxdrop(self, url: str, dest_dir: Path, name: str | None, progress: JobState, file_ref: dict[str, Any], proxy: str | None = None) -> list[Path]:
+        resolved_url, resolved_name, dl_headers = await self._resolve_mxdrop(url, file_ref, progress, proxy=proxy)
+        final_name = name or resolved_name
+        return await self._download_http_stream(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=proxy)
+
     async def _dispatch_download(
         self, link_type: str, is_stream: bool, url: str, urls: list[str],
         dest_dir: Path, name: str | None, progress: JobState, *,
@@ -715,10 +793,12 @@ class LinksProvider(BaseProvider):
         dec_key: dict[str, Any] | None = None, file_ref: dict[str, Any] | None = None,
         proxy: str | None = None,
     ) -> list[Path]:
-        """Central download dispatch. Extracted so WARP retry can re-call it with a proxy."""
+        """Central download dispatch. Extracted so proxy retry can re-call it."""
         file_ref = file_ref or {}
         if link_type == "torrent":
             return await self._download_torrent(url, dest_dir, progress)
+        elif link_type == "mxdrop":
+            return await self._download_mxdrop(url, dest_dir, name, progress, file_ref, proxy=proxy)
         elif is_stream:
             return await self._download_stream_nm3u8dl(url, dest_dir, name, progress, headers=headers, cookies=cookies, dec_key=dec_key, proxy=proxy)
         elif link_type == "gofile_page":
@@ -736,7 +816,7 @@ class LinksProvider(BaseProvider):
             return await self._download_gdrive(url, dest_dir, name, progress)
         else:
             if self._needs_browser_stream(headers or {}, file_ref):
-                return await self._download_http_stream(urls, dest_dir, name, progress, headers=headers)
+                return await self._download_http_stream(urls, dest_dir, name, progress, headers=headers, proxy=proxy, cookies=cookies)
             else:
                 try:
                     return await self._download_aria2(urls, dest_dir, name, progress, headers=headers, proxy=proxy)
@@ -746,7 +826,7 @@ class LinksProvider(BaseProvider):
                     if "code 22" not in exc.message:
                         raise
                     progress.log("aria2c failed; retrying browser-compatible downloader")
-                    return await self._download_http_stream(urls, dest_dir, name, progress, headers=headers)
+                    return await self._download_http_stream(urls, dest_dir, name, progress, headers=headers, proxy=proxy, cookies=cookies)
 
     async def validate_credentials(self, credentials: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True}
@@ -800,12 +880,12 @@ class LinksProvider(BaseProvider):
         except ProviderFailure as exc:
             if exc.code not in ("DOWNLOAD_FAILED",) or "403" not in exc.message:
                 raise
-            progress.log("[WARP] Download blocked (403). Setting up Cloudflare WARP proxy and retrying...")
-            proxy = await self._ensure_warp_proxy()
+            progress.log("[Proxy] Download blocked (403). Activating TCP SOCKS5 proxy and retrying...")
+            proxy = await self._ensure_tor_proxy(progress)
             if not proxy:
-                progress.log("[WARP] Could not set up WARP proxy. Skipping retry.")
+                progress.log("[Proxy] Proxy unavailable. Skipping retry.")
                 raise
-            progress.log(f"[WARP] WARP proxy active at {proxy}. Retrying download...")
+            progress.log(f"[Proxy] Retrying download via {proxy}...")
             downloaded = await self._dispatch_download(
                 link_type, is_stream, url, urls, dest_dir, name, progress,
                 headers=headers, cookies=cookies, dec_key=dec_key, file_ref=file_ref, proxy=proxy,

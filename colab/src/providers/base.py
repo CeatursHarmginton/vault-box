@@ -238,7 +238,18 @@ class BaseProvider(ABC):
         skipped = len(results) - len(uploaded)
         return {"ok": True, "uploaded": len(uploaded), "skipped": skipped, "items": uploaded}
 
-async def stream_download(url: str, dest: Path, progress: JobState, *, headers: dict[str, str] | None = None, phase: str = "download", on_verify: Any = None, auth_fail_code: str = "INVALID_PROVIDER_CREDENTIALS", auth_fail_message: str = "Provider rejected download credentials") -> Path:
+async def stream_download(
+    url: str,
+    dest: Path,
+    progress: JobState,
+    *,
+    headers: dict[str, str] | None = None,
+    phase: str = "download",
+    on_verify: Any = None,
+    auth_fail_code: str = "INVALID_PROVIDER_CREDENTIALS",
+    auth_fail_message: str = "Provider rejected download credentials",
+    proxy: str | None = None,
+) -> Path:
     """Stream `url` into `dest`, resuming across connection drops.
 
     When the provider answers with a JSON error instead of bytes and `on_verify` is given,
@@ -258,26 +269,46 @@ async def stream_download(url: str, dest: Path, progress: JobState, *, headers: 
             done = part.stat().st_size if part.exists() else 0
             attempt_start = done
             req_headers = dict(headers or {})
+            req_headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
             if done:
                 req_headers["Range"] = f"bytes={done}-"
             try:
-                client = shared_client("download", timeout=httpx.Timeout(None, connect=30.0, read=DOWNLOAD_READ_TIMEOUT, write=60.0, pool=30.0), follow_redirects=True)
-                async with client.stream("GET", url, headers=req_headers) as resp:
-                    if resp.status_code in (401, 403):
-                        raise ProviderFailure(auth_fail_code, f"{auth_fail_message} (HTTP {resp.status_code})", {"status": resp.status_code})
-                    resp.raise_for_status()
-                    if done and resp.status_code != 206:
-                        part.unlink(missing_ok=True)
-                        done = 0
-                    total = done + int(resp.headers.get("content-length") or 0)
-                    expected = total or expected
-                    content_type = resp.headers.get("content-type", content_type)
-                    with part.open("ab" if done else "wb") as fh:
-                        async for chunk in resp.aiter_bytes(CHUNK_SIZE):
-                            progress.check_cancelled()
-                            fh.write(chunk)
-                            done += len(chunk)
-                            progress.add_bytes(len(chunk), total, phase, str(dest))
+                if proxy:
+                    async with httpx.AsyncClient(proxy=proxy, timeout=httpx.Timeout(None, connect=30.0, read=DOWNLOAD_READ_TIMEOUT, write=60.0, pool=30.0), follow_redirects=True) as client:
+                        async with client.stream("GET", url, headers=req_headers) as resp:
+                            if resp.status_code in (401, 403):
+                                raise ProviderFailure(auth_fail_code, f"{auth_fail_message} (HTTP {resp.status_code})", {"status": resp.status_code})
+                            resp.raise_for_status()
+                            if done and resp.status_code != 206:
+                                part.unlink(missing_ok=True)
+                                done = 0
+                            total = done + int(resp.headers.get("content-length") or 0)
+                            expected = total or expected
+                            content_type = resp.headers.get("content-type", content_type)
+                            with part.open("ab" if done else "wb") as fh:
+                                async for chunk in resp.aiter_bytes(CHUNK_SIZE):
+                                    progress.check_cancelled()
+                                    fh.write(chunk)
+                                    done += len(chunk)
+                                    progress.add_bytes(len(chunk), total, phase, str(dest))
+                else:
+                    client = shared_client("download", timeout=httpx.Timeout(None, connect=30.0, read=DOWNLOAD_READ_TIMEOUT, write=60.0, pool=30.0), follow_redirects=True)
+                    async with client.stream("GET", url, headers=req_headers) as resp:
+                        if resp.status_code in (401, 403):
+                            raise ProviderFailure(auth_fail_code, f"{auth_fail_message} (HTTP {resp.status_code})", {"status": resp.status_code})
+                        resp.raise_for_status()
+                        if done and resp.status_code != 206:
+                            part.unlink(missing_ok=True)
+                            done = 0
+                        total = done + int(resp.headers.get("content-length") or 0)
+                        expected = total or expected
+                        content_type = resp.headers.get("content-type", content_type)
+                        with part.open("ab" if done else "wb") as fh:
+                            async for chunk in resp.aiter_bytes(CHUNK_SIZE):
+                                progress.check_cancelled()
+                                fh.write(chunk)
+                                done += len(chunk)
+                                progress.add_bytes(len(chunk), total, phase, str(dest))
                 if not expected or part.stat().st_size >= expected:
                     break
                 raise RuntimeError(f"Download incomplete: got {part.stat().st_size} bytes, expected {expected}")
