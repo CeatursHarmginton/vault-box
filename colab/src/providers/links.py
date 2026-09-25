@@ -448,13 +448,15 @@ class LinksProvider(BaseProvider):
         cookies: str | None = None,
         dec_key: dict[str, Any] | None = None,
         proxy: str | None = None,
+        page_url: str | None = None,
     ) -> list[Path]:
         if not shutil.which("N_m3u8DL-RE"):
             progress.log("N_m3u8DL-RE not found in PATH, falling back to yt-dlp...")
+            target_fallback = page_url if page_url and page_url != url else url
             try:
-                return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
+                return await self._download_ytdlp(target_fallback, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
             except TypeError:
-                return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers)
+                return await self._download_ytdlp(target_fallback, dest_dir, name, progress, headers=headers)
 
         dest_dir.mkdir(parents=True, exist_ok=True)
         before = set(dest_dir.iterdir()) if dest_dir.exists() else set()
@@ -563,13 +565,45 @@ class LinksProvider(BaseProvider):
             ]
 
         if not new_files or process.returncode != 0:
-            progress.log("N_m3u8DL-RE produced no output file on disk, falling back to yt-dlp...")
+            target_fallback = page_url if page_url and page_url != url else url
+            progress.log(f"N_m3u8DL-RE produced no output file on disk, falling back to yt-dlp ({target_fallback[:80]})...")
             try:
-                return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
+                return await self._download_ytdlp(target_fallback, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
             except TypeError:
-                return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers)
+                return await self._download_ytdlp(target_fallback, dest_dir, name, progress, headers=headers)
 
         return new_files
+
+    @staticmethod
+    def _write_netscape_cookies(cookies_str: str, domain: str, dest_file: Path) -> Path | None:
+        """Write raw Cookie string (key=value; ...) into Netscape format cookies file."""
+        if not cookies_str:
+            return None
+        domain_clean = str(domain).strip()
+        if "://" in domain_clean:
+            domain_clean = urlparse(domain_clean).netloc
+        domain_clean = domain_clean.split(":")[0]
+        parts = [p for p in domain_clean.split(".") if p]
+        if len(parts) >= 2:
+            base_domain = f".{parts[-2]}.{parts[-1]}"
+        else:
+            base_domain = f".{domain_clean}" if not domain_clean.startswith(".") else domain_clean
+
+        lines = ["# Netscape HTTP Cookie File\n", "# https://curl.se/docs/http-cookies.html\n\n"]
+        for item in str(cookies_str).split(";"):
+            item = item.strip()
+            if not item or "=" not in item:
+                continue
+            k, v = item.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if k:
+                lines.append(f"{base_domain}\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
+
+        if len(lines) > 2:
+            dest_file.write_text("".join(lines), encoding="utf-8")
+            return dest_file
+        return None
 
     async def _download_ytdlp(
         self,
@@ -603,6 +637,7 @@ class LinksProvider(BaseProvider):
         cmd = [
             "yt-dlp",
             "--no-warnings",
+            "--no-playlist",
             "--newline",
             "--progress",
             "-N", "8",
@@ -635,8 +670,13 @@ class LinksProvider(BaseProvider):
                 elif k_low not in skip_hdrs:
                     cmd.extend(["--add-header", f"{k}: {v}"])
 
-        if cookies and "cookie" not in {str(k).lower() for k in req_headers}:
-            cmd.extend(["--add-header", f"Cookie: {cookies}"])
+        if cookies:
+            ref_domain = req_headers.get("referer") or req_headers.get("Referer") or default_ref or url
+            c_file = stage_dir / "cookies.txt"
+            if self._write_netscape_cookies(cookies, ref_domain, c_file):
+                cmd.extend(["--cookies", str(c_file)])
+            elif "cookie" not in {str(k).lower() for k in req_headers}:
+                cmd.extend(["--add-header", f"Cookie: {cookies}"])
 
         if proxy:
             cmd.extend(["--proxy", proxy])
@@ -958,6 +998,7 @@ class LinksProvider(BaseProvider):
         headers: dict[str, str] | None = None, cookies: str | None = None,
         dec_key: dict[str, Any] | None = None, file_ref: dict[str, Any] | None = None,
         proxy: str | None = None,
+        page_url: str | None = None,
     ) -> list[Path]:
         """Central download dispatch. Extracted so proxy retry can re-call it."""
         file_ref = file_ref or {}
@@ -966,7 +1007,7 @@ class LinksProvider(BaseProvider):
         elif link_type == "mxdrop":
             return await self._download_mxdrop(url, dest_dir, name, progress, file_ref, proxy=proxy)
         elif is_stream:
-            return await self._download_stream_nm3u8dl(url, dest_dir, name, progress, headers=headers, cookies=cookies, dec_key=dec_key, proxy=proxy)
+            return await self._download_stream_nm3u8dl(url, dest_dir, name, progress, headers=headers, cookies=cookies, dec_key=dec_key, proxy=proxy, page_url=page_url)
         elif link_type == "gofile_page":
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Gofile page links are not direct downloads. Click Download in browser, stop it, copy the store-*.gofile.io/download/web/... URL, then paste that link.")
         elif link_type == "mediafire":
@@ -1026,8 +1067,31 @@ class LinksProvider(BaseProvider):
             urls = await self._filter_urls_by_size(urls, expected_size, headers)
 
         raw_name = file_ref.get("name") or (local_path.name if local_path.suffix else "")
+        meta_dict = file_ref.get("meta") or {}
+        page_url = str(file_ref.get("page_url") or meta_dict.get("page_url") or "").strip()
+        if not page_url:
+            ref_hdr = str(headers.get("Referer") or headers.get("referer") or "").strip()
+            if ref_hdr.startswith("http") and ref_hdr.rstrip("/").count("/") >= 3:
+                page_url = ref_hdr
+
+        page_title = meta_dict.get("page_title") or file_ref.get("page_title")
+        if page_title and (not raw_name or any(raw_name.startswith(p) for p in ("1080P_", "720P_", "480P_", "360P_", "master", "index", "chunklist", "stream_download_"))):
+            raw_name = f"{safe_name(page_title)}.mp4"
+
         name = safe_name(raw_name) if raw_name else None
         link_type = self._classify_link(url)
+
+        # Check if URL belongs to known client-IP bound / HMAC-locked CDNs that return 410 on Colab
+        url_lower = url.lower()
+        is_ip_bound_cdn = any(cdn in url_lower for cdn in [
+            "phncdn.com", "pornhub.com/hls", "xhcdn.com", "xvideos-cdn.com", "xv-cdn.com"
+        ])
+        if is_ip_bound_cdn and page_url:
+            progress.log(f"[links] CDN stream has client-IP bound HMAC token (returns 410 Gone on datacenter IP). Routing to canonical page URL via yt-dlp: {page_url}")
+            url = page_url
+            urls = [page_url]
+            link_type = "ytdlp"
+
         progress.log(f"[links] {link_type}: {url[:120]}")
 
         dest_dir = local_path.parent if local_path.suffix else local_path
@@ -1036,11 +1100,12 @@ class LinksProvider(BaseProvider):
         cookies = file_ref.get("cookies") or (file_ref.get("meta") or {}).get("cookies") or ""
         dec_key = file_ref.get("decryption_key") or (file_ref.get("meta") or {}).get("decryption_key")
         is_stream = (
-            link_type == "stream"
+            (link_type == "stream"
             or str(file_ref.get("type") or "").lower() in ("hls", "m3u8", "dash", "stream")
             or bool(dec_key)
             or ".m3u8" in url.lower()
-            or ".mpd" in url.lower()
+            or ".mpd" in url.lower())
+            and link_type != "ytdlp"
         )
 
         # Check token expiration timestamp in stream/direct URL
@@ -1062,25 +1127,49 @@ class LinksProvider(BaseProvider):
         except Exception:
             pass
 
+        downloaded = None
         try:
             downloaded = await self._dispatch_download(
                 link_type, is_stream, url, urls, dest_dir, name, progress,
                 headers=headers, cookies=cookies, dec_key=dec_key, file_ref=file_ref,
+                page_url=page_url,
             )
         except ProviderFailure as exc:
             msg = str(exc.message).lower()
-            if exc.code not in ("DOWNLOAD_FAILED",) or ("403" not in msg and "forbidden" not in msg and "429" not in msg):
-                raise
-            progress.log(f"[Proxy] Download blocked ({exc.message}). Activating TCP SOCKS5 proxy and retrying...")
-            proxy = await self._ensure_tor_proxy(progress)
-            if not proxy:
-                progress.log("[Proxy] Proxy unavailable. Skipping retry.")
-                raise
-            progress.log(f"[Proxy] Retrying download via {proxy}...")
-            downloaded = await self._dispatch_download(
-                link_type, is_stream, url, urls, dest_dir, name, progress,
-                headers=headers, cookies=cookies, dec_key=dec_key, file_ref=file_ref, proxy=proxy,
-            )
+            # Fallback 1: If stream failed with 410/403/failure and we have page_url, try page_url with yt-dlp!
+            if page_url and page_url != url:
+                progress.log(f"[Fallback] Direct stream download failed ({exc.message}). Retrying download from canonical page URL with yt-dlp: {page_url}...")
+                try:
+                    downloaded = await self._download_ytdlp(
+                        page_url, dest_dir, name, progress,
+                        headers=headers, cookies=cookies,
+                    )
+                except Exception as page_exc:
+                    progress.log(f"[Fallback] Page URL download failed: {page_exc}")
+                    downloaded = None
+
+            # Fallback 2: Proxy retry if blocked (403, 410, 429, forbidden, gone)
+            if not downloaded:
+                is_blocked = (
+                    exc.code in ("DOWNLOAD_FAILED",)
+                    and any(err in msg for err in ("403", "forbidden", "429", "410", "gone", "blocked"))
+                )
+                if not is_blocked:
+                    raise exc
+                progress.log(f"[Proxy] Download blocked ({exc.message}). Activating TCP SOCKS5 proxy and retrying...")
+                proxy = await self._ensure_tor_proxy(progress)
+                if not proxy:
+                    progress.log("[Proxy] Proxy unavailable. Skipping retry.")
+                    raise exc
+                progress.log(f"[Proxy] Retrying download via {proxy}...")
+                retry_url = page_url if page_url else url
+                retry_type = "ytdlp" if page_url else link_type
+                retry_stream = False if page_url else is_stream
+                downloaded = await self._dispatch_download(
+                    retry_type, retry_stream, retry_url, [retry_url], dest_dir, name, progress,
+                    headers=headers, cookies=cookies, dec_key=dec_key, file_ref=file_ref, proxy=proxy,
+                    page_url=page_url,
+                )
 
         if not downloaded:
             raise ProviderFailure("DOWNLOAD_FAILED", "Download completed but no files found on disk")
