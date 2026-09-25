@@ -208,41 +208,79 @@ class LinksProvider(BaseProvider):
         return None
 
     def _update_stream_progress(self, line: str, progress: JobState, default_size: int = 0) -> None:
-        """Parse real speed, percentage, and size from N_m3u8DL-RE / yt-dlp stdout."""
+        """Parse real speed, percentage, size, and fragments from N_m3u8DL-RE / yt-dlp stdout."""
         try:
+            total_sz = 0
             m_sz = re.search(r'of\s*~?\s*(\d+(?:\.\d+)?)\s*([KMGT]?i?B)', line, re.IGNORECASE)
             if m_sz:
                 try:
                     val = float(m_sz.group(1))
                     unit = m_sz.group(2).upper().replace('I', '')
                     mult = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}.get(unit, 1024**2)
-                    progress.bytes_total = int(val * mult)
+                    total_sz = int(val * mult)
                 except (ValueError, TypeError):
                     pass
             elif not progress.bytes_total and default_size:
-                progress.bytes_total = default_size
+                total_sz = default_size
 
+            pct_val = 0.0
             m_pct = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
             if m_pct:
                 try:
-                    pct = float(m_pct.group(1))
-                    progress.progress.download = min(100.0, pct)
-                    if progress.bytes_total:
-                        progress.bytes_done = int(progress.bytes_total * (pct / 100.0))
+                    pct_val = float(m_pct.group(1))
                 except (ValueError, TypeError):
                     pass
+            else:
+                m_frag = re.search(r'(?:frag\s+|^\s*)(\d+)/(\d+)', line, re.IGNORECASE)
+                if m_frag:
+                    try:
+                        cur_frag = int(m_frag.group(1))
+                        tot_frag = int(m_frag.group(2))
+                        if tot_frag > 0:
+                            pct_val = min(100.0, (cur_frag / tot_frag) * 100.0)
+                    except (ValueError, TypeError):
+                        pass
 
+            speed_val = 0.0
             m_spd = re.search(r'(\d+(?:\.\d+)?)\s*([KMGT]?i?B)/s', line, re.IGNORECASE)
             if m_spd:
                 try:
                     val = float(m_spd.group(1))
                     unit = m_spd.group(2).upper().replace('I', '')
                     mult = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}.get(unit, 1024**2)
-                    progress.speed = val * mult
+                    speed_val = val * mult
                 except (ValueError, TypeError):
                     pass
 
-            progress.updated_at = time.time()
+            done_sz = 0
+            m_done = re.search(r'\[download\]\s+(\d+(?:\.\d+)?)\s*([KMGT]?i?B)', line, re.IGNORECASE)
+            if m_done:
+                try:
+                    val = float(m_done.group(1))
+                    unit = m_done.group(2).upper().replace('I', '')
+                    mult = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}.get(unit, 1024**2)
+                    done_sz = int(val * mult)
+                except (ValueError, TypeError):
+                    pass
+
+            if hasattr(progress, "set_phase_progress"):
+                progress.set_phase_progress(
+                    done_bytes=done_sz,
+                    total_bytes=total_sz or progress.bytes_total,
+                    pct=pct_val,
+                    speed=speed_val,
+                    phase="download",
+                )
+            else:
+                if total_sz:
+                    progress.bytes_total = total_sz
+                if pct_val > 0:
+                    progress.progress.download = min(100.0, pct_val)
+                    if progress.bytes_total:
+                        progress.bytes_done = int(progress.bytes_total * (pct_val / 100.0))
+                if speed_val > 0:
+                    progress.speed = speed_val
+                progress.updated_at = time.time()
         except Exception:
             pass
 
@@ -482,6 +520,7 @@ class LinksProvider(BaseProvider):
         if not has_origin and default_origin:
             req_headers["Origin"] = default_origin
 
+        clean_name = re.sub(r'[,;:*?"<>|]', '_', clean_name)
         cmd = [
             "N_m3u8DL-RE",
             url,
@@ -495,12 +534,17 @@ class LinksProvider(BaseProvider):
             "--del-after-done",
             "--no-ansi-color",
             "--auto-select",
-            "--binary-merge",
         ]
         if shutil.which("ffmpeg"):
             cmd.extend(["-M", "format=mp4:muxer=ffmpeg"])
+        else:
+            cmd.append("--binary-merge")
 
-        skip_hdrs = ("host", "content-length", "accept-encoding", "connection", "range", "transfer-encoding")
+        skip_hdrs = (
+            "host", "content-length", "accept-encoding", "connection", "range", "transfer-encoding",
+            "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+            "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-user"
+        )
         for k, v in req_headers.items():
             low = str(k).lower()
             if v and low not in skip_hdrs:
@@ -565,8 +609,9 @@ class LinksProvider(BaseProvider):
             ]
 
         if not new_files or process.returncode != 0:
+            err_detail = f" (code {process.returncode}: {' | '.join(last_lines[-2:])})" if (last_lines and process.returncode != 0) else ""
             target_fallback = page_url if page_url and page_url != url else url
-            progress.log(f"N_m3u8DL-RE produced no output file on disk, falling back to yt-dlp ({target_fallback[:80]})...")
+            progress.log(f"N_m3u8DL-RE produced no output file on disk{err_detail}, falling back to yt-dlp ({target_fallback[:80]})...")
             try:
                 return await self._download_ytdlp(target_fallback, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
             except TypeError:
@@ -640,8 +685,8 @@ class LinksProvider(BaseProvider):
             "--no-playlist",
             "--newline",
             "--progress",
-            "-N", "8",
-            "--concurrent-fragments", "8",
+            "-N", "16",
+            "--concurrent-fragments", "16",
             "--socket-timeout", "20",
             "--fragment-retries", "10",
             "--retries", "10",
@@ -657,7 +702,11 @@ class LinksProvider(BaseProvider):
         if shutil.which("ffmpeg"):
             cmd.extend(["--remux-video", "mp4"])
 
-        skip_hdrs = ("host", "content-length", "accept-encoding", "connection", "range", "transfer-encoding")
+        skip_hdrs = (
+            "host", "content-length", "accept-encoding", "connection", "range", "transfer-encoding",
+            "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+            "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-user"
+        )
         if req_headers:
             for k, v in req_headers.items():
                 if not v:

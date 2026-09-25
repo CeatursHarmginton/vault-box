@@ -141,6 +141,39 @@ class JobState:
             self._tick_bytes = self.bytes_done
         self.updated_at = now
 
+    def set_phase_progress(
+        self,
+        done_bytes: int = 0,
+        total_bytes: int = 0,
+        pct: float = 0.0,
+        speed: float = 0.0,
+        phase: str = "download",
+    ) -> None:
+        if phase != self._phase:
+            self._phase = phase
+        if total_bytes > 0:
+            self._phase_total = total_bytes
+            self.bytes_total = total_bytes
+            self._phase_total_by_name[phase] = total_bytes
+        if done_bytes > 0:
+            self._phase_done = done_bytes
+            self.bytes_done = done_bytes
+            self._phase_done_by_name[phase] = done_bytes
+        elif (self._phase_total > 0 or total_bytes > 0) and pct > 0:
+            tot = total_bytes or self._phase_total
+            calc_done = int(tot * (pct / 100.0))
+            self._phase_done = calc_done
+            self.bytes_done = calc_done
+            self._phase_done_by_name[phase] = calc_done
+        if pct > 0:
+            setattr(self.progress, phase, min(100.0, pct))
+        elif self._phase_total > 0:
+            setattr(self.progress, phase, min(100.0, (self._phase_done / self._phase_total) * 100.0))
+        if speed > 0:
+            self.speed = speed
+        now = time.time()
+        self.updated_at = now
+
     def check_cancelled(self) -> None:
         if self.cancel:
             raise JobCancelled("JOB_CANCELLED")
@@ -160,10 +193,10 @@ class JobState:
             "progress": self.progress.__dict__,
             "phases": phases,
             "currentFile": self.current_file,
-            "bytesDone": self._phase_done,
+            "bytesDone": self._phase_done or self.bytes_done,
             "bytesTotal": self._phase_total or self.bytes_total,
-            "bytesOverallDone": sum(self._phase_done_by_name.values()),
-            "bytesOverallTotal": sum(self._phase_total_by_name.values()),
+            "bytesOverallDone": sum(self._phase_done_by_name.values()) or self.bytes_done,
+            "bytesOverallTotal": sum(self._phase_total_by_name.values()) or self.bytes_total,
             "bytesCumulative": self.bytes_done,
             "speed": self.speed,
             "logs": self.logs[-50:],
