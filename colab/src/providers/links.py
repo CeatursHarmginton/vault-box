@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -606,11 +607,11 @@ class LinksProvider(BaseProvider):
         new_files = [
             p for p in (after - before) 
             if p.is_file() 
+            and not p.name.startswith(".")
             and not p.name.startswith(".tmp") 
-            and not p.name.endswith(".aria2")
-            and not p.name.endswith(".part")
+            and not p.name.endswith((".aria2", ".part", ".ytdl", ".tmp", ".txt", ".json"))
+            and not (p.name.lower() in ("cookies.txt", "cookie.txt") or p.name.lower().startswith("cookie"))
             and ".part-Frag" not in p.name
-            and not p.name.endswith(".ytdl")
             and p.stat().st_size > 0
         ]
         if not new_files:
@@ -618,11 +619,11 @@ class LinksProvider(BaseProvider):
                 p for p in dest_dir.iterdir() 
                 if p.is_file() 
                 and p.name.startswith(clean_name)
-                and not p.name.startswith(".tmp")
-                and not p.name.endswith(".aria2")
-                and not p.name.endswith(".part")
+                and not p.name.startswith(".")
+                and not p.name.startswith(".tmp") 
+                and not p.name.endswith((".aria2", ".part", ".ytdl", ".tmp", ".txt", ".json"))
+                and not (p.name.lower() in ("cookies.txt", "cookie.txt") or p.name.lower().startswith("cookie"))
                 and ".part-Frag" not in p.name
-                and not p.name.endswith(".ytdl")
                 and p.stat().st_size > 0
             ]
 
@@ -769,9 +770,12 @@ class LinksProvider(BaseProvider):
                 elif k_low not in skip_hdrs:
                     cmd.extend(["--add-header", f"{k}: {v}"])
 
+        cookie_dir: Path | None = None
         if cookies:
             ref_domain = req_headers.get("referer") or req_headers.get("Referer") or default_ref or url
-            c_file = stage_dir / "cookies.txt"
+            cookie_dir = Path(tempfile.gettempdir()) / f"vb_cookies_{uuid.uuid4().hex[:8]}"
+            cookie_dir.mkdir(parents=True, exist_ok=True)
+            c_file = cookie_dir / "cookies.txt"
             if self._write_netscape_cookies(cookies, ref_domain, c_file):
                 cmd.extend(["--cookies", str(c_file)])
             elif "cookie" not in {str(k).lower() for k in req_headers}:
@@ -805,14 +809,14 @@ class LinksProvider(BaseProvider):
                 err_msg = stderr_out.decode('utf-8', errors='ignore').strip()
                 raise ProviderFailure("DOWNLOAD_FAILED", f"yt-dlp failed (exit code {process.returncode}): {err_msg[:300]}")
 
-            # Find finished valid video files in stage_dir (exclude fragments)
+            # Find finished valid video files in stage_dir (strictly exclude cookies, metadata, fragments)
             completed_files = [
                 p for p in stage_dir.iterdir()
                 if p.is_file()
-                and not p.name.endswith(".part")
+                and not p.name.startswith(".")
+                and not p.name.endswith((".part", ".ytdl", ".aria2", ".tmp", ".txt", ".json", ".log"))
+                and not (p.name.lower() in ("cookies.txt", "cookie.txt") or p.name.lower().startswith("cookie"))
                 and ".part-Frag" not in p.name
-                and not p.name.endswith(".ytdl")
-                and not p.name.endswith(".aria2")
                 and p.stat().st_size > 0
             ]
 
@@ -825,9 +829,16 @@ class LinksProvider(BaseProvider):
                 shutil.move(str(src_file), str(target_file))
                 final_files.append(target_file)
 
+            # Clean any stray cookie files in dest_dir
+            for extra in dest_dir.glob("*cookie*"):
+                if extra.is_file():
+                    extra.unlink(missing_ok=True)
+
             return final_files
         finally:
             shutil.rmtree(stage_dir, ignore_errors=True)
+            if cookie_dir:
+                shutil.rmtree(cookie_dir, ignore_errors=True)
 
     async def _download_gdrive(self, url: str, dest_dir: Path, name: str | None, progress: JobState) -> list[Path]:
         progress.log(f"Starting gdown download for: {url}")

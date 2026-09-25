@@ -126,9 +126,8 @@ async def run_transfer(job: JobState) -> None:
             downloaded = [
                 p for p in sorted(dirs["input"].rglob("*")) 
                 if p.is_file() 
-                and not p.name.endswith(".aria2")
-                and not p.name.endswith(".ytdl")
-                and not p.name.endswith(".part")
+                and not p.name.endswith((".aria2", ".ytdl", ".part", ".tmp"))
+                and not (p.name.lower() in ("cookies.txt", "cookie.txt", "cookies.json") or p.name.lower().startswith("cookie"))
                 and ".part-Frag" not in p.name
                 and not p.name.startswith(".tmp")
                 and not p.name.startswith(".")
