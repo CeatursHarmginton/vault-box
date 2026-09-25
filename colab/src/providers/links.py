@@ -70,6 +70,16 @@ class LinksProvider(BaseProvider):
         missing = []
         if not shutil.which("yt-dlp"):
             missing.append("yt-dlp")
+        else:
+            try:
+                subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp", "curl_cffi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+            except Exception:
+                pass
+
+        try:
+            import curl_cffi
+        except ImportError:
+            missing.append("curl_cffi")
             
         try:
             import gdown
@@ -171,7 +181,7 @@ class LinksProvider(BaseProvider):
         ytdlp_domains = [
             "youtube", "youtu.be", "tiktok", "bilibili", "vimeo", 
             "dailymotion", "twitch", "mega.nz", 
-            "pixeldrain.com", "1fichier.com"
+            "pixeldrain.com", "1fichier.com", "pornhub.com"
         ]
         
         if url_lower.endswith(".m3u8") or url_lower.endswith(".mpd") or ".m3u8?" in url_lower or ".mpd?" in url_lower or "/hls/" in url_lower:
@@ -488,6 +498,18 @@ class LinksProvider(BaseProvider):
         proxy: str | None = None,
         page_url: str | None = None,
     ) -> list[Path]:
+        # Check if stream is from PornHub CDN where tokens are bound to browser client IP
+        is_phncdn = "phncdn.com" in url.lower() or "pornhub.com" in (page_url or "").lower()
+        if is_phncdn and page_url:
+            clean_page = page_url
+            if "pornhub.com" in clean_page:
+                clean_page = re.sub(r'https?://[a-zA-Z0-9_-]+\.pornhub\.com', 'https://www.pornhub.com', clean_page)
+            progress.log(f"[links] PornHub stream detected (tokens are browser-IP bound). Fetching fresh stream from canonical page with yt-dlp: {clean_page[:80]}...")
+            try:
+                return await self._download_ytdlp(clean_page, dest_dir, name, progress, cookies=cookies, proxy=proxy)
+            except Exception as page_err:
+                progress.log(f"[Fallback] Canonical page download failed: {page_err}. Falling back to direct stream...")
+
         if not shutil.which("N_m3u8DL-RE"):
             progress.log("N_m3u8DL-RE not found in PATH, falling back to yt-dlp...")
             return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
@@ -611,11 +633,14 @@ class LinksProvider(BaseProvider):
                 return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
             except Exception as direct_err:
                 if page_url and page_url != url:
-                    progress.log(f"[Fallback] Direct stream download failed ({direct_err}). Retrying download from canonical page URL with yt-dlp: {page_url[:80]}...")
+                    clean_page_url = page_url
+                    if "pornhub.com" in clean_page_url:
+                        clean_page_url = re.sub(r'https?://[a-zA-Z0-9_-]+\.pornhub\.com', 'https://www.pornhub.com', clean_page_url)
+                    progress.log(f"[Fallback] Direct stream download failed ({direct_err}). Retrying download from canonical page URL with yt-dlp: {clean_page_url[:80]}...")
                     try:
-                        return await self._download_ytdlp(page_url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
-                    except Exception:
-                        pass
+                        return await self._download_ytdlp(clean_page_url, dest_dir, name, progress, headers=None, cookies=cookies, proxy=proxy)
+                    except Exception as page_err:
+                        progress.log(f"[Fallback] Canonical page URL download failed: {page_err}")
                 raise ProviderFailure("DOWNLOAD_FAILED", f"Stream download failed: N_m3u8DL-RE error{err_detail}; yt-dlp direct error: {direct_err}")
 
         return new_files
@@ -672,11 +697,24 @@ class LinksProvider(BaseProvider):
         out_tpl = str(stage_dir / "%(title)s.%(ext)s") if not name else str(stage_dir / out_name)
         progress.current_file = out_name
 
+        if "pornhub.com" in url:
+            url = re.sub(r'https?://[a-zA-Z0-9_-]+\.pornhub\.com', 'https://www.pornhub.com', url)
+
         parsed_url = urlparse(url)
         default_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
         default_ref = f"{parsed_url.scheme}://{parsed_url.netloc}/" if parsed_url.netloc else ""
+        if "pornhub.com" in url:
+            default_ref = "https://www.pornhub.com/"
 
         req_headers = dict(headers or {})
+        if "pornhub.com" in url:
+            for k in list(req_headers.keys()):
+                low = k.lower()
+                if low in ("referer", "origin"):
+                    req_headers[k] = re.sub(r'https?://[a-zA-Z0-9_-]+\.pornhub\.com/?', 'https://www.pornhub.com/', req_headers[k])
+                elif low == "accept" and "vnd.t1c" in str(req_headers[k]):
+                    del req_headers[k]
+
         has_ua = any(k.lower() == "user-agent" for k in req_headers)
         has_ref = any(k.lower() == "referer" for k in req_headers)
 
@@ -684,6 +722,7 @@ class LinksProvider(BaseProvider):
             "yt-dlp",
             "--no-warnings",
             "--no-playlist",
+            "--no-check-certificates",
             "--newline",
             "--progress",
             "-N", "16",
@@ -694,6 +733,16 @@ class LinksProvider(BaseProvider):
             "--hls-use-mpegts",
             "-o", out_tpl,
         ]
+
+        # Enable browser impersonation via curl_cffi to bypass Cloudflare/TLS fingerprint detection
+        has_curl_cffi = False
+        try:
+            import curl_cffi
+            has_curl_cffi = True
+        except ImportError:
+            pass
+        if has_curl_cffi:
+            cmd.extend(["--impersonate", "Chrome"])
 
         if not has_ua:
             cmd.extend(["--user-agent", default_ua])
@@ -1124,6 +1173,9 @@ class LinksProvider(BaseProvider):
             if ref_hdr.startswith("http") and ref_hdr.rstrip("/").count("/") >= 3:
                 page_url = ref_hdr
 
+        if "pornhub.com" in page_url:
+            page_url = re.sub(r'https?://[a-zA-Z0-9_-]+\.pornhub\.com', 'https://www.pornhub.com', page_url)
+
         page_title = meta_dict.get("page_title") or file_ref.get("page_title")
         if page_title and (not raw_name or any(raw_name.startswith(p) for p in ("1080P_", "720P_", "480P_", "360P_", "master", "index", "chunklist", "stream_download_"))):
             raw_name = f"{safe_name(page_title)}.mp4"
@@ -1162,7 +1214,10 @@ class LinksProvider(BaseProvider):
                 now_ts = int(time.time())
                 if exp_ts < now_ts:
                     diff_m = max(1, (now_ts - exp_ts) // 60)
-                    progress.log(f"[WARNING] Link token expired {diff_m} minutes ago! If download fails with 403, please refresh the webpage and copy a fresh link.")
+                    progress.log(f"[WARNING] Link token expired {diff_m} minute(s) ago! (Expires: {exp_ts}, Now: {now_ts}). If download fails with 410/403, please refresh the webpage and copy a fresh link.")
+                elif (exp_ts - now_ts) < 300:
+                    diff_m = max(1, (exp_ts - now_ts) // 60)
+                    progress.log(f"[WARNING] Link token will expire in ~{diff_m} minute(s)! Ensure download completes before expiration or copy a fresh link.")
         except Exception:
             pass
 
@@ -1180,12 +1235,28 @@ class LinksProvider(BaseProvider):
                 and any(err in msg for err in ("403", "forbidden", "429", "410", "gone", "blocked"))
             )
 
-            # Fallback 1: If blocked or failed, retry with SOCKS5 Proxy
-            if is_blocked:
+            # Fallback 1: If stream failed and we have canonical page_url, retry with yt-dlp first
+            if not downloaded and page_url and page_url != url:
+                clean_page_url = page_url
+                if "pornhub.com" in clean_page_url:
+                    clean_page_url = re.sub(r'https?://[a-zA-Z0-9_-]+\.pornhub\.com', 'https://www.pornhub.com', clean_page_url)
+                progress.log(f"[Fallback] Stream download failed. Retrying download from canonical page URL with yt-dlp: {clean_page_url[:80]}...")
+                try:
+                    downloaded = await self._download_ytdlp(
+                        clean_page_url, dest_dir, name, progress,
+                        headers=None, cookies=cookies,
+                    )
+                except Exception as page_exc:
+                    progress.log(f"[Fallback] Page URL download failed: {page_exc}")
+                    downloaded = None
+
+            # Fallback 2: If still blocked and not downloaded, retry with SOCKS5 Proxy
+            # (skip Tor for pornhub as Cloudflare blocks Tor exit nodes)
+            if not downloaded and is_blocked and "pornhub.com" not in url and "pornhub.com" not in (page_url or ""):
                 progress.log(f"[Proxy] Download blocked ({exc.message}). Activating TCP SOCKS5 proxy and retrying...")
                 proxy = await self._ensure_tor_proxy(progress)
                 if proxy:
-                    progress.log(f"[Proxy] Retrying direct stream via {proxy}...")
+                    progress.log(f"[Proxy] Retrying via {proxy}...")
                     try:
                         downloaded = await self._dispatch_download(
                             link_type, is_stream, url, urls, dest_dir, name, progress,
@@ -1193,31 +1264,10 @@ class LinksProvider(BaseProvider):
                             page_url=page_url,
                         )
                     except Exception as stream_proxy_exc:
-                        if page_url and page_url != url:
-                            progress.log(f"[Proxy] Direct stream via proxy failed ({stream_proxy_exc}). Retrying canonical page URL via yt-dlp: {page_url}...")
-                            try:
-                                downloaded = await self._download_ytdlp(
-                                    page_url, dest_dir, name, progress,
-                                    headers=headers, cookies=cookies, proxy=proxy,
-                                )
-                            except Exception:
-                                downloaded = None
-                        if not downloaded:
-                            raise exc
+                        progress.log(f"[Proxy] Retry via proxy failed: {stream_proxy_exc}")
+                        downloaded = None
                 else:
                     progress.log("[Proxy] Proxy unavailable.")
-
-            # Fallback 2: If stream failed and we have page_url, try page_url with yt-dlp as last resort
-            if not downloaded and page_url and page_url != url:
-                progress.log(f"[Fallback] Retrying download from canonical page URL with yt-dlp: {page_url}...")
-                try:
-                    downloaded = await self._download_ytdlp(
-                        page_url, dest_dir, name, progress,
-                        headers=headers, cookies=cookies,
-                    )
-                except Exception as page_exc:
-                    progress.log(f"[Fallback] Page URL download failed: {page_exc}")
-                    downloaded = None
 
             if not downloaded:
                 raise exc

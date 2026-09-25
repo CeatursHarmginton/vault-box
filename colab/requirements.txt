@@ -6,5 +6,6 @@ websockets>=12
 pydantic>=2.7
 python-multipart>=0.0.9
 yt-dlp>=2024.0
+curl_cffi>=0.7.0
 gdown>=5.0
 cryptography>=41.0
