@@ -239,9 +239,22 @@ class DriveProvider(BaseProvider):
         size = local_path.stat().st_size
         mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
         progress.set(step="uploading", current_file=name)
+        meta_dict: dict[str, Any] = {"name": name, "parents": [parent]}
+        try:
+            from ..utils.video_thumbnail import get_cached_thumbnail
+            thumb_bytes = get_cached_thumbnail(local_path)
+            if thumb_bytes and len(thumb_bytes) <= 2 * 1024 * 1024:
+                meta_dict["contentHints"] = {
+                    "thumbnail": {
+                        "image": base64.urlsafe_b64encode(thumb_bytes).decode("ascii"),
+                        "mimeType": "image/jpeg",
+                    }
+                }
+        except Exception:
+            pass
         if size <= API_MULTIPART_MAX:
             boundary = f"vaultbox-drive-{int(time.time() * 1000)}"
-            body = _multipart_body(boundary, json.dumps({"name": name, "parents": [parent]}, ensure_ascii=False), mime, await asyncio.to_thread(local_path.read_bytes))
+            body = _multipart_body(boundary, json.dumps(meta_dict, ensure_ascii=False), mime, await asyncio.to_thread(local_path.read_bytes))
             resp = await self._request(credentials, "POST", f"{DRIVE_UPLOAD_API}/files", params={"uploadType": "multipart", "fields": FIELDS, "supportsAllDrives": "true"}, headers={"Content-Type": f"multipart/related; boundary={boundary}"}, content=body)
             progress.add_bytes(size, size, "upload", str(local_path))
             return resp.json()
@@ -249,7 +262,7 @@ class DriveProvider(BaseProvider):
             "Content-Type": "application/json; charset=UTF-8",
             "X-Upload-Content-Type": mime,
             "X-Upload-Content-Length": str(size),
-        }, content=json.dumps({"name": name, "parents": [parent]}))
+        }, content=json.dumps(meta_dict))
         session = init.headers.get("Location")
         if not session:
             raise ProviderFailure("UPLOAD_FAILED", "Drive resumable session missing")
@@ -294,9 +307,22 @@ class DriveProvider(BaseProvider):
         size = local_path.stat().st_size
         mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
         progress.set(step="uploading", current_file=name)
+        meta_dict: dict[str, Any] = {"name": name}
+        try:
+            from ..utils.video_thumbnail import get_cached_thumbnail
+            thumb_bytes = get_cached_thumbnail(local_path)
+            if thumb_bytes and len(thumb_bytes) <= 2 * 1024 * 1024:
+                meta_dict["contentHints"] = {
+                    "thumbnail": {
+                        "image": base64.urlsafe_b64encode(thumb_bytes).decode("ascii"),
+                        "mimeType": "image/jpeg",
+                    }
+                }
+        except Exception:
+            pass
         if size <= API_MULTIPART_MAX:
             boundary = f"vaultbox-drive-{int(time.time() * 1000)}"
-            body = _multipart_body(boundary, json.dumps({"name": name}, ensure_ascii=False), mime, await asyncio.to_thread(local_path.read_bytes))
+            body = _multipart_body(boundary, json.dumps(meta_dict, ensure_ascii=False), mime, await asyncio.to_thread(local_path.read_bytes))
             resp = await self._request(credentials, "PATCH", f"{DRIVE_UPLOAD_API}/files/{fid}", params={"uploadType": "multipart", "fields": FIELDS, "supportsAllDrives": "true"}, headers={"Content-Type": f"multipart/related; boundary={boundary}"}, content=body)
             progress.add_bytes(size, size, "upload", str(local_path))
             out = resp.json()
@@ -307,7 +333,7 @@ class DriveProvider(BaseProvider):
             "Content-Type": "application/json; charset=UTF-8",
             "X-Upload-Content-Type": mime,
             "X-Upload-Content-Length": str(size),
-        }, content=json.dumps({"name": name}))
+        }, content=json.dumps(meta_dict))
         session = init.headers.get("Location")
         if not session:
             raise ProviderFailure("UPLOAD_FAILED", "Drive resumable session missing")

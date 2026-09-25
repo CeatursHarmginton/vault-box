@@ -206,8 +206,18 @@ async def run_transfer(job: JobState) -> None:
                 job.log("No image files found for optimization, skipping confirmation.")
                 
             job.set(status="running", step="uploading")
-        else:
-            job.set(step="uploading")
+        if options.get("set_video_thumbnail", True):
+            try:
+                from ..utils.video_thumbnail import process_video_thumbnails
+                outputs = await asyncio.to_thread(
+                    process_video_thumbnails,
+                    outputs,
+                    options,
+                    job,
+                )
+            except Exception as exc:
+                job.log(f"[Thumbnail] Warning during video thumbnailing: {exc}")
+        job.set(step="uploading")
         preserve_tree = bool(options.get("preserveFolderStructure") or has_folder_source)
         if len(outputs) == 1 and outputs[0].is_file() and not preserve_tree:
             job.files_to_upload = 1
