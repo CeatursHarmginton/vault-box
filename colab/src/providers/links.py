@@ -499,21 +499,26 @@ class LinksProvider(BaseProvider):
         proxy: str | None = None,
         page_url: str | None = None,
     ) -> list[Path]:
-        # Check if stream is from PornHub CDN where tokens are bound to browser client IP
-        is_phncdn = "phncdn.com" in url.lower() or "pornhub.com" in (page_url or "").lower()
-        if is_phncdn and page_url:
+        # Universal High-Speed Strategy:
+        # If a canonical webpage URL is present (from Sniffer JSON), attempt downloading via yt-dlp first.
+        # yt-dlp supports 1,800+ sites and will generate fresh, unthrottled CDN tokens directly on Colab's IP,
+        # bypassing the single-connection 600KB/s throttle imposed by CDNs on remote browser tokens!
+        if page_url and page_url.startswith(("http://", "https://")) and page_url != url:
             clean_page = page_url
             if "pornhub.com" in clean_page:
                 clean_page = re.sub(r'https?://[a-zA-Z0-9_-]+\.pornhub\.com', 'https://www.pornhub.com', clean_page)
-            progress.log(f"[links] PornHub stream detected (tokens are browser-IP bound). Fetching fresh stream from canonical page with yt-dlp: {clean_page[:80]}...")
+            progress.log(f"[links] Canonical page detected. Attempting high-speed extraction with yt-dlp: {clean_page[:80]}...")
             try:
-                return await self._download_ytdlp(clean_page, dest_dir, name, progress, cookies=cookies, proxy=proxy)
+                return await self._download_ytdlp(clean_page, dest_dir, name, progress, headers=None, cookies=cookies, proxy=proxy)
             except Exception as page_err:
-                progress.log(f"[Fallback] Canonical page download failed: {page_err}. Falling back to direct stream...")
+                progress.log(f"[links] Canonical page extraction bypassed ({str(page_err)[:100]}). Falling back to multi-threaded N_m3u8DL-RE...")
 
         if not shutil.which("N_m3u8DL-RE"):
             progress.log("N_m3u8DL-RE not found in PATH, falling back to yt-dlp...")
-            return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
+            try:
+                return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
+            except TypeError:
+                return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers)
 
         dest_dir.mkdir(parents=True, exist_ok=True)
         before = set(dest_dir.iterdir()) if dest_dir.exists() else set()
@@ -567,10 +572,16 @@ class LinksProvider(BaseProvider):
         for k, v in req_headers.items():
             low = str(k).lower()
             if v and low not in skip_hdrs:
-                cmd.extend(["-H", f"{k}: {v}"])
+                if low == "accept" and "vnd." in str(v):
+                    cmd.extend(["-H", "Accept: */*"])
+                else:
+                    clean_v = re.sub(r'[\r\n\t]+', ' ', str(v)).strip()
+                    cmd.extend(["-H", f"{k}: {clean_v}"])
 
         if cookies and "cookie" not in {str(k).lower() for k in req_headers}:
-            cmd.extend(["-H", f"Cookie: {cookies}"])
+            clean_cookie = re.sub(r'[\r\n\t]+', ' ', str(cookies)).strip()
+            if clean_cookie:
+                cmd.extend(["-H", f"Cookie: {clean_cookie}"])
 
         if dec_key and isinstance(dec_key, dict):
             key_hex = dec_key.get("key_hex") or dec_key.get("key")
@@ -633,11 +644,7 @@ class LinksProvider(BaseProvider):
             try:
                 return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
             except Exception as direct_err:
-                has_page_extractor = any(d in (page_url or "").lower() for d in [
-                    "pornhub", "youtube", "youtu.be", "tiktok", "bilibili", "vimeo", 
-                    "dailymotion", "twitch", "xvideos", "xhamster", "spankbang", "redtube"
-                ])
-                if page_url and page_url != url and has_page_extractor:
+                if page_url and page_url != url and page_url.startswith(("http://", "https://")):
                     clean_page_url = page_url
                     if "pornhub.com" in clean_page_url:
                         clean_page_url = re.sub(r'https?://[a-zA-Z0-9_-]+\.pornhub\.com', 'https://www.pornhub.com', clean_page_url)
@@ -730,12 +737,14 @@ class LinksProvider(BaseProvider):
             "--no-check-certificates",
             "--newline",
             "--progress",
+            "-f", "bestvideo*+bestaudio/best",
             "-N", "16",
             "--concurrent-fragments", "16",
+            "--downloader", "dash,m3u8:native",
             "--socket-timeout", "20",
             "--fragment-retries", "10",
             "--retries", "10",
-            "--hls-use-mpegts",
+            "--buffer-size", "16M",
             "-o", out_tpl,
         ]
 
@@ -1250,12 +1259,8 @@ class LinksProvider(BaseProvider):
                 and any(err in msg for err in ("403", "forbidden", "429", "blocked"))
             )
 
-            # Fallback 1: If stream failed and we have canonical page_url on a supported site, retry with yt-dlp
-            has_page_extractor = any(d in (page_url or "").lower() for d in [
-                "pornhub", "youtube", "youtu.be", "tiktok", "bilibili", "vimeo", 
-                "dailymotion", "twitch", "xvideos", "xhamster", "spankbang", "redtube"
-            ])
-            if not downloaded and page_url and page_url != url and has_page_extractor:
+            # Fallback 1: If stream failed and we have canonical page_url, retry with yt-dlp
+            if not downloaded and page_url and page_url != url and page_url.startswith(("http://", "https://")):
                 clean_page_url = page_url
                 if "pornhub.com" in clean_page_url:
                     clean_page_url = re.sub(r'https?://[a-zA-Z0-9_-]+\.pornhub\.com', 'https://www.pornhub.com', clean_page_url)
