@@ -15,6 +15,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+WARP_PROXY = "socks5://127.0.0.1:40000"
+WARP_SETUP_LOCK: asyncio.Lock | None = None
+_warp_ready = False
+
 import httpx
 
 from ..providers.base import BaseProvider, ProviderFailure, safe_name, stream_download
@@ -34,7 +38,23 @@ class LinksProvider(BaseProvider):
             return
             
         if not shutil.which("aria2c"):
-            subprocess.check_call(['apt-get', 'install', '-y', '-qq', 'aria2'])
+            try:
+                subprocess.check_call(['apt-get', 'install', '-y', '-qq', 'aria2'])
+            except Exception:
+                pass
+
+        if not shutil.which("N_m3u8DL-RE") and sys.platform.startswith("linux"):
+            try:
+                nm_tar = "/tmp/N_m3u8DL-RE.tar.gz"
+                url = "https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.2.1-beta/N_m3u8DL-RE_Beta_linux-x64_20240828.tar.gz"
+                subprocess.check_call(["curl", "-fsSL", url, "-o", nm_tar], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.check_call(["tar", "-xzf", nm_tar, "-C", "/tmp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                for extracted in Path("/tmp").glob("**/N_m3u8DL-RE"):
+                    if extracted.is_file():
+                        subprocess.check_call(["install", "-m", "755", str(extracted), "/usr/local/bin/N_m3u8DL-RE"])
+                        break
+            except Exception:
+                pass
             
         missing = []
         if not shutil.which("yt-dlp"):
@@ -54,9 +74,92 @@ class LinksProvider(BaseProvider):
                 missing.append("cryptography")
             
         if missing:
-            subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q'] + missing)
+            try:
+                subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q'] + missing)
+            except Exception:
+                pass
             
         cls._deps_checked = True
+
+    @classmethod
+    async def _ensure_warp_proxy(cls) -> str | None:
+        """Set up Cloudflare WARP as SOCKS5 proxy for IP-blocked sites. Returns proxy URL or None."""
+        global _warp_ready, WARP_SETUP_LOCK
+        if _warp_ready:
+            return WARP_PROXY
+        if WARP_SETUP_LOCK is None:
+            WARP_SETUP_LOCK = asyncio.Lock()
+        async with WARP_SETUP_LOCK:
+            if _warp_ready:
+                return WARP_PROXY
+            # Check if wireproxy is already running
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "curl", "-s", "--socks5", "127.0.0.1:40000", "--connect-timeout", "3", "http://ifconfig.me",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                )
+                out, _ = await proc.communicate()
+                if proc.returncode == 0 and out.strip():
+                    _warp_ready = True
+                    return WARP_PROXY
+            except Exception:
+                pass
+
+            if not sys.platform.startswith("linux"):
+                return None
+
+            try:
+                # Install wgcf if needed
+                if not shutil.which("wgcf"):
+                    subprocess.check_call([
+                        "bash", "-c",
+                        "curl -fsSL https://github.com/ViRb3/wgcf/releases/download/v2.2.22/wgcf_2.2.22_linux_amd64 -o /usr/local/bin/wgcf && chmod +x /usr/local/bin/wgcf"
+                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                # Install wireproxy if needed
+                if not shutil.which("wireproxy"):
+                    subprocess.check_call([
+                        "bash", "-c",
+                        "curl -fsSL https://github.com/pufferffish/wireproxy/releases/download/v1.0.9/wireproxy_linux_amd64.tar.gz | tar -xzf - -C /tmp && install -m 755 /tmp/wireproxy /usr/local/bin/wireproxy"
+                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                # Generate WARP config if needed
+                warp_dir = Path("/tmp/vaultbox-warp")
+                warp_dir.mkdir(parents=True, exist_ok=True)
+                wgcf_profile = warp_dir / "wgcf-profile.conf"
+                wireproxy_conf = warp_dir / "wireproxy.conf"
+
+                if not wgcf_profile.exists():
+                    subprocess.check_call(["wgcf", "register", "--accept-tos"], cwd=str(warp_dir), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.check_call(["wgcf", "generate"], cwd=str(warp_dir), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                if wgcf_profile.exists() and not wireproxy_conf.exists():
+                    # Convert WireGuard config to wireproxy config
+                    wg_text = wgcf_profile.read_text()
+                    wp_text = wg_text.rstrip() + "\n\n[Socks5]\nBindAddress = 127.0.0.1:40000\n"
+                    # Remove DNS line (wireproxy doesn't support it the same way)
+                    wp_text = re.sub(r'(?m)^DNS\s*=.*$', '', wp_text)
+                    wireproxy_conf.write_text(wp_text)
+
+                if wireproxy_conf.exists():
+                    subprocess.Popen(
+                        ["wireproxy", "-c", str(wireproxy_conf)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                    await asyncio.sleep(3)  # Wait for proxy to start
+
+                    # Verify proxy works
+                    proc = await asyncio.create_subprocess_exec(
+                        "curl", "-s", "--socks5", "127.0.0.1:40000", "--connect-timeout", "5", "http://ifconfig.me",
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    out, _ = await proc.communicate()
+                    if proc.returncode == 0 and out.strip():
+                        _warp_ready = True
+                        return WARP_PROXY
+            except Exception:
+                pass
+            return None
 
     def _classify_link(self, url: str) -> str:
         url_lower = url.lower()
@@ -79,8 +182,8 @@ class LinksProvider(BaseProvider):
             "pixeldrain.com", "1fichier.com"
         ]
         
-        if url_lower.endswith(".m3u8") or url_lower.endswith(".mpd"):
-            return "ytdlp"
+        if url_lower.endswith(".m3u8") or url_lower.endswith(".mpd") or ".m3u8?" in url_lower or ".mpd?" in url_lower or "/hls/" in url_lower:
+            return "stream"
             
         for domain in ytdlp_domains:
             if domain in url_lower:
@@ -201,7 +304,7 @@ class LinksProvider(BaseProvider):
             raise last
         raise ProviderFailure("DOWNLOAD_FAILED", "No URL provided")
 
-    async def _download_aria2(self, url: str | list[str], dest_dir: Path, name: str | None, progress: JobState, headers: dict[str, str] | None = None) -> list[Path]:
+    async def _download_aria2(self, url: str | list[str], dest_dir: Path, name: str | None, progress: JobState, headers: dict[str, str] | None = None, proxy: str | None = None) -> list[Path]:
         urls = [str(item) for item in (url if isinstance(url, list) else [url]) if str(item or "")]
         uri_file: Path | None = None
         cmd = [
@@ -218,6 +321,8 @@ class LinksProvider(BaseProvider):
             "--retry-wait=2",
             "--uri-selector=adaptive",
         ]
+        if proxy:
+            cmd.append(f"--all-proxy={proxy}")
         if headers:
             for k, v in headers.items():
                 if v and str(k).lower() not in ("host", "content-length"):
@@ -300,7 +405,103 @@ class LinksProvider(BaseProvider):
         new_files = [p for p in (after - before) if p.is_file() and not p.name.endswith(".aria2") and not p.name.startswith(".vaultbox-aria2-")]
         return new_files or [p for p in dest_dir.iterdir() if p.is_file() and not p.name.endswith(".aria2") and not p.name.startswith(".vaultbox-aria2-")]
 
-    async def _download_ytdlp(self, url: str, dest_dir: Path, name: str | None, progress: JobState, headers: dict[str, str] | None = None) -> list[Path]:
+    async def _download_stream_nm3u8dl(
+        self,
+        url: str,
+        dest_dir: Path,
+        name: str | None,
+        progress: JobState,
+        headers: dict[str, str] | None = None,
+        cookies: str | None = None,
+        dec_key: dict[str, Any] | None = None,
+        proxy: str | None = None,
+    ) -> list[Path]:
+        if not shutil.which("N_m3u8DL-RE"):
+            progress.log("N_m3u8DL-RE not found, falling back to yt-dlp...")
+            try:
+                return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
+            except TypeError:
+                return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers)
+
+        before = set(dest_dir.iterdir()) if dest_dir.exists() else set()
+        clean_name = (name or safe_name(unquote(Path(urlparse(url).path).name) or "stream")).replace(".mp4", "").replace(".ts", "")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        tmp_dir = dest_dir / f".tmp-{uuid.uuid4().hex[:8]}"
+
+        cmd = [
+            "N_m3u8DL-RE",
+            url,
+            "--save-name", clean_name,
+            "--save-dir", str(dest_dir),
+            "--tmp-dir", str(tmp_dir),
+            "--thread-count", "16",
+            "--download-retry-count", "5",
+            "--auto-select",
+            "--binary-merge",
+        ]
+        if shutil.which("ffmpeg"):
+            cmd.extend(["-M", "format=mp4:muxer=ffmpeg"])
+
+        if headers:
+            for k, v in headers.items():
+                if v and str(k).lower() not in ("host", "content-length"):
+                    cmd.extend(["-H", f"{k}: {v}"])
+
+        if cookies:
+            cmd.extend(["-H", f"Cookie: {cookies}"])
+
+        if dec_key and isinstance(dec_key, dict):
+            key_hex = dec_key.get("key_hex") or dec_key.get("key")
+            if key_hex:
+                cmd.extend(["--key", str(key_hex)])
+                progress.log(f"[*] Applying Offline AES-128 Key: {key_hex}")
+
+        if proxy:
+            cmd.extend(["--custom-proxy", proxy])
+
+        progress.log(f"Starting N_m3u8DL-RE stream download: {clean_name}")
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+        last_pct = 0.0
+        if process.stdout:
+            while True:
+                line_bytes = await process.stdout.readline()
+                if not line_bytes:
+                    break
+                line = line_bytes.decode("utf-8", errors="ignore").strip()
+                progress.check_cancelled()
+                pct = self._parse_ytdlp_progress(line)
+                if pct is not None and pct > last_pct:
+                    diff = pct - last_pct
+                    progress.add_bytes(int(diff * 1024), int(100 * 1024))
+                    last_pct = pct
+
+        await process.wait()
+        if process.returncode != 0:
+            progress.log("N_m3u8DL-RE finished with non-zero or failed, trying yt-dlp fallback...")
+            try:
+                return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies)
+            except TypeError:
+                return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers)
+
+        after = set(dest_dir.iterdir()) if dest_dir.exists() else set()
+        new_files = [p for p in (after - before) if p.is_file() and not p.name.startswith(".tmp")]
+        return new_files or [p for p in dest_dir.iterdir() if p.is_file() and p.name.startswith(clean_name)]
+
+    async def _download_ytdlp(
+        self,
+        url: str,
+        dest_dir: Path,
+        name: str | None,
+        progress: JobState,
+        headers: dict[str, str] | None = None,
+        cookies: str | None = None,
+        proxy: str | None = None,
+    ) -> list[Path]:
         before = set(dest_dir.iterdir()) if dest_dir.exists() else set()
         out_tpl = str(dest_dir / "%(title)s.%(ext)s")
         if name:
@@ -327,6 +528,12 @@ class LinksProvider(BaseProvider):
                     cmd.extend(["--user-agent", str(v)])
                 elif k_low not in ("host", "content-length"):
                     cmd.extend(["--add-header", f"{k}: {v}"])
+
+        if cookies and "cookie" not in {str(k).lower() for k in (headers or {})}:
+            cmd.extend(["--add-header", f"Cookie: {cookies}"])
+
+        if proxy:
+            cmd.extend(["--proxy", proxy])
 
         cmd.append(url)
         progress.log(f"Starting yt-dlp download for: {url}")
@@ -501,6 +708,46 @@ class LinksProvider(BaseProvider):
             direct_url, resolved_name, headers = await self._resolve_sorafolder_url(url)
             return await self._download_http_stream(direct_url, dest_dir, name, progress, headers=headers)
 
+    async def _dispatch_download(
+        self, link_type: str, is_stream: bool, url: str, urls: list[str],
+        dest_dir: Path, name: str | None, progress: JobState, *,
+        headers: dict[str, str] | None = None, cookies: str | None = None,
+        dec_key: dict[str, Any] | None = None, file_ref: dict[str, Any] | None = None,
+        proxy: str | None = None,
+    ) -> list[Path]:
+        """Central download dispatch. Extracted so WARP retry can re-call it with a proxy."""
+        file_ref = file_ref or {}
+        if link_type == "torrent":
+            return await self._download_torrent(url, dest_dir, progress)
+        elif is_stream:
+            return await self._download_stream_nm3u8dl(url, dest_dir, name, progress, headers=headers, cookies=cookies, dec_key=dec_key, proxy=proxy)
+        elif link_type == "gofile_page":
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Gofile page links are not direct downloads. Click Download in browser, stop it, copy the store-*.gofile.io/download/web/... URL, then paste that link.")
+        elif link_type == "mediafire":
+            return await self._download_mediafire(url, dest_dir, name, progress)
+        elif link_type == "sorafolder":
+            return await self._download_sorafolder(url, dest_dir, name, progress)
+        elif link_type == "ytdlp":
+            try:
+                return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
+            except TypeError:
+                return await self._download_ytdlp(url, dest_dir, name, progress)
+        elif link_type == "gdrive":
+            return await self._download_gdrive(url, dest_dir, name, progress)
+        else:
+            if self._needs_browser_stream(headers or {}, file_ref):
+                return await self._download_http_stream(urls, dest_dir, name, progress, headers=headers)
+            else:
+                try:
+                    return await self._download_aria2(urls, dest_dir, name, progress, headers=headers, proxy=proxy)
+                except TypeError:
+                    return await self._download_aria2(urls, dest_dir, name, progress)
+                except ProviderFailure as exc:
+                    if "code 22" not in exc.message:
+                        raise
+                    progress.log("aria2c failed; retrying browser-compatible downloader")
+                    return await self._download_http_stream(urls, dest_dir, name, progress, headers=headers)
+
     async def validate_credentials(self, credentials: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True}
 
@@ -535,34 +782,34 @@ class LinksProvider(BaseProvider):
         dest_dir = local_path.parent if local_path.suffix else local_path
         dest_dir.mkdir(parents=True, exist_ok=True)
 
-        if link_type == "torrent":
-            downloaded = await self._download_torrent(url, dest_dir, progress)
-        elif link_type == "gofile_page":
-            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Gofile page links are not direct downloads. Click Download in browser, stop it, copy the store-*.gofile.io/download/web/... URL, then paste that link.")
-        elif link_type == "mediafire":
-            downloaded = await self._download_mediafire(url, dest_dir, name, progress)
-        elif link_type == "sorafolder":
-            downloaded = await self._download_sorafolder(url, dest_dir, name, progress)
-        elif link_type == "ytdlp":
-            try:
-                downloaded = await self._download_ytdlp(url, dest_dir, name, progress, headers=headers)
-            except TypeError:
-                downloaded = await self._download_ytdlp(url, dest_dir, name, progress)
-        elif link_type == "gdrive":
-            downloaded = await self._download_gdrive(url, dest_dir, name, progress)
-        else:
-            if self._needs_browser_stream(headers, file_ref):
-                downloaded = await self._download_http_stream(urls, dest_dir, name, progress, headers=headers)
-            else:
-                try:
-                    downloaded = await self._download_aria2(urls, dest_dir, name, progress, headers=headers)
-                except TypeError:
-                    downloaded = await self._download_aria2(urls, dest_dir, name, progress)
-                except ProviderFailure as exc:
-                    if "code 22" not in exc.message:
-                        raise
-                    progress.log("aria2c failed; retrying browser-compatible downloader")
-                    downloaded = await self._download_http_stream(urls, dest_dir, name, progress, headers=headers)
+        cookies = file_ref.get("cookies") or (file_ref.get("meta") or {}).get("cookies") or ""
+        dec_key = file_ref.get("decryption_key") or (file_ref.get("meta") or {}).get("decryption_key")
+        is_stream = (
+            link_type == "stream"
+            or str(file_ref.get("type") or "").lower() in ("hls", "m3u8", "dash", "stream")
+            or bool(dec_key)
+            or ".m3u8" in url.lower()
+            or ".mpd" in url.lower()
+        )
+
+        try:
+            downloaded = await self._dispatch_download(
+                link_type, is_stream, url, urls, dest_dir, name, progress,
+                headers=headers, cookies=cookies, dec_key=dec_key, file_ref=file_ref,
+            )
+        except ProviderFailure as exc:
+            if exc.code not in ("DOWNLOAD_FAILED",) or "403" not in exc.message:
+                raise
+            progress.log("[WARP] Download blocked (403). Setting up Cloudflare WARP proxy and retrying...")
+            proxy = await self._ensure_warp_proxy()
+            if not proxy:
+                progress.log("[WARP] Could not set up WARP proxy. Skipping retry.")
+                raise
+            progress.log(f"[WARP] WARP proxy active at {proxy}. Retrying download...")
+            downloaded = await self._dispatch_download(
+                link_type, is_stream, url, urls, dest_dir, name, progress,
+                headers=headers, cookies=cookies, dec_key=dec_key, file_ref=file_ref, proxy=proxy,
+            )
 
         if not downloaded:
             raise ProviderFailure("DOWNLOAD_FAILED", "Download completed but no files found on disk")
