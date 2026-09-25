@@ -46,13 +46,24 @@ class LinksProvider(BaseProvider):
         if not shutil.which("N_m3u8DL-RE") and sys.platform.startswith("linux"):
             try:
                 nm_tar = "/tmp/N_m3u8DL-RE.tar.gz"
-                url = "https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.2.1-beta/N_m3u8DL-RE_Beta_linux-x64_20240828.tar.gz"
-                subprocess.check_call(["curl", "-fsSL", url, "-o", nm_tar], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                subprocess.check_call(["tar", "-xzf", nm_tar, "-C", "/tmp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                for extracted in Path("/tmp").glob("**/N_m3u8DL-RE"):
-                    if extracted.is_file():
-                        subprocess.check_call(["install", "-m", "755", str(extracted), "/usr/local/bin/N_m3u8DL-RE"])
-                        break
+                candidate_urls = [
+                    "https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.6.0-beta/N_m3u8DL-RE_v0.6.0-beta_linux-x64_20260629.tar.gz",
+                    "https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.2.1-beta/N_m3u8DL-RE_Beta_linux-x64_20240828.tar.gz",
+                ]
+                for url in candidate_urls:
+                    try:
+                        res = subprocess.run(["curl", "-fsSL", url, "-o", nm_tar], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
+                        if res.returncode == 0 and os.path.exists(nm_tar) and os.path.getsize(nm_tar) > 10000:
+                            break
+                    except Exception:
+                        pass
+
+                if os.path.exists(nm_tar) and os.path.getsize(nm_tar) > 10000:
+                    subprocess.run(["tar", "-xzf", nm_tar, "-C", "/tmp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    for extracted in Path("/tmp").glob("**/N_m3u8DL-RE"):
+                        if extracted.is_file():
+                            subprocess.run(["install", "-m", "755", str(extracted), "/usr/local/bin/N_m3u8DL-RE"])
+                            break
             except Exception:
                 pass
             
@@ -428,17 +439,18 @@ class LinksProvider(BaseProvider):
         proxy: str | None = None,
     ) -> list[Path]:
         if not shutil.which("N_m3u8DL-RE"):
-            progress.log("N_m3u8DL-RE not found, falling back to yt-dlp...")
+            progress.log("N_m3u8DL-RE not found in PATH, falling back to yt-dlp...")
             try:
                 return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
             except TypeError:
                 return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers)
 
+        dest_dir.mkdir(parents=True, exist_ok=True)
         before = set(dest_dir.iterdir()) if dest_dir.exists() else set()
         clean_name = (name or safe_name(unquote(Path(urlparse(url).path).name) or "stream")).replace(".mp4", "").replace(".ts", "")
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        tmp_dir = dest_dir / f".tmp-{uuid.uuid4().hex[:8]}"
-        progress.current_file = clean_name
+        tmp_dir = dest_dir / f".tmp_nm3u8dl_{uuid.uuid4().hex[:8]}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        progress.current_file = f"{clean_name}.mp4"
 
         parsed_url = urlparse(url)
         default_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -463,9 +475,9 @@ class LinksProvider(BaseProvider):
             "--save-name", clean_name,
             "--save-dir", str(dest_dir),
             "--tmp-dir", str(tmp_dir),
-            "--thread-count", "32",
-            "--download-retry-count", "5",
-            "--http-request-timeout", "15",
+            "--thread-count", "16",
+            "--download-retry-count", "8",
+            "--http-request-timeout", "20",
             "--check-segments-count", "false",
             "--del-after-done",
             "--no-ansi-color",
@@ -476,9 +488,10 @@ class LinksProvider(BaseProvider):
         if shutil.which("ffmpeg"):
             cmd.extend(["-M", "format=mp4:muxer=ffmpeg"])
 
+        skip_hdrs = ("host", "content-length", "accept-encoding", "connection", "range", "transfer-encoding")
         for k, v in req_headers.items():
             low = str(k).lower()
-            if v and low not in ("host", "content-length", "accept-encoding", "connection", "range", "transfer-encoding"):
+            if v and low not in skip_hdrs:
                 cmd.extend(["-H", f"{k}: {v}"])
 
         if cookies and "cookie" not in {str(k).lower() for k in req_headers}:
@@ -513,14 +526,32 @@ class LinksProvider(BaseProvider):
                 self._update_stream_progress(line, progress)
 
         await process.wait()
-        after = set(dest_dir.iterdir()) if dest_dir.exists() else set()
-        new_files = [p for p in (after - before) if p.is_file() and not p.name.startswith(".tmp") and not p.name.endswith(".aria2")]
-        if not new_files:
-            new_files = [p for p in dest_dir.iterdir() if p.is_file() and p.name.startswith(clean_name)]
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        if not new_files or process.returncode != 0:
-            err_detail = f" (exit code {process.returncode}: {' | '.join(last_lines)})" if last_lines else ""
-            progress.log(f"N_m3u8DL-RE produced no output file on disk{err_detail}, falling back to yt-dlp...")
+        after = set(dest_dir.iterdir()) if dest_dir.exists() else set()
+        new_files = [
+            p for p in (after - before) 
+            if p.is_file() 
+            and not p.name.startswith(".tmp") 
+            and not p.name.endswith(".aria2")
+            and not p.name.endswith(".part")
+            and ".part-Frag" not in p.name
+            and not p.name.endswith(".ytdl")
+            and p.stat().st_size > 0
+        ]
+        if not new_files:
+            new_files = [
+                p for p in dest_dir.iterdir() 
+                if p.is_file() 
+                and p.name.startswith(clean_name)
+                and not p.name.startswith(".tmp")
+                and not p.name.endswith(".aria2")
+                and not p.name.endswith(".part")
+                and ".part-Frag" not in p.name
+                and not p.name.endswith(".ytdl")
+                and p.stat().st_size > 0
+            ]
+
             try:
                 return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
             except TypeError:
@@ -538,13 +569,16 @@ class LinksProvider(BaseProvider):
         cookies: str | None = None,
         proxy: str | None = None,
     ) -> list[Path]:
-        before = set(dest_dir.iterdir()) if dest_dir.exists() else set()
-        out_tpl = str(dest_dir / "%(title)s.%(ext)s")
-        if name:
-            out_tpl = str(dest_dir / name)
-            progress.current_file = name
-        else:
-            progress.current_file = Path(urlparse(url).path).name or "stream.mp4"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        # Use a temporary staging directory to isolate downloading fragments
+        stage_dir = dest_dir / f".tmp_ytdlp_{uuid.uuid4().hex[:8]}"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+
+        out_name = name or safe_name(unquote(Path(urlparse(url).path).name) or "stream.mp4")
+        if not out_name.lower().endswith((".mp4", ".mkv", ".webm", ".ts")):
+            out_name += ".mp4"
+        out_tpl = str(stage_dir / "%(title)s.%(ext)s") if not name else str(stage_dir / out_name)
+        progress.current_file = out_name
 
         parsed_url = urlparse(url)
         default_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -559,14 +593,13 @@ class LinksProvider(BaseProvider):
             "--no-warnings",
             "--newline",
             "--progress",
-            "-N", "16",
-            "--concurrent-fragments", "16",
-            "--socket-timeout", "15",
+            "-N", "8",
+            "--concurrent-fragments", "8",
+            "--socket-timeout", "20",
             "--fragment-retries", "10",
             "--retries", "10",
             "--hls-use-mpegts",
-            "-o",
-            out_tpl,
+            "-o", out_tpl,
         ]
 
         if not has_ua:
@@ -574,6 +607,7 @@ class LinksProvider(BaseProvider):
         if not has_ref and default_ref:
             cmd.extend(["--referer", default_ref])
 
+        skip_hdrs = ("host", "content-length", "accept-encoding", "connection", "range", "transfer-encoding")
         if req_headers:
             for k, v in req_headers.items():
                 if not v:
@@ -583,7 +617,7 @@ class LinksProvider(BaseProvider):
                     cmd.extend(["--referer", str(v)])
                 elif k_low == "user-agent":
                     cmd.extend(["--user-agent", str(v)])
-                elif k_low not in ("host", "content-length", "accept-encoding", "connection", "range", "transfer-encoding"):
+                elif k_low not in skip_hdrs:
                     cmd.extend(["--add-header", f"{k}: {v}"])
 
         if cookies and "cookie" not in {str(k).lower() for k in req_headers}:
@@ -595,29 +629,51 @@ class LinksProvider(BaseProvider):
         cmd.append(url)
         progress.log(f"Starting yt-dlp multi-fragment download for: {url}")
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
 
-        if process.stdout:
-            while True:
-                line_bytes = await process.stdout.readline()
-                if not line_bytes:
-                    break
-                line = line_bytes.decode('utf-8', errors='ignore').strip()
-                progress.check_cancelled()
-                self._update_stream_progress(line, progress)
+            if process.stdout:
+                while True:
+                    line_bytes = await process.stdout.readline()
+                    if not line_bytes:
+                        break
+                    line = line_bytes.decode('utf-8', errors='ignore').strip()
+                    progress.check_cancelled()
+                    self._update_stream_progress(line, progress)
 
-        await process.wait()
-        if process.returncode != 0:
-            stderr_out = await process.stderr.read() if process.stderr else b""
-            raise ProviderFailure("DOWNLOAD_FAILED", f"yt-dlp failed: {stderr_out.decode('utf-8', errors='ignore')}")
+            await process.wait()
+            if process.returncode != 0:
+                stderr_out = await process.stderr.read() if process.stderr else b""
+                err_msg = stderr_out.decode('utf-8', errors='ignore').strip()
+                raise ProviderFailure("DOWNLOAD_FAILED", f"yt-dlp failed (exit code {process.returncode}): {err_msg[:300]}")
 
-        after = set(dest_dir.iterdir()) if dest_dir.exists() else set()
-        new_files = [p for p in (after - before) if p.is_file()]
-        return new_files or [p for p in dest_dir.iterdir() if p.is_file()]
+            # Find finished valid video files in stage_dir (exclude fragments)
+            completed_files = [
+                p for p in stage_dir.iterdir()
+                if p.is_file()
+                and not p.name.endswith(".part")
+                and ".part-Frag" not in p.name
+                and not p.name.endswith(".ytdl")
+                and not p.name.endswith(".aria2")
+                and p.stat().st_size > 0
+            ]
+
+            if not completed_files:
+                raise ProviderFailure("DOWNLOAD_FAILED", "yt-dlp finished but no valid merged video file was produced (only incomplete fragments)")
+
+            final_files = []
+            for src_file in completed_files:
+                target_file = dest_dir / (out_name if len(completed_files) == 1 and name else src_file.name)
+                shutil.move(str(src_file), str(target_file))
+                final_files.append(target_file)
+
+            return final_files
+        finally:
+            shutil.rmtree(stage_dir, ignore_errors=True)
 
     async def _download_gdrive(self, url: str, dest_dir: Path, name: str | None, progress: JobState) -> list[Path]:
         progress.log(f"Starting gdown download for: {url}")

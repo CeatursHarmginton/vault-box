@@ -123,7 +123,17 @@ async def run_transfer(job: JobState) -> None:
         if str(source.get("provider") or "").lower() == "links":
             for item in file_items:
                 downloaded.extend(await download_one(item))
-            downloaded = [p for p in sorted(dirs["input"].rglob("*")) if p.is_file() and not p.name.endswith(".aria2")]
+            downloaded = [
+                p for p in sorted(dirs["input"].rglob("*")) 
+                if p.is_file() 
+                and not p.name.endswith(".aria2")
+                and not p.name.endswith(".ytdl")
+                and not p.name.endswith(".part")
+                and ".part-Frag" not in p.name
+                and not p.name.startswith(".tmp")
+                and not p.name.startswith(".")
+                and p.stat().st_size > 0
+            ]
         else:
             for batch in await asyncio.gather(*(download_one(item) for item in file_items)):
                 downloaded.extend(batch)
