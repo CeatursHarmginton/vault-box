@@ -13,7 +13,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 TOR_PROXY = "socks5://127.0.0.1:9050"
 PROXY_SETUP_LOCK: asyncio.Lock | None = None
@@ -225,8 +225,8 @@ class LinksProvider(BaseProvider):
         progress.updated_at = time.time()
 
     def _http_headers(self, headers: dict[str, str] | None, *, range_header: str | None = None, cookies: str | None = None) -> dict[str, str]:
-        out = {str(k): str(v) for k, v in (headers or {}).items() if v and str(k).lower() not in ("host", "content-length")}
-        out.setdefault("Accept-Encoding", "identity")
+        out = {str(k): str(v) for k, v in (headers or {}).items() if v and str(k).lower() not in ("host", "content-length", "accept-encoding", "connection", "transfer-encoding")}
+        out["Accept-Encoding"] = "identity"
         out.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
         if cookies and "cookie" not in {k.lower() for k in out}:
             out["Cookie"] = cookies
@@ -308,7 +308,7 @@ class LinksProvider(BaseProvider):
             raise last
         raise ProviderFailure("DOWNLOAD_FAILED", "No URL provided")
 
-    async def _download_aria2(self, url: str | list[str], dest_dir: Path, name: str | None, progress: JobState, headers: dict[str, str] | None = None, proxy: str | None = None) -> list[Path]:
+    async def _download_aria2(self, url: str | list[str], dest_dir: Path, name: str | None, progress: JobState, headers: dict[str, str] | None = None, proxy: str | None = None, cookies: str | None = None) -> list[Path]:
         urls = [str(item) for item in (url if isinstance(url, list) else [url]) if str(item or "")]
         uri_file: Path | None = None
         cmd = [
@@ -327,13 +327,20 @@ class LinksProvider(BaseProvider):
         ]
         if proxy:
             cmd.append(f"--all-proxy={proxy}")
-        if headers:
-            for k, v in headers.items():
-                if v and str(k).lower() not in ("host", "content-length"):
+
+        all_headers = dict(headers or {})
+        if cookies and "cookie" not in {str(k).lower() for k in all_headers}:
+            all_headers["Cookie"] = cookies
+
+        skip_hdrs = ("host", "content-length", "accept-encoding", "connection", "transfer-encoding", "range")
+        if all_headers:
+            for k, v in all_headers.items():
+                low = str(k).lower()
+                if v and low not in skip_hdrs:
                     cmd.append(f"--header={k}: {v}")
         if len(urls) > 1:
             uri_file = dest_dir / f".vaultbox-aria2-{uuid.uuid4().hex}.txt"
-            header_lines = "".join([f"\n  header={k}: {v}" for k, v in (headers or {}).items() if v and str(k).lower() not in ("host", "content-length")])
+            header_lines = "".join([f"\n  header={k}: {v}" for k, v in all_headers.items() if v and str(k).lower() not in skip_hdrs])
             uri_file.write_text("\t".join(urls) + ("\n  out=" + name if name else "") + header_lines + "\n", encoding="utf-8")
             cmd.append(f"--input-file={uri_file}")
         elif name:
@@ -450,7 +457,8 @@ class LinksProvider(BaseProvider):
 
         if headers:
             for k, v in headers.items():
-                if v and str(k).lower() not in ("host", "content-length"):
+                low = str(k).lower()
+                if v and low not in ("host", "content-length", "accept-encoding", "connection", "range", "transfer-encoding"):
                     cmd.extend(["-H", f"{k}: {v}"])
 
         if cookies:
@@ -482,16 +490,19 @@ class LinksProvider(BaseProvider):
                 self._update_stream_progress(line, progress)
 
         await process.wait()
-        if process.returncode != 0:
-            progress.log("N_m3u8DL-RE finished with non-zero or failed, trying yt-dlp fallback...")
+        after = set(dest_dir.iterdir()) if dest_dir.exists() else set()
+        new_files = [p for p in (after - before) if p.is_file() and not p.name.startswith(".tmp") and not p.name.endswith(".aria2")]
+        if not new_files:
+            new_files = [p for p in dest_dir.iterdir() if p.is_file() and p.name.startswith(clean_name)]
+
+        if not new_files or process.returncode != 0:
+            progress.log("N_m3u8DL-RE produced no output file on disk, falling back to yt-dlp...")
             try:
                 return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
             except TypeError:
                 return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers)
 
-        after = set(dest_dir.iterdir()) if dest_dir.exists() else set()
-        new_files = [p for p in (after - before) if p.is_file() and not p.name.startswith(".tmp")]
-        return new_files or [p for p in dest_dir.iterdir() if p.is_file() and p.name.startswith(clean_name)]
+        return new_files
 
     async def _download_ytdlp(
         self,
@@ -531,7 +542,7 @@ class LinksProvider(BaseProvider):
                     cmd.extend(["--referer", str(v)])
                 elif k_low == "user-agent":
                     cmd.extend(["--user-agent", str(v)])
-                elif k_low not in ("host", "content-length"):
+                elif k_low not in ("host", "content-length", "accept-encoding", "connection", "range", "transfer-encoding"):
                     cmd.extend(["--add-header", f"{k}: {v}"])
 
         if cookies and "cookie" not in {str(k).lower() for k in (headers or {})}:
@@ -796,9 +807,24 @@ class LinksProvider(BaseProvider):
         return wurl, out_name, dl_headers
 
     async def _download_mxdrop(self, url: str, dest_dir: Path, name: str | None, progress: JobState, file_ref: dict[str, Any], proxy: str | None = None) -> list[Path]:
-        resolved_url, resolved_name, dl_headers = await self._resolve_mxdrop(url, file_ref, progress, proxy=proxy)
-        final_name = name or resolved_name
-        return await self._download_http_stream(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=proxy)
+        resolved_url = None
+        dl_headers = {}
+        final_name = name
+        try:
+            resolved_url, resolved_name, dl_headers = await self._resolve_mxdrop(url, file_ref, progress, proxy=proxy)
+            if not final_name:
+                final_name = resolved_name
+        except Exception as exc:
+            progress.log(f"Notice: Could not resolve embed token on Colab ({exc}), trying direct URL...")
+            resolved_url = url
+            dl_headers = file_ref.get("headers") or (file_ref.get("meta") or {}).get("headers") or {}
+
+        progress.log(f"Downloading MixDrop stream via aria2c (16 connections)...")
+        try:
+            return await self._download_aria2(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=proxy)
+        except Exception as exc:
+            progress.log(f"aria2c failed ({exc}); falling back to HTTP stream downloader")
+            return await self._download_http_stream(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=proxy)
 
     async def _dispatch_download(
         self, link_type: str, is_stream: bool, url: str, urls: list[str],
@@ -829,18 +855,12 @@ class LinksProvider(BaseProvider):
         elif link_type == "gdrive":
             return await self._download_gdrive(url, dest_dir, name, progress)
         else:
-            if self._needs_browser_stream(headers or {}, file_ref):
+            progress.log("Downloading via aria2c (16 connections)...")
+            try:
+                return await self._download_aria2(urls, dest_dir, name, progress, headers=headers, proxy=proxy, cookies=cookies)
+            except Exception as exc:
+                progress.log(f"aria2c failed ({exc}); falling back to browser-compatible HTTP stream downloader...")
                 return await self._download_http_stream(urls, dest_dir, name, progress, headers=headers, proxy=proxy, cookies=cookies)
-            else:
-                try:
-                    return await self._download_aria2(urls, dest_dir, name, progress, headers=headers, proxy=proxy)
-                except TypeError:
-                    return await self._download_aria2(urls, dest_dir, name, progress)
-                except ProviderFailure as exc:
-                    if "code 22" not in exc.message:
-                        raise
-                    progress.log("aria2c failed; retrying browser-compatible downloader")
-                    return await self._download_http_stream(urls, dest_dir, name, progress, headers=headers, proxy=proxy, cookies=cookies)
 
     async def validate_credentials(self, credentials: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True}
@@ -886,15 +906,35 @@ class LinksProvider(BaseProvider):
             or ".mpd" in url.lower()
         )
 
+        # Check token expiration timestamp in stream/direct URL
+        try:
+            parsed_url = urlparse(url)
+            parsed_query = parse_qs(parsed_url.query)
+            exp_val = (
+                parsed_query.get("expires", [None])[0]
+                or parsed_query.get("e", [None])[0]
+                or parsed_query.get("exp", [None])[0]
+                or parsed_query.get("expire", [None])[0]
+            )
+            if exp_val and str(exp_val).isdigit():
+                exp_ts = int(exp_val)
+                now_ts = int(time.time())
+                if exp_ts < now_ts:
+                    diff_m = max(1, (now_ts - exp_ts) // 60)
+                    progress.log(f"[WARNING] Link token expired {diff_m} minutes ago! If download fails with 403, please refresh the webpage and copy a fresh link.")
+        except Exception:
+            pass
+
         try:
             downloaded = await self._dispatch_download(
                 link_type, is_stream, url, urls, dest_dir, name, progress,
                 headers=headers, cookies=cookies, dec_key=dec_key, file_ref=file_ref,
             )
         except ProviderFailure as exc:
-            if exc.code not in ("DOWNLOAD_FAILED",) or "403" not in exc.message:
+            msg = str(exc.message).lower()
+            if exc.code not in ("DOWNLOAD_FAILED",) or ("403" not in msg and "forbidden" not in msg and "429" not in msg):
                 raise
-            progress.log("[Proxy] Download blocked (403). Activating TCP SOCKS5 proxy and retrying...")
+            progress.log(f"[Proxy] Download blocked ({exc.message}). Activating TCP SOCKS5 proxy and retrying...")
             proxy = await self._ensure_tor_proxy(progress)
             if not proxy:
                 progress.log("[Proxy] Proxy unavailable. Skipping retry.")
