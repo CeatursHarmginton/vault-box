@@ -196,14 +196,33 @@ class LinksProvider(BaseProvider):
             return done_bytes, total_bytes
         return None
 
-    def _parse_ytdlp_progress(self, line: str) -> float | None:
-        match = re.search(r'([0-9.]+)%', line)
-        if match:
-            try:
-                return float(match.group(1))
-            except ValueError:
-                pass
-        return None
+    def _update_stream_progress(self, line: str, progress: JobState, default_size: int = 0) -> None:
+        """Parse real speed, percentage, and size from N_m3u8DL-RE / yt-dlp stdout."""
+        m_pct = re.search(r'([0-9.]+)%', line)
+        m_spd = re.search(r'([0-9.]+)\s*([KMGT]?i?B)/s', line, re.IGNORECASE)
+        m_sz = re.search(r'of\s*~?\s*([0-9.]+)\s*([KMGT]?i?B)', line, re.IGNORECASE)
+
+        if m_sz:
+            val = float(m_sz.group(1))
+            unit = m_sz.group(2).upper().replace('I', '')
+            mult = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}.get(unit, 1024**2)
+            progress.bytes_total = int(val * mult)
+        elif not progress.bytes_total and default_size:
+            progress.bytes_total = default_size
+
+        if m_pct:
+            pct = float(m_pct.group(1))
+            progress.progress.download = min(100.0, pct)
+            if progress.bytes_total:
+                progress.bytes_done = int(progress.bytes_total * (pct / 100.0))
+
+        if m_spd:
+            val = float(m_spd.group(1))
+            unit = m_spd.group(2).upper().replace('I', '')
+            mult = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}.get(unit, 1024**2)
+            progress.speed = val * mult
+
+        progress.updated_at = time.time()
 
     def _http_headers(self, headers: dict[str, str] | None, *, range_header: str | None = None, cookies: str | None = None) -> dict[str, str]:
         out = {str(k): str(v) for k, v in (headers or {}).items() if v and str(k).lower() not in ("host", "content-length")}
@@ -419,8 +438,10 @@ class LinksProvider(BaseProvider):
             "--save-name", clean_name,
             "--save-dir", str(dest_dir),
             "--tmp-dir", str(tmp_dir),
-            "--thread-count", "16",
+            "--thread-count", "32",
             "--download-retry-count", "5",
+            "--http-request-timeout", "15",
+            "--no-ansi-color",
             "--auto-select",
             "--binary-merge",
         ]
@@ -451,7 +472,6 @@ class LinksProvider(BaseProvider):
             stderr=asyncio.subprocess.STDOUT,
         )
 
-        last_pct = 0.0
         if process.stdout:
             while True:
                 line_bytes = await process.stdout.readline()
@@ -459,17 +479,13 @@ class LinksProvider(BaseProvider):
                     break
                 line = line_bytes.decode("utf-8", errors="ignore").strip()
                 progress.check_cancelled()
-                pct = self._parse_ytdlp_progress(line)
-                if pct is not None and pct > last_pct:
-                    diff = pct - last_pct
-                    progress.add_bytes(int(diff * 1024), int(100 * 1024))
-                    last_pct = pct
+                self._update_stream_progress(line, progress)
 
         await process.wait()
         if process.returncode != 0:
             progress.log("N_m3u8DL-RE finished with non-zero or failed, trying yt-dlp fallback...")
             try:
-                return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies)
+                return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers, cookies=cookies, proxy=proxy)
             except TypeError:
                 return await self._download_ytdlp(url, dest_dir, name, progress, headers=headers)
 
@@ -497,7 +513,11 @@ class LinksProvider(BaseProvider):
             "--no-warnings",
             "--newline",
             "--progress",
-            "-N", "8",
+            "-N", "16",
+            "--concurrent-fragments", "16",
+            "--socket-timeout", "15",
+            "--fragment-retries", "5",
+            "--retries", "5",
             "-o",
             out_tpl,
         ]
@@ -529,7 +549,6 @@ class LinksProvider(BaseProvider):
             stderr=asyncio.subprocess.PIPE
         )
 
-        last_pct = 0.0
         if process.stdout:
             while True:
                 line_bytes = await process.stdout.readline()
@@ -537,12 +556,7 @@ class LinksProvider(BaseProvider):
                     break
                 line = line_bytes.decode('utf-8', errors='ignore').strip()
                 progress.check_cancelled()
-                pct = self._parse_ytdlp_progress(line)
-                if pct is not None and pct > last_pct:
-                    # Approximate byte progress: report percentage increments as bytes (100 total)
-                    diff = pct - last_pct
-                    progress.add_bytes(int(diff * 1024), int(100 * 1024))
-                    last_pct = pct
+                self._update_stream_progress(line, progress)
 
         await process.wait()
         if process.returncode != 0:
