@@ -402,20 +402,27 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         job.log("No image files found for optimization.")
 
 async def _run_plain_file_batches(job: JobState, dirs: dict[str, Path], source: dict[str, Any], target: dict[str, Any], options: dict[str, Any], src: Any, dst: Any, file_items: list[dict[str, Any]]) -> None:
+    job.files_to_download = len(file_items)
     groups = _download_batches(file_items, dirs["input"], options, job)
     sem = asyncio.Semaphore(max(1, FOLDER_DOWNLOAD_CONCURRENCY))
 
     async def download_one(item: dict[str, Any], batch_input: Path) -> list[Path]:
         async with sem:
             job.check_cancelled()
+            item_name = _item_name(item)
+            item_k = _queue_item_key(source, item)
+            job.start_item(item_k, name=item_name)
+            job.set(current_file=item_name, status="running", step="downloading")
             item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
             item_src = PROVIDERS.get(item_prov, src)
             item_creds = item.get("credentials") or source.get("credentials") or {}
             try:
                 path = await download_with_retry(
                     lambda: item_src.download_file(item_creds, item, batch_input, job),
-                    progress=job, label=_item_name(item),
+                    progress=job, label=item_name,
                 )
+                job.files_downloaded += 1
+                job.log(f"[{job.files_downloaded}/{job.files_to_download or len(file_items)}] Downloaded: {item_name}")
                 _remember_source_ref(job, path, item)
                 return [path]
             except ProviderFailure as exc:
