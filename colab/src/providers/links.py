@@ -1355,8 +1355,6 @@ class LinksProvider(BaseProvider):
         result = downloaded[0]
         if expected_size and result.stat().st_size < expected_size:
             raise ProviderFailure("DOWNLOAD_INCOMPLETE", f"Downloaded {result.stat().st_size} bytes, expected {expected_size}")
-        progress.files_downloaded += 1
-        progress.log(f"[{progress.files_downloaded}/{progress.files_to_download}] Downloaded: {result.name}")
         return result
 
     async def upload_file(self, credentials: dict[str, Any], local_path: Path, target_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:

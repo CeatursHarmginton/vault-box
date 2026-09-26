@@ -3914,4 +3914,28 @@ class ActiveFilesTrackingTests(TestCase):
         self.assertIn("links::clip.mp4", job.downloaded_files)
         self.assertEqual(job.file_sizes["links::clip.mp4"], 5120)
 
+    def test_links_provider_does_not_double_count_files_downloaded(self):
+        from src.providers.links import LinksProvider
+        provider = LinksProvider()
+        job = JobState("test-no-double", {"options": {}})
+        self.assertEqual(job.files_downloaded, 0)
+
+        # Mock dependencies
+        async def fake_ensure_deps():
+            return None
+        async def fake_aria2(*args, **kwargs):
+            import tempfile
+            p = Path(tempfile.gettempdir()) / "test_fake.mp4"
+            p.write_bytes(b"data123")
+            return [p]
+
+        provider._ensure_deps = fake_ensure_deps
+        provider._download_aria2 = fake_aria2
+
+        out = asyncio.run(provider.download_file({}, {"id": "https://example.com/test_fake.mp4", "name": "test_fake.mp4"}, Path("."), job))
+        self.assertEqual(out.name, "test_fake.mp4")
+        # LinksProvider itself must NOT increment files_downloaded (transfer_job owns the counter)
+        self.assertEqual(job.files_downloaded, 0)
+
+
 

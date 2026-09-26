@@ -561,6 +561,8 @@ async def _download_batch_item(job: JobState, source: dict[str, Any], src: Any, 
         job.finish_file(item_name, phase="download", size=actual_size, key=item_k)
         if item_k != item_name:
             job.file_sizes[item_k] = actual_size
+        job.files_downloaded += 1
+        job.log(f"[{job.files_downloaded}/{job.files_to_download}] Downloaded: {item_name}")
         _remember_source_ref(job, path, item)
         return [path]
     except Exception:

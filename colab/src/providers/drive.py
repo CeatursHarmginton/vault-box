@@ -189,9 +189,7 @@ class DriveProvider(BaseProvider):
             dest.parent.mkdir(parents=True, exist_ok=True)
             progress.set(step="downloading", current_file=dest.name)
             await asyncio.to_thread(shutil.copy2, src, dest)
-            progress.files_downloaded += 1
             progress.add_bytes(src.stat().st_size, src.stat().st_size, "download", str(dest))
-            progress.log(f"[{progress.files_downloaded}/{progress.files_to_download}] Downloaded: {dest.name}")
             return dest
         if self._use_mount(credentials) and not (credentials.get("access_token") or credentials.get("token") or credentials.get("web_access_token")):
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Drive source must be a MyDrive path after mounting")

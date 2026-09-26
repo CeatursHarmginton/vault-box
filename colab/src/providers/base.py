@@ -194,6 +194,14 @@ class BaseProvider(ABC):
                     )
                     actual_sz = path.stat().st_size if (path and path.exists()) else file_sz
                     progress.finish_file(dest.name, phase="download", size=actual_sz)
+                    progress.files_downloaded += 1
+                    ctx = _DOWNLOAD_LOG_CONTEXT.get()
+                    if ctx:
+                        async with ctx["lock"]:
+                            ctx["done"] += 1
+                            progress.log(f"[{ctx['done']}/{ctx['total']}] Downloaded: {dest.name}")
+                    else:
+                        progress.log(f"[{progress.files_downloaded}/{progress.files_to_download}] Downloaded: {dest.name}")
                     _remember_source_ref(progress, path, item)
                     return [path]
                 except ProviderFailure as exc:
@@ -364,14 +372,6 @@ async def stream_download(
         if fresh.get("headers"):
             headers = dict(fresh["headers"])
     part.replace(dest)
-    progress.files_downloaded += 1
-    ctx = _DOWNLOAD_LOG_CONTEXT.get()
-    if ctx:
-        async with ctx["lock"]:
-            ctx["done"] += 1
-            progress.log(f"[{ctx['done']}/{ctx['total']}] Downloaded: {dest.name}")
-    else:
-        progress.log(f"[{progress.files_downloaded}/{progress.files_to_download}] Downloaded: {dest.name}")
     return dest
 
 def _download_error_payload(path: Path, content_type: str, strict: bool) -> dict[str, Any] | None:
