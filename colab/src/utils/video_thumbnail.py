@@ -236,6 +236,137 @@ def embed_thumbnail(video_path: Path, thumb_path: Path, progress: JobState | Non
                 pass
 
 
+def prepend_cover_frame(
+    video_path: Path,
+    thumb_path: Path,
+    duration_sec: float = 0.5,
+    progress: JobState | None = None,
+) -> bool:
+    """
+    Prepend a short (0.5s) video clip of the thumbnail image to the beginning of the video
+    using ffmpeg concat demuxer without re-encoding the main video.
+    Forces Google Drive's transcoder to pick the thumbnail image as the video thumbnail.
+    """
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        return False
+
+    suffix = video_path.suffix.lower()
+    if suffix not in (".mp4", ".m4v", ".mov", ".mkv"):
+        return False
+
+    temp_dir = video_path.parent
+    temp_out = temp_dir / f".prep_mux_{os.getpid()}_{video_path.name}"
+
+    try:
+        # Probe video and audio stream parameters
+        cmd_probe = [
+            "ffprobe", "-v", "error",
+            "-show_streams",
+            "-of", "json",
+            str(video_path),
+        ]
+        res = subprocess.run(cmd_probe, capture_output=True, text=True, timeout=30)
+        if res.returncode != 0:
+            return False
+        probe = json.loads(res.stdout)
+        streams = probe.get("streams") or []
+        v_stream = next((s for s in streams if s.get("codec_type") == "video" and s.get("disposition", {}).get("attached_pic", 0) == 0), None)
+        if not v_stream:
+            return False
+        a_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+
+        w = v_stream.get("width")
+        h = v_stream.get("height")
+        if not w or not h:
+            return False
+
+        # Match dimensions to even numbers (libx264 requirement)
+        w = int(w)
+        h = int(h)
+        if w % 2 != 0:
+            w -= 1
+        if h % 2 != 0:
+            h -= 1
+
+        pix_fmt = v_stream.get("pix_fmt") or "yuv420p"
+        if pix_fmt not in ("yuv420p", "yuvj420p"):
+            pix_fmt = "yuv420p"
+
+        fps = v_stream.get("r_frame_rate") or "30/1"
+        codec_name = (v_stream.get("codec_name") or "h264").lower()
+        encoder = "libx265" if "hevc" in codec_name or "h265" in codec_name else "libx264"
+
+        with tempfile.TemporaryDirectory(prefix="vb_prep_") as td_str:
+            td = Path(td_str)
+            intro_clip = td / f"intro{suffix}"
+            dur_str = f"{duration_sec:.2f}"
+
+            cmd_intro = [
+                "ffmpeg", "-y",
+                "-loop", "1", "-t", dur_str, "-i", str(thumb_path),
+            ]
+            if a_stream:
+                sr = str(a_stream.get("sample_rate") or "44100")
+                ch = int(a_stream.get("channels") or 2)
+                cl = "mono" if ch == 1 else "stereo"
+                cmd_intro.extend([
+                    "-f", "lavfi", "-t", dur_str, "-i", f"anullsrc=r={sr}:cl={cl}",
+                ])
+
+            cmd_intro.extend([
+                "-c:v", encoder,
+                "-preset", "ultrafast",
+                "-pix_fmt", pix_fmt,
+                "-r", str(fps),
+                "-s", f"{w}x{h}",
+            ])
+
+            if a_stream:
+                cmd_intro.extend(["-c:a", "aac", "-b:a", "128k"])
+            else:
+                cmd_intro.append("-an")
+
+            cmd_intro.extend(["-movflags", "+faststart", str(intro_clip)])
+            res_intro = subprocess.run(cmd_intro, capture_output=True, timeout=30)
+            if res_intro.returncode != 0 or not intro_clip.exists() or intro_clip.stat().st_size == 0:
+                if progress:
+                    err_msg = (res_intro.stderr.decode("utf-8", errors="ignore") if res_intro.stderr else "")[-200:]
+                    progress.log(f"[Thumbnail] Intro clip encode warning: {err_msg.strip()}")
+                return False
+
+            list_txt = td / "list.txt"
+            with open(list_txt, "w", encoding="utf-8") as f:
+                f.write(f"file '{intro_clip.as_posix()}'\n")
+                f.write(f"file '{video_path.as_posix()}'\n")
+
+            cmd_concat = [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0", "-i", str(list_txt),
+                "-c", "copy",
+                "-movflags", "+faststart",
+                str(temp_out),
+            ]
+            res_concat = subprocess.run(cmd_concat, capture_output=True, timeout=180)
+            if res_concat.returncode == 0 and temp_out.exists() and temp_out.stat().st_size > 0:
+                os.replace(str(temp_out), str(video_path))
+                return True
+            else:
+                if progress:
+                    err_msg = (res_concat.stderr.decode("utf-8", errors="ignore") if res_concat.stderr else "")[-200:]
+                    progress.log(f"[Thumbnail] Concat warning: {err_msg.strip()}")
+                return False
+    except Exception as exc:
+        if progress:
+            progress.log(f"[Thumbnail] Prepend cover warning: {exc}")
+        return False
+    finally:
+        if temp_out.exists():
+            try:
+                temp_out.unlink()
+            except Exception:
+                pass
+
+
 def process_video_thumbnails(
     files: list[Path],
     options: dict[str, Any],
@@ -246,6 +377,7 @@ def process_video_thumbnails(
     For each video, extracts a representative deep frame at configured percentage (default 20%),
     embeds it into the container as attached_pic (for MP4/MKV/MOV/M4V), and caches thumbnail
     bytes for cloud upload metadata (e.g. Google Drive contentHints).
+    Optionally prepends 0.5s of the frame to the video stream to force Google Drive's web preview.
     Runs fast with zero re-encoding (-c copy).
     """
     if not options.get("set_video_thumbnail", True):
@@ -292,13 +424,24 @@ def process_video_thumbnails(
                 thumb_bytes = thumb_file.read_bytes()
                 set_cached_thumbnail(video_path, thumb_bytes)
 
+                prepended = False
+                if options.get("prepend_thumbnail_frame", False):
+                    prepended = prepend_cover_frame(video_path, thumb_file, duration_sec=0.5, progress=progress)
+
                 # Embed thumbnail into video container (MP4, M4V, MOV, MKV)
                 success = embed_thumbnail(video_path, thumb_file, progress)
                 if progress:
                     mins = int(used_ts // 60)
                     secs = int(used_ts % 60)
                     pct_val = (used_ts / duration) * 100.0
-                    action_desc = "embedded cover" if success else "cached for Drive"
+                    actions = []
+                    if prepended:
+                        actions.append("0.5s prepended for Drive")
+                    if success:
+                        actions.append("embedded cover")
+                    else:
+                        actions.append("cached for Drive")
+                    action_desc = ", ".join(actions)
                     progress.log(f"[Thumbnail] Set deep frame ({pct_val:.0f}%, {mins:02d}:{secs:02d} / {used_ts:.1f}s, {action_desc}) for {video_path.name}")
             except Exception as exc:
                 if progress:
