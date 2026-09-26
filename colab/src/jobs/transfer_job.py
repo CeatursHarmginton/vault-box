@@ -283,9 +283,12 @@ async def run_transfer(job: JobState) -> None:
         _mark_remaining_items_failed(job, source, f"{exc.code}: {exc.message}")
         job.set(status="failed", step="failed")
     except Exception as exc:
-        job.error = {"code": "TRANSFER_FAILED", "message": str(exc), "details": {"type": exc.__class__.__name__}}
-        job.log(f"Failed: {exc}")
-        _mark_remaining_items_failed(job, source, str(exc))
+        err_msg = str(exc).strip()
+        if isinstance(exc, (KeyError, IndexError, AttributeError, TypeError, ValueError)):
+            err_msg = f"{exc.__class__.__name__}: {err_msg}" if err_msg else exc.__class__.__name__
+        job.error = {"code": "TRANSFER_FAILED", "message": err_msg or "Unexpected transfer error", "details": {"type": exc.__class__.__name__}}
+        job.log(f"Failed: {err_msg or exc.__class__.__name__}")
+        _mark_remaining_items_failed(job, source, err_msg or exc.__class__.__name__)
         job.set(status="failed", step="failed")
     finally:
         # Nested finally: an await here can be interrupted by cancellation, and the credential

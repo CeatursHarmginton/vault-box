@@ -3953,7 +3953,13 @@ def test_doodstream_classification_and_14b_error_rejection(tmp_path):
     err_file.write_bytes(b"File not found")
     err_info = _download_error_payload(err_file, "text/plain", False)
     assert err_info is not None
+    assert err_info["code"] == "DOWNLOAD_FAILED"
     assert "File not found" in err_info["message"]
+
+    # Verify ProviderFailure accepts extra kwargs gracefully
+    pf = ProviderFailure(err_info["code"], err_info["message"], status=403, details=err_info)
+    assert pf.code == "DOWNLOAD_FAILED"
+    assert pf.details.get("status") == 403
 
     try:
         provider._validate_downloaded_files([err_file])

@@ -660,7 +660,9 @@ class LinksProvider(BaseProvider):
                             progress.add_bytes(len(chunk), total, "download", dest.name)
                     if error := _download_error_payload(part_path, content_type, False):
                         part_path.unlink(missing_ok=True)
-                        raise ProviderFailure(error["code"], error["message"], **(error.get("details") or {}))
+                        err_code = str(error.get("code") or error.get("errno") or "DOWNLOAD_FAILED")
+                        err_msg = str(error.get("message") or "Download returned error payload instead of file")
+                        raise ProviderFailure(err_code, err_msg, details=error)
                     part_path.replace(dest)
                     return dest
 
@@ -679,14 +681,18 @@ class LinksProvider(BaseProvider):
                 part_path.write_bytes(first_bytes)
                 if error := _download_error_payload(part_path, content_type, False):
                     part_path.unlink(missing_ok=True)
-                    raise ProviderFailure(error["code"], error["message"], **(error.get("details") or {}))
+                    err_code = str(error.get("code") or error.get("errno") or "DOWNLOAD_FAILED")
+                    err_msg = str(error.get("message") or "Download returned error payload instead of file")
+                    raise ProviderFailure(err_code, err_msg, details=error)
 
             first_len = len(first_bytes)
             if total_size <= first_len:
                 part_path.write_bytes(first_bytes)
                 if error := _download_error_payload(part_path, content_type, False):
                     part_path.unlink(missing_ok=True)
-                    raise ProviderFailure(error["code"], error["message"], **(error.get("details") or {}))
+                    err_code = str(error.get("code") or error.get("errno") or "DOWNLOAD_FAILED")
+                    err_msg = str(error.get("message") or "Download returned error payload instead of file")
+                    raise ProviderFailure(err_code, err_msg, details=error)
                 progress.add_bytes(first_len, total_size or first_len, "download", dest.name)
                 part_path.replace(dest)
                 return dest
@@ -771,7 +777,9 @@ class LinksProvider(BaseProvider):
 
         if error := _download_error_payload(part_path, content_type, False):
             part_path.unlink(missing_ok=True)
-            raise ProviderFailure(error["code"], error["message"], **(error.get("details") or {}))
+            err_code = str(error.get("code") or error.get("errno") or "DOWNLOAD_FAILED")
+            err_msg = str(error.get("message") or "Download returned error payload instead of file")
+            raise ProviderFailure(err_code, err_msg, details=error)
         part_path.replace(dest)
         return dest
 
@@ -1745,13 +1753,30 @@ class LinksProvider(BaseProvider):
                 dl_headers["Referer"] = "https://playmogo.com/"
 
         progress.log("Downloading DoodStream media...")
+
+        async def _attempt_dood_download(
+            target_url: str,
+            target_name: str | None,
+            headers_to_use: dict[str, str],
+            proxy_to_use: str | None,
+        ) -> list[Path]:
+            try:
+                if proxy_to_use:
+                    dl = await self._download_aria2(target_url, dest_dir, target_name, progress, headers=headers_to_use, proxy=proxy_to_use)
+                else:
+                    dl = await self._download_aria2(target_url, dest_dir, target_name, progress, headers=headers_to_use)
+                self._validate_downloaded_files(dl)
+                return dl
+            except Exception as dl_exc:
+                if self._is_ip_bound_token_error(str(dl_exc)):
+                    raise
+                progress.log(f"aria2c failed ({dl_exc}); falling back to HTTP stream downloader...")
+                dl = await self._download_http_stream(target_url, dest_dir, target_name, progress, headers=headers_to_use, proxy=proxy_to_use)
+                self._validate_downloaded_files(dl)
+                return dl
+
         try:
-            if active_proxy:
-                downloaded = await self._download_aria2(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=active_proxy)
-            else:
-                downloaded = await self._download_aria2(resolved_url, dest_dir, final_name, progress, headers=dl_headers)
-            self._validate_downloaded_files(downloaded)
-            return downloaded
+            return await _attempt_dood_download(resolved_url, final_name, dl_headers, active_proxy)
         except Exception as exc:
             # If the resolved token reported error_wrong_ip, rotate to a fresh isolated Tor circuit and re-resolve once
             if self._is_ip_bound_token_error(str(exc)):
@@ -1762,14 +1787,12 @@ class LinksProvider(BaseProvider):
                     res = await self._resolve_doodstream(url, file_ref, progress, proxy=fresh_circuit)
                     resolved_url, resolved_name, dl_headers = res[0], res[1], dict(res[2] or {})
                     active_proxy = dl_headers.pop("_active_proxy", None) or fresh_circuit
-                    downloaded = await self._download_http_stream(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=active_proxy)
-                    self._validate_downloaded_files(downloaded)
-                    return downloaded
-                raise
-            progress.log(f"aria2c failed ({exc}); falling back to HTTP stream downloader...")
-            downloaded = await self._download_http_stream(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=active_proxy)
-            self._validate_downloaded_files(downloaded)
-            return downloaded
+                    if resolved_name and (not final_name or final_name.startswith("video_download_")):
+                        final_name = resolved_name
+                    dl = await self._download_http_stream(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=active_proxy)
+                    self._validate_downloaded_files(dl)
+                    return dl
+            raise
 
     async def _resolve_universal_page(
         self,

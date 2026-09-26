@@ -69,11 +69,14 @@ async def close_shared_clients() -> None:
             pass
 
 class ProviderFailure(RuntimeError):
-    def __init__(self, code: str, message: str, details: dict[str, Any] | None = None) -> None:
+    def __init__(self, code: str, message: str, details: dict[str, Any] | None = None, **kwargs: Any) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
-        self.details = details or {}
+        combined = dict(details) if isinstance(details, dict) else ({"details": details} if details is not None else {})
+        if kwargs:
+            combined.update(kwargs)
+        self.details = combined
 
 # TeraBox answers a dlink with {"errno": 400141, "errmsg": "need verify"} when it wants the
 # web session re-verified; the other codes are the token-expiry family the web client fixes
@@ -398,7 +401,7 @@ def _download_error_payload(path: Path, content_type: str, strict: bool) -> dict
         )
         if any(err in raw_lower for err in text_errors):
             msg = raw.decode("utf-8", errors="replace").strip() or f"{path.stat().st_size} bytes error payload"
-            return {"errno": 404 if b"not found" in raw_lower else 403, "message": msg[:200], "body": msg}
+            return {"code": "DOWNLOAD_FAILED", "errno": 404 if b"not found" in raw_lower else 403, "message": msg[:200], "body": msg}
     if not raw.startswith((b"{", b"[")):
         return None
     try:
@@ -411,7 +414,8 @@ def _download_error_payload(path: Path, content_type: str, strict: bool) -> dict
     message = data.get("errmsg") or data.get("error_description") or data.get("error") or data.get("message")
     if not message and errno in (None, 0, "0"):
         return None
-    payload = {"errno": errno, "message": str(message or "download error"), "body": data}
+    code = "PROVIDER_NEEDS_VERIFY" if is_verify_error(data) else "DOWNLOAD_FAILED"
+    payload = {"code": code, "errno": errno, "message": str(message or "download error"), "body": data}
     # A complete errno+errmsg envelope is a provider refusal whatever the content-type claims;
     # trusting the content-type here would leave a 70-byte "video" on disk.
     if message and errno not in (None, 0, "0"):
