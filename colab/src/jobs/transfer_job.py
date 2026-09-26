@@ -85,7 +85,7 @@ async def run_transfer(job: JobState) -> None:
                 item_name = _item_name(item)
                 item_size = _item_size(item)
                 item_k = _queue_item_key(source, item)
-                job.start_file(item_name, phase="download", size=item_size)
+                job.start_file(item_name, phase="download", size=item_size, key=item_k)
                 job.start_item(item_k, name=item_name)
                 item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
                 item_src = PROVIDERS.get(item_prov, src)
@@ -96,7 +96,7 @@ async def run_transfer(job: JobState) -> None:
                         progress=job, label=item_name,
                     )
                     actual_size = path.stat().st_size if (path and path.exists()) else item_size
-                    job.finish_file(item_name, phase="download", size=actual_size)
+                    job.finish_file(item_name, phase="download", size=actual_size, key=item_k)
                     if item_k != item_name:
                         job.file_sizes[item_k] = actual_size
                     job.files_downloaded += 1
@@ -104,13 +104,13 @@ async def run_transfer(job: JobState) -> None:
                     _remember_source_ref(job, path, item)
                     return [path]
                 except ProviderFailure as exc:
-                    job.finish_file(item_name, phase="download")
+                    job.finish_file(item_name, phase="download", key=item_k)
                     if not is_skippable_download_failure(exc):
                         raise
                     _mark_item_skipped(job, source, item, exc.message)
                     return []
                 except Exception:
-                    job.finish_file(item_name, phase="download")
+                    job.finish_file(item_name, phase="download", key=item_k)
                     raise
 
         for item in source.get("items") or []:
@@ -465,9 +465,10 @@ async def _run_plain_file_batches(job: JobState, dirs: dict[str, Path], source: 
         async with sem:
             job.check_cancelled()
             item_name = _item_name(item)
+            item_size = _item_size(item)
             item_k = _queue_item_key(source, item)
+            job.start_file(item_name, phase="download", size=item_size, key=item_k)
             job.start_item(item_k, name=item_name)
-            job.set(current_file=item_name, status="running", step="downloading")
             item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
             item_src = PROVIDERS.get(item_prov, src)
             item_creds = item.get("credentials") or source.get("credentials") or {}
@@ -476,15 +477,23 @@ async def _run_plain_file_batches(job: JobState, dirs: dict[str, Path], source: 
                     lambda: item_src.download_file(item_creds, item, batch_input, job),
                     progress=job, label=item_name,
                 )
+                actual_size = path.stat().st_size if (path and path.exists()) else item_size
+                job.finish_file(item_name, phase="download", size=actual_size, key=item_k)
+                if item_k != item_name:
+                    job.file_sizes[item_k] = actual_size
                 job.files_downloaded += 1
                 job.log(f"[{job.files_downloaded}/{job.files_to_download or len(file_items)}] Downloaded: {item_name}")
                 _remember_source_ref(job, path, item)
                 return [path]
             except ProviderFailure as exc:
+                job.finish_file(item_name, phase="download", key=item_k)
                 if not is_skippable_download_failure(exc):
                     raise
                 _mark_item_skipped(job, source, item, exc.message)
                 return []
+            except Exception:
+                job.finish_file(item_name, phase="download", key=item_k)
+                raise
 
     for index, batch_items in enumerate(groups):
         batch_input = dirs["input"] / f"batch-{index}"
@@ -541,7 +550,7 @@ async def _download_batch_item(job: JobState, source: dict[str, Any], src: Any, 
     item_name = _item_name(item)
     item_size = _item_size(item)
     item_k = _queue_item_key(source, item)
-    job.start_file(item_name, phase="download", size=item_size)
+    job.start_file(item_name, phase="download", size=item_size, key=item_k)
     job.start_item(item_k, name=item_name)
     try:
         path = await download_with_retry(
@@ -549,13 +558,13 @@ async def _download_batch_item(job: JobState, source: dict[str, Any], src: Any, 
             progress=job, label=item_name,
         )
         actual_size = path.stat().st_size if (path and path.exists()) else item_size
-        job.finish_file(item_name, phase="download", size=actual_size)
+        job.finish_file(item_name, phase="download", size=actual_size, key=item_k)
         if item_k != item_name:
             job.file_sizes[item_k] = actual_size
         _remember_source_ref(job, path, item)
         return [path]
     except Exception:
-        job.finish_file(item_name, phase="download")
+        job.finish_file(item_name, phase="download", key=item_k)
         raise
 
 def _download_batches(items: list[dict[str, Any]], root: Path, options: dict[str, Any], job: JobState) -> list[list[dict[str, Any]]]:

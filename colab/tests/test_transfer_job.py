@@ -3894,4 +3894,24 @@ class ActiveFilesTrackingTests(TestCase):
         self.assertEqual(v["fileSizes"]["vid2.mp4"], 2000)
         self.assertIn("vid1.mp4", v["uploadedFiles"])
         self.assertIn("vid1.mp4", v["downloadedFiles"])
+        self.assertEqual(v["options"], {})
+
+    def test_active_files_with_keys_and_options_view(self):
+        opts = {"download_concurrency": 4, "upload_concurrency": 8}
+        job = JobState("test-job-keys", {"options": opts})
+        job.start_file("clip.mp4", phase="download", size=5000, key="links::clip.mp4")
+
+        self.assertIn("clip.mp4", job.active_files)
+        self.assertIn("links::clip.mp4", job.active_files)
+        self.assertEqual(job.file_sizes["links::clip.mp4"], 5000)
+
+        v = job.view()
+        self.assertEqual(v["options"]["download_concurrency"], 4)
+        self.assertIn("links::clip.mp4", v["activeFiles"])
+
+        job.finish_file("clip.mp4", phase="download", size=5120, key="links::clip.mp4")
+        self.assertNotIn("links::clip.mp4", job.active_files)
+        self.assertIn("links::clip.mp4", job.downloaded_files)
+        self.assertEqual(job.file_sizes["links::clip.mp4"], 5120)
+
 

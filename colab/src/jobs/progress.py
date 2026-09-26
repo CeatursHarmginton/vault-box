@@ -94,7 +94,7 @@ class JobState:
         self._last_item_end_time = now
         self.updated_at = now
 
-    def start_file(self, name: str, phase: str = "download", size: int = 0) -> None:
+    def start_file(self, name: str, phase: str = "download", size: int = 0, key: str | None = None) -> None:
         if not name:
             return
         now = time.time()
@@ -110,13 +110,17 @@ class JobState:
         self.active_files[name] = file_info
         if base_name and base_name != name:
             self.active_files[base_name] = file_info
+        if key:
+            self.active_files[key] = file_info
         if size > 0:
             self.file_sizes[name] = size
             if base_name:
                 self.file_sizes[base_name] = size
+            if key:
+                self.file_sizes[key] = size
         self.updated_at = now
 
-    def finish_file(self, name: str, phase: str = "download", size: int = 0) -> None:
+    def finish_file(self, name: str, phase: str = "download", size: int = 0, key: str | None = None) -> None:
         if not name:
             return
         now = time.time()
@@ -124,19 +128,27 @@ class JobState:
         self.active_files.pop(name, None)
         if base_name:
             self.active_files.pop(base_name, None)
+        if key:
+            self.active_files.pop(key, None)
         if phase == "download":
             self.downloaded_files.add(name)
             if base_name:
                 self.downloaded_files.add(base_name)
+            if key:
+                self.downloaded_files.add(key)
         elif phase == "upload":
             self.uploaded_files.add(name)
             if base_name:
                 self.uploaded_files.add(base_name)
+            if key:
+                self.uploaded_files.add(key)
         if size > 0:
             self.file_sizes[name] = size
             if base_name:
                 self.file_sizes[base_name] = size
-        if self.current_file in (name, base_name):
+            if key:
+                self.file_sizes[key] = size
+        if self.current_file in (name, base_name, key):
             if self.active_files:
                 first_active = next(iter(self.active_files.values()))
                 self.current_file = str(first_active.get("name") or next(iter(self.active_files.keys())))
@@ -254,6 +266,7 @@ class JobState:
             "step": self.step,
             "progress": self.progress.__dict__,
             "phases": phases,
+            "options": options,
             "currentFile": self.current_file,
             "activeFiles": self.active_files,
             "fileSizes": self.file_sizes,
