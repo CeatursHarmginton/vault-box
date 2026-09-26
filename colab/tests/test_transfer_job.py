@@ -4136,4 +4136,65 @@ def test_universal_page_resolver_and_circuit_isolated_proxy_for_any_website(tmp_
     assert seen["referer"] == "https://embed-host.example/"
 
 
+def test_download_parallel_ranges_multiplexes_streams_over_same_proxy(tmp_path, monkeypatch):
+    from src.providers.links import LinksProvider
+    provider = LinksProvider()
+    full_data = bytes((i % 251 for i in range(1500 * 1024)))  # 1.5 MB payload
+    seen_ranges = []
+    seen_proxies = []
+
+    class FakeRangeStream:
+        def __init__(self, range_hdr: str):
+            seen_ranges.append(range_hdr)
+            m = __import__("re").search(r"bytes=(\d+)-(\d+)", range_hdr)
+            self.start = int(m.group(1))
+            self.end = min(len(full_data) - 1, int(m.group(2)))
+            self.status_code = 206
+            self.headers = {
+                "content-type": "video/mp4",
+                "content-range": f"bytes {self.start}-{self.end}/{len(full_data)}",
+            }
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_bytes(self, size):
+            yield full_data[self.start : self.end + 1]
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            seen_proxies.append(kwargs.get("proxy"))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, headers):
+            return FakeRangeStream(headers["Range"])
+
+    monkeypatch.setattr(base_mod.httpx, "AsyncClient", FakeClient)
+    job = JobState("parallel-ranges", {})
+    dest = tmp_path / "fast.mp4"
+    out = asyncio.run(provider._download_parallel_ranges(
+        "https://cdn.example/fast.mp4",
+        dest,
+        job,
+        headers={"Referer": "https://dooood.com/"},
+        proxy="socks5://vb_fast99:pass@127.0.0.1:9050",
+        num_connections=8,
+    ))
+    assert out.read_bytes() == full_data
+    assert seen_proxies == ["socks5://vb_fast99:pass@127.0.0.1:9050"]
+    assert len(seen_ranges) >= 3
+    assert job.bytes_done == len(full_data)
+
+
 

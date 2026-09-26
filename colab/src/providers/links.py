@@ -21,10 +21,12 @@ from urllib.parse import parse_qs, unquote, urlparse
 TOR_PROXY = "socks5://127.0.0.1:9050"
 PROXY_SETUP_LOCK: asyncio.Lock | None = None
 _proxy_ready = False
+_PROXY_REQUIRED_DOMAINS: set[str] = set()
 
 import httpx
 
-from ..providers.base import BaseProvider, ProviderFailure, safe_name, stream_download
+from ..providers.base import BaseProvider, ProviderFailure, _download_error_payload, safe_name, stream_download
+_default_stream_download = stream_download
 from ..jobs.progress import JobState
 
 BT_TRACKERS = "udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,udp://tracker.openbittorrent.com:6969/announce,udp://exodus.desync.com:6969/announce"
@@ -177,14 +179,29 @@ class LinksProvider(BaseProvider):
                     if not shutil.which("tor"):
                         subprocess.run(["apt-get", "update", "-qq"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         subprocess.run(["apt-get", "install", "-y", "-qq", "tor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    # Clean any invalid/duplicate HTTPTunnelPort lines from /etc/tor/torrc so tor starts cleanly
                     torrc = Path("/etc/tor/torrc")
+                    high_speed_marker = "# vaultbox-high-speed-tor"
                     if torrc.exists():
                         try:
                             txt = torrc.read_text(encoding="utf-8", errors="ignore")
+                            needs_restart = False
                             if "HTTPTunnelPort" in txt:
-                                cleaned = "\n".join(line for line in txt.splitlines() if "HTTPTunnelPort" not in line) + "\n"
-                                torrc.write_text(cleaned, encoding="utf-8")
+                                txt = "\n".join(line for line in txt.splitlines() if "HTTPTunnelPort" not in line) + "\n"
+                                needs_restart = True
+                            if high_speed_marker not in txt:
+                                txt = (
+                                    txt.rstrip()
+                                    + f"\n{high_speed_marker}\n"
+                                    + "SocksPort 127.0.0.1:9050 IsolateSOCKSAuth KeepAliveIsolateSOCKSAuth\n"
+                                    + "NumEntryGuards 8\n"
+                                    + "CircuitBuildTimeout 10\n"
+                                    + "LearnCircuitBuildTimeout 0\n"
+                                    + "MaxCircuitDirtiness 7200\n"
+                                    + "CircuitStreamTimeout 30\n"
+                                )
+                                needs_restart = True
+                            if needs_restart:
+                                torrc.write_text(txt, encoding="utf-8")
                                 subprocess.run(["pkill", "-9", "tor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         except Exception:
                             pass
@@ -193,7 +210,13 @@ class LinksProvider(BaseProvider):
                         time.sleep(1.5)
                     if not _is_port_open(9050):
                         subprocess.run(
-                            ["tor", "--SocksPort", "127.0.0.1:9050", "--RunAsDaemon", "1"],
+                            [
+                                "tor",
+                                "--SocksPort", "127.0.0.1:9050 IsolateSOCKSAuth KeepAliveIsolateSOCKSAuth",
+                                "--NumEntryGuards", "8",
+                                "--MaxCircuitDirtiness", "7200",
+                                "--RunAsDaemon", "1",
+                            ],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                         )
 
@@ -265,15 +288,15 @@ class LinksProvider(BaseProvider):
         proxy: str | None = None,
         auto_proxy: bool = True,
     ) -> tuple[int, str, str, str | None]:
-        """Universal webpage fetcher with browser TLS impersonation and automatic Tor proxy + circuit rotation on IP/Captcha blocks."""
+        """Universal webpage fetcher with browser TLS impersonation, domain proxy memory, and parallel 3-circuit racing."""
         def _do_fetch(active_px: str | None) -> tuple[int, str, str]:
             try:
                 from curl_cffi import requests as cffi_requests
                 s = cffi_requests.Session(impersonate="chrome")
-                r = s.get(target_url, headers=req_headers, proxy=active_px, timeout=25)
+                r = s.get(target_url, headers=req_headers, proxy=active_px, timeout=20)
                 return r.status_code, r.text, str(r.url)
             except Exception:
-                with httpx.Client(follow_redirects=True, timeout=25.0, proxy=active_px) as client:
+                with httpx.Client(follow_redirects=True, timeout=20.0, proxy=active_px) as client:
                     r = client.get(target_url, headers=req_headers)
                     return r.status_code, r.text, str(r.url)
 
@@ -288,15 +311,24 @@ class LinksProvider(BaseProvider):
                 return True
             return False
 
+        target_host = urlparse(target_url).netloc.lower()
         code, body, final_url = 0, "", target_url
-        try:
-            code, body, final_url = await asyncio.to_thread(_do_fetch, proxy)
-            if not _is_page_challenged(code, body) and body.strip():
-                return code, body, final_url, proxy
-        except Exception as exc:
-            if not auto_proxy:
-                raise
-            progress.log(f"[IP-Guard] Direct fetch failed on {urlparse(target_url).netloc} ({exc}); activating proxy...")
+
+        # Skip wasted direct attempt if this domain is already known to challenge datacenter IPs
+        if proxy or not (auto_proxy and target_host in _PROXY_REQUIRED_DOMAINS):
+            try:
+                code, body, final_url = await asyncio.to_thread(_do_fetch, proxy)
+                if not _is_page_challenged(code, body) and body.strip():
+                    return code, body, final_url, proxy
+                if not proxy and auto_proxy:
+                    _PROXY_REQUIRED_DOMAINS.add(target_host)
+                    final_host = urlparse(final_url).netloc.lower()
+                    if final_host:
+                        _PROXY_REQUIRED_DOMAINS.add(final_host)
+            except Exception as exc:
+                if not auto_proxy:
+                    raise
+                progress.log(f"[IP-Guard] Direct fetch failed on {target_host} ({exc}); activating proxy...")
 
         if not auto_proxy:
             return code, body, final_url, proxy
@@ -305,20 +337,43 @@ class LinksProvider(BaseProvider):
         if not base_proxy:
             return code, body, final_url, proxy
 
-        for attempt in range(3):
-            circuit_proxy = (
-                proxy
-                if (attempt == 0 and proxy and "vb_" in proxy)
-                else self._isolated_proxy(base_proxy, uuid.uuid4().hex[:8])
-            )
-            progress.log(f"[IP-Guard] Datacenter/Exit IP challenged on {urlparse(target_url).netloc}; fetching via proxy circuit #{attempt + 1}...")
+        # If caller already pinned a specific circuit (e.g. /pass_md5/ after /e/), try that circuit first
+        if proxy and "vb_" in proxy:
             try:
-                c_code, c_body, c_url = await asyncio.to_thread(_do_fetch, circuit_proxy)
-                code, body, final_url = c_code, c_body, c_url
+                c_code, c_body, c_url = await asyncio.to_thread(_do_fetch, proxy)
                 if not _is_page_challenged(c_code, c_body) and c_body.strip():
-                    return c_code, c_body, c_url, circuit_proxy
-            except Exception as p_exc:
-                progress.log(f"[IP-Guard] Proxy circuit #{attempt + 1} notice: {p_exc}")
+                    return c_code, c_body, c_url, proxy
+            except Exception:
+                pass
+
+        # Race 3 isolated Tor circuits in parallel so the lowest-latency, highest-bandwidth exit node wins
+        progress.log(f"[IP-Guard] Racing 3 parallel proxy circuits on {target_host} to select fastest exit IP...")
+
+        async def _race_circuit(circuit_px: str) -> tuple[int, str, str, str]:
+            r_code, r_body, r_url = await asyncio.to_thread(_do_fetch, circuit_px)
+            if _is_page_challenged(r_code, r_body) or not r_body.strip():
+                raise RuntimeError(f"circuit challenged (HTTP {r_code})")
+            return r_code, r_body, r_url, circuit_px
+
+        candidates = [self._isolated_proxy(base_proxy, uuid.uuid4().hex[:8]) for _ in range(3)]
+        tasks = [asyncio.create_task(_race_circuit(px)) for px in candidates if px]
+        try:
+            pending = set(tasks)
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for d in done:
+                    try:
+                        w_code, w_body, w_url, w_px = d.result()
+                        for p_task in pending:
+                            p_task.cancel()
+                        return w_code, w_body, w_url, w_px
+                    except Exception:
+                        pass
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+
         return code, body, final_url, proxy or base_proxy
 
     def _classify_link(self, url: str) -> str:
@@ -544,22 +599,213 @@ class LinksProvider(BaseProvider):
         elapsed = max(time.monotonic() - started, 0.001)
         return url, size, read / elapsed
 
+    async def _download_parallel_ranges(
+        self,
+        url: str,
+        dest: Path,
+        progress: JobState,
+        *,
+        headers: dict[str, str] | None = None,
+        proxy: str | None = None,
+        num_connections: int = 16,
+    ) -> Path:
+        """High-speed multi-connection HTTP Range downloader that multiplexes 16 parallel streams over the same SOCKS5 circuit or direct connection."""
+        import threading
+        from ..providers import base as _base_mod
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        part_path = dest.with_suffix(dest.suffix + ".part")
+        base_headers = {k: v for k, v in (headers or {}).items() if str(k).lower() != "range"}
+
+        limits = httpx.Limits(
+            max_connections=max(24, num_connections + 4),
+            max_keepalive_connections=max(20, num_connections),
+        )
+        timeout = httpx.Timeout(connect=30.0, read=45.0, write=30.0, pool=60.0)
+        client_kwargs: dict[str, Any] = {"follow_redirects": True, "timeout": timeout, "limits": limits}
+        if proxy:
+            client_kwargs["proxy"] = proxy
+
+        async with _base_mod.httpx.AsyncClient(**client_kwargs) as client:
+            probe_headers = {**base_headers, "Range": "bytes=0-65535"}
+            async with client.stream("GET", url, headers=probe_headers) as resp:
+                if resp.status_code in (401, 403):
+                    raise ProviderFailure(
+                        "DOWNLOAD_FAILED",
+                        f"Source rejected direct download (HTTP {resp.status_code}): the site likely binds the URL to the original browser/IP or expired the token.",
+                        status=resp.status_code,
+                    )
+                resp.raise_for_status()
+                content_type = resp.headers.get("content-type") or ""
+
+                # If server does not support Range (200 OK), stream the response directly without re-requesting
+                if resp.status_code != 206:
+                    total = int(resp.headers.get("content-length") or 0)
+                    done = 0
+                    with part_path.open("wb") as f:
+                        async for chunk in resp.aiter_bytes(262144):
+                            progress.check_cancelled()
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            done += len(chunk)
+                            if done <= 4096 and (total == 0 or total <= 4096):
+                                sample_low = chunk.lower()
+                                if any(tok in sample_low for tok in (
+                                    b"error_wrong_ip", b"file not found", b"403 forbidden",
+                                    b"access denied", b"ip not allowed", b"invalid token",
+                                    b"link expired", b'"errmsg"', b"<html",
+                                )):
+                                    continue
+                            progress.add_bytes(len(chunk), total, "download", dest.name)
+                    if error := _download_error_payload(part_path, content_type, False):
+                        part_path.unlink(missing_ok=True)
+                        raise ProviderFailure(error["code"], error["message"], **(error.get("details") or {}))
+                    part_path.replace(dest)
+                    return dest
+
+                # 206 Partial Content: read initial 64 KB probe
+                first_chunks: list[bytes] = []
+                async for chunk in resp.aiter_bytes(65536):
+                    if chunk:
+                        first_chunks.append(chunk)
+                first_bytes = b"".join(first_chunks)
+                content_range = resp.headers.get("Content-Range") or resp.headers.get("content-range") or ""
+                m_total = re.search(r"/(\d+)$", content_range)
+                total_size = int(m_total.group(1)) if m_total else 0
+
+            # Validate initial probe before allocating or updating progress
+            if len(first_bytes) <= 4096:
+                part_path.write_bytes(first_bytes)
+                if error := _download_error_payload(part_path, content_type, False):
+                    part_path.unlink(missing_ok=True)
+                    raise ProviderFailure(error["code"], error["message"], **(error.get("details") or {}))
+
+            first_len = len(first_bytes)
+            if total_size <= first_len:
+                part_path.write_bytes(first_bytes)
+                if error := _download_error_payload(part_path, content_type, False):
+                    part_path.unlink(missing_ok=True)
+                    raise ProviderFailure(error["code"], error["message"], **(error.get("details") or {}))
+                progress.add_bytes(first_len, total_size or first_len, "download", dest.name)
+                part_path.replace(dest)
+                return dest
+
+            # Prepare output file and write first 64 KB
+            with part_path.open("wb") as f:
+                f.truncate(total_size)
+                f.seek(0)
+                f.write(first_bytes)
+            progress.add_bytes(first_len, total_size, "download", dest.name)
+
+            remaining = total_size - first_len
+            seg_size = max(512 * 1024, min(4 * 1024 * 1024, max(1, remaining // num_connections)))
+            seg_queue: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
+            pos = first_len
+            while pos < total_size:
+                seg_end = min(total_size - 1, pos + seg_size - 1)
+                seg_queue.put_nowait((pos, seg_end))
+                pos = seg_end + 1
+
+            worker_count = min(num_connections, seg_queue.qsize())
+            progress.log(f"[Turbo] Downloading {dest.name} via {worker_count} parallel Range streams...")
+
+            write_lock = threading.Lock()
+            has_pwrite = hasattr(os, "pwrite")
+
+            with part_path.open("r+b") as f_out:
+                fd = f_out.fileno()
+
+                def _write_at(data: bytes, offset: int) -> None:
+                    if has_pwrite:
+                        os.pwrite(fd, data, offset)
+                    else:
+                        with write_lock:
+                            f_out.seek(offset)
+                            f_out.write(data)
+
+                async def _range_worker() -> None:
+                    while not seg_queue.empty():
+                        try:
+                            seg_start, seg_end = seg_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        cur = seg_start
+                        for attempt in range(5):
+                            progress.check_cancelled()
+                            if cur > seg_end:
+                                break
+                            req_hdr = {**base_headers, "Range": f"bytes={cur}-{seg_end}"}
+                            try:
+                                async with client.stream("GET", url, headers=req_hdr) as r_seg:
+                                    if r_seg.status_code in (401, 403):
+                                        raise ProviderFailure(
+                                            "DOWNLOAD_FAILED",
+                                            f"Range request rejected with HTTP {r_seg.status_code}",
+                                            status=r_seg.status_code,
+                                        )
+                                    r_seg.raise_for_status()
+                                    async for chunk in r_seg.aiter_bytes(262144):
+                                        progress.check_cancelled()
+                                        if not chunk:
+                                            continue
+                                        # Trim if server returned more than requested end
+                                        max_need = (seg_end - cur) + 1
+                                        if len(chunk) > max_need:
+                                            chunk = chunk[:max_need]
+                                        _write_at(chunk, cur)
+                                        cur += len(chunk)
+                                        progress.add_bytes(len(chunk), total_size, "download", dest.name)
+                                        if cur > seg_end:
+                                            break
+                                if cur > seg_end:
+                                    break
+                            except ProviderFailure:
+                                raise
+                            except Exception as exc:
+                                if attempt == 4:
+                                    raise ProviderFailure("DOWNLOAD_FAILED", f"Parallel segment {cur}-{seg_end} failed: {exc}") from exc
+                                await asyncio.sleep(min(2.0, 0.4 * (attempt + 1)))
+
+                await asyncio.gather(*(_range_worker() for _ in range(worker_count)))
+
+        if error := _download_error_payload(part_path, content_type, False):
+            part_path.unlink(missing_ok=True)
+            raise ProviderFailure(error["code"], error["message"], **(error.get("details") or {}))
+        part_path.replace(dest)
+        return dest
+
     async def _download_http_stream(self, url: str | list[str], dest_dir: Path, name: str | None, progress: JobState, headers: dict[str, str] | None = None, proxy: str | None = None, cookies: str | None = None) -> list[Path]:
+        from ..providers import base as _base_mod
         urls = [str(item) for item in (url if isinstance(url, list) else [url]) if str(item or "")]
         last: ProviderFailure | None = None
+        use_parallel = (
+            stream_download is _default_stream_download
+            and getattr(_base_mod.httpx.AsyncClient, "__module__", "").startswith("httpx")
+        )
         for one in urls:
             out_name = name or safe_name(unquote(Path(urlparse(one).path).name) or "download")
             try:
                 progress.log(f"Starting browser-compatible download: {out_name}")
-                downloaded = [await stream_download(
-                    one,
-                    dest_dir / out_name,
-                    progress,
-                    headers=self._http_headers(headers, cookies=cookies),
-                    auth_fail_code="DOWNLOAD_FAILED",
-                    auth_fail_message="Direct link rejected Colab; this host likely binds the URL to the original browser/IP",
-                    proxy=proxy,
-                )]
+                if use_parallel:
+                    downloaded = [await self._download_parallel_ranges(
+                        one,
+                        dest_dir / out_name,
+                        progress,
+                        headers=self._http_headers(headers, cookies=cookies),
+                        proxy=proxy,
+                        num_connections=16,
+                    )]
+                else:
+                    downloaded = [await stream_download(
+                        one,
+                        dest_dir / out_name,
+                        progress,
+                        headers=self._http_headers(headers, cookies=cookies),
+                        auth_fail_code="DOWNLOAD_FAILED",
+                        auth_fail_message="Direct link rejected Colab; this host likely binds the URL to the original browser/IP",
+                        proxy=proxy,
+                    )]
                 self._validate_downloaded_files(downloaded)
                 return downloaded
             except ProviderFailure as exc:
