@@ -300,6 +300,11 @@ async def stream_download(
             if done:
                 req_headers["Range"] = f"bytes={done}-"
             try:
+                _err_tokens = (
+                    b"error_wrong_ip", b"file not found", b"404 not found", b"403 forbidden",
+                    b"access denied", b"ip not allowed", b"invalid token", b"link expired",
+                    b"url expired", b'"errmsg"', b"<html", b"<!doctype html"
+                )
                 if proxy:
                     async with httpx.AsyncClient(proxy=proxy, timeout=httpx.Timeout(None, connect=30.0, read=DOWNLOAD_READ_TIMEOUT, write=60.0, pool=30.0), follow_redirects=True) as client:
                         async with client.stream("GET", url, headers=req_headers) as resp:
@@ -317,7 +322,8 @@ async def stream_download(
                                     progress.check_cancelled()
                                     fh.write(chunk)
                                     done += len(chunk)
-                                    progress.add_bytes(len(chunk), total, phase, str(dest))
+                                    if not (done <= 4096 and any(t in chunk.lower() for t in _err_tokens)):
+                                        progress.add_bytes(len(chunk), total, phase, str(dest))
                 else:
                     client = shared_client("download", timeout=httpx.Timeout(None, connect=30.0, read=DOWNLOAD_READ_TIMEOUT, write=60.0, pool=30.0), follow_redirects=True)
                     async with client.stream("GET", url, headers=req_headers) as resp:
@@ -335,7 +341,8 @@ async def stream_download(
                                 progress.check_cancelled()
                                 fh.write(chunk)
                                 done += len(chunk)
-                                progress.add_bytes(len(chunk), total, phase, str(dest))
+                                if not (done <= 4096 and any(t in chunk.lower() for t in _err_tokens)):
+                                    progress.add_bytes(len(chunk), total, phase, str(dest))
                 if not expected or part.stat().st_size >= expected:
                     break
                 raise RuntimeError(f"Download incomplete: got {part.stat().st_size} bytes, expected {expected}")

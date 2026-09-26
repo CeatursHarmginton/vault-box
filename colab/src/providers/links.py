@@ -126,63 +126,200 @@ class LinksProvider(BaseProvider):
 
     @classmethod
     async def _ensure_tor_proxy(cls, progress: JobState | None = None) -> str | None:
-        """Set up Tor as SOCKS5 proxy on 127.0.0.1:9050 and HTTP proxy on 127.0.0.1:9080 (pure TCP, works 100% in Colab)."""
+        """Set up Tor as SOCKS5 proxy on 127.0.0.1:9050 (pure TCP, works 100% in Colab)."""
         global _proxy_ready, PROXY_SETUP_LOCK
-        if _proxy_ready:
+        import socket
+
+        def _is_port_open(port: int = 9050) -> bool:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                    return True
+            except Exception:
+                return False
+
+        if _proxy_ready and _is_port_open(9050):
             return TOR_PROXY
         if PROXY_SETUP_LOCK is None:
             PROXY_SETUP_LOCK = asyncio.Lock()
         async with PROXY_SETUP_LOCK:
-            if _proxy_ready:
+            if _proxy_ready and _is_port_open(9050):
                 return TOR_PROXY
             if not sys.platform.startswith("linux"):
                 return None
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "curl", "-s", "--socks5", "127.0.0.1:9050", "--connect-timeout", "3", "https://api.ipify.org",
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-                )
-                out, _ = await proc.communicate()
-                if proc.returncode == 0 and out.strip():
+
+            async def _probe_socks() -> str:
+                for probe_url in ("https://checkip.amazonaws.com", "https://api.ipify.org", "https://icanhazip.com"):
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            "curl", "-s", "--socks5-hostname", "127.0.0.1:9050",
+                            "--connect-timeout", "4", "--max-time", "6", probe_url,
+                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        out, _ = await proc.communicate()
+                        txt = out.decode(errors="ignore").strip()
+                        if proc.returncode == 0 and txt and len(txt) < 64 and ("." in txt or ":" in txt):
+                            return txt
+                    except Exception:
+                        pass
+                return ""
+
+            if _is_port_open(9050):
+                ip_txt = await _probe_socks()
+                if ip_txt:
                     _proxy_ready = True
                     return TOR_PROXY
-            except Exception:
-                pass
 
             try:
                 if progress:
-                    progress.log("[Proxy] Starting Tor SOCKS5/HTTP proxy for IP bypass (TCP-based)...")
-                def _setup():
+                    progress.log("[Proxy] Starting Tor SOCKS5 proxy for IP bypass (TCP-based)...")
+
+                def _setup() -> None:
                     if not shutil.which("tor"):
                         subprocess.run(["apt-get", "update", "-qq"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         subprocess.run(["apt-get", "install", "-y", "-qq", "tor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    # Clean any invalid/duplicate HTTPTunnelPort lines from /etc/tor/torrc so tor starts cleanly
                     torrc = Path("/etc/tor/torrc")
                     if torrc.exists():
                         try:
                             txt = torrc.read_text(encoding="utf-8", errors="ignore")
-                            if "HTTPTunnelPort 9080" not in txt:
-                                torrc.write_text(txt + "\nHTTPTunnelPort 127.0.0.1:9080\n", encoding="utf-8")
+                            if "HTTPTunnelPort" in txt:
+                                cleaned = "\n".join(line for line in txt.splitlines() if "HTTPTunnelPort" not in line) + "\n"
+                                torrc.write_text(cleaned, encoding="utf-8")
+                                subprocess.run(["pkill", "-9", "tor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         except Exception:
                             pass
-                    subprocess.run(["service", "tor", "restart"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if not _is_port_open(9050):
+                        subprocess.run(["service", "tor", "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        time.sleep(1.5)
+                    if not _is_port_open(9050):
+                        subprocess.run(
+                            ["tor", "--SocksPort", "127.0.0.1:9050", "--RunAsDaemon", "1"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        )
+
                 await asyncio.to_thread(_setup)
 
-                for _ in range(8):
+                for _ in range(20):
                     await asyncio.sleep(1)
-                    proc = await asyncio.create_subprocess_exec(
-                        "curl", "-s", "--socks5", "127.0.0.1:9050", "--connect-timeout", "4", "https://api.ipify.org",
-                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    out, _ = await proc.communicate()
-                    if proc.returncode == 0 and out.strip():
+                    if not _is_port_open(9050):
+                        continue
+                    ip_txt = await _probe_socks()
+                    if ip_txt:
                         _proxy_ready = True
                         if progress:
-                            progress.log(f"[Proxy] Tor proxy active (Exit IP: {out.decode(errors='ignore').strip()[:60]})")
+                            progress.log(f"[Proxy] Tor proxy active (Exit IP: {ip_txt[:60]})")
                         return TOR_PROXY
+                    for log_path in (Path("/var/log/tor/notices.log"), Path("/var/log/tor/log")):
+                        if log_path.exists():
+                            try:
+                                if "Bootstrapped 100%" in log_path.read_text(encoding="utf-8", errors="ignore"):
+                                    _proxy_ready = True
+                                    if progress:
+                                        progress.log("[Proxy] Tor proxy active (Bootstrapped 100%)")
+                                    return TOR_PROXY
+                            except Exception:
+                                pass
             except Exception as exc:
                 if progress:
                     progress.log(f"[Proxy] Tor setup notice: {exc}")
             return None
+
+    @staticmethod
+    def _isolated_proxy(proxy: str | None, circuit_tag: str | None = None) -> str | None:
+        """Return a SOCKS5 URL with IsolateSOCKSAuth credentials so a download and its token resolution share one dedicated exit IP."""
+        if not proxy:
+            return None
+        if "127.0.0.1:9050" in proxy and circuit_tag:
+            return f"socks5://vb_{circuit_tag}:pass@127.0.0.1:9050"
+        return proxy
+
+    @staticmethod
+    def _is_ip_bound_token_error(msg: str) -> bool:
+        """Detect errors where a URL token is strictly bound to another IP or expired, making direct retries useless."""
+        low = str(msg or "").lower()
+        return any(k in low for k in (
+            "error_wrong_ip", "wrong_ip", "wrong ip", "ip not allowed", "ip mismatch",
+            "invalid token", "token expired", "link expired", "url expired",
+            "binds the url to the original browser/ip",
+        ))
+
+    @staticmethod
+    def _is_ip_or_captcha_blocked(text_or_msg: str, status_code: int = 200) -> bool:
+        """Universal check for datacenter IP blocks, Cloudflare/Turnstile challenges, or CDN token/IP refusals."""
+        if status_code in (401, 403, 429, 451, 503):
+            return True
+        low = str(text_or_msg or "").lower()
+        return any(k in low for k in (
+            "error_wrong_ip", "wrong_ip", "ip not allowed", "403", "forbidden",
+            "429", "blocked", "access denied", "file not found", "error response",
+            "error instead of file", "error payload", "captcha-player",
+            "cf-challenge", "cf-turnstile", "turnstile", "just a moment",
+            "attention required", "ddos-guard", "security check",
+        ))
+
+    async def _fetch_webpage(
+        self,
+        target_url: str,
+        req_headers: dict[str, str],
+        progress: JobState,
+        proxy: str | None = None,
+        auto_proxy: bool = True,
+    ) -> tuple[int, str, str, str | None]:
+        """Universal webpage fetcher with browser TLS impersonation and automatic Tor proxy + circuit rotation on IP/Captcha blocks."""
+        def _do_fetch(active_px: str | None) -> tuple[int, str, str]:
+            try:
+                from curl_cffi import requests as cffi_requests
+                s = cffi_requests.Session(impersonate="chrome")
+                r = s.get(target_url, headers=req_headers, proxy=active_px, timeout=25)
+                return r.status_code, r.text, str(r.url)
+            except Exception:
+                with httpx.Client(follow_redirects=True, timeout=25.0, proxy=active_px) as client:
+                    r = client.get(target_url, headers=req_headers)
+                    return r.status_code, r.text, str(r.url)
+
+        def _is_page_challenged(code: int, body: str) -> bool:
+            if code in (401, 403, 429, 451, 503):
+                return True
+            low = (body or "").lower()
+            if len(low) < 25000 and any(m in low for m in (
+                "captcha-player", "cf-challenge", "cf-turnstile", "just a moment...",
+                "attention required! | cloudflare", "ddos-guard", "verify you are human",
+            )):
+                return True
+            return False
+
+        code, body, final_url = 0, "", target_url
+        try:
+            code, body, final_url = await asyncio.to_thread(_do_fetch, proxy)
+            if not _is_page_challenged(code, body) and body.strip():
+                return code, body, final_url, proxy
+        except Exception as exc:
+            if not auto_proxy:
+                raise
+            progress.log(f"[IP-Guard] Direct fetch failed on {urlparse(target_url).netloc} ({exc}); activating proxy...")
+
+        if not auto_proxy:
+            return code, body, final_url, proxy
+
+        base_proxy = await self._ensure_tor_proxy(progress)
+        if not base_proxy:
+            return code, body, final_url, proxy
+
+        for attempt in range(3):
+            circuit_proxy = (
+                proxy
+                if (attempt == 0 and proxy and "vb_" in proxy)
+                else self._isolated_proxy(base_proxy, uuid.uuid4().hex[:8])
+            )
+            progress.log(f"[IP-Guard] Datacenter/Exit IP challenged on {urlparse(target_url).netloc}; fetching via proxy circuit #{attempt + 1}...")
+            try:
+                c_code, c_body, c_url = await asyncio.to_thread(_do_fetch, circuit_proxy)
+                code, body, final_url = c_code, c_body, c_url
+                if not _is_page_challenged(c_code, c_body) and c_body.strip():
+                    return c_code, c_body, c_url, circuit_proxy
+            except Exception as p_exc:
+                progress.log(f"[IP-Guard] Proxy circuit #{attempt + 1} notice: {p_exc}")
+        return code, body, final_url, proxy or base_proxy
 
     def _classify_link(self, url: str) -> str:
         url_lower = url.lower()
@@ -432,6 +569,8 @@ class LinksProvider(BaseProvider):
         raise ProviderFailure("DOWNLOAD_FAILED", "No URL provided")
 
     async def _download_aria2(self, url: str | list[str], dest_dir: Path, name: str | None, progress: JobState, headers: dict[str, str] | None = None, proxy: str | None = None, cookies: str | None = None) -> list[Path]:
+        if proxy and str(proxy).startswith("socks"):
+            return await self._download_http_stream(url, dest_dir, name, progress, headers=headers, proxy=proxy, cookies=cookies)
         urls = [str(item) for item in (url if isinstance(url, list) else [url]) if str(item or "")]
         uri_file: Path | None = None
         cmd = [
@@ -449,10 +588,7 @@ class LinksProvider(BaseProvider):
             "--uri-selector=adaptive",
         ]
         if proxy:
-            aria_proxy = "http://127.0.0.1:9080" if "127.0.0.1:9050" in proxy else proxy
-            if aria_proxy.startswith("socks"):
-                raise ProviderFailure("DOWNLOAD_FAILED", "aria2c requires HTTP proxy, falling back to stream downloader")
-            cmd.append(f"--all-proxy={aria_proxy}")
+            cmd.append(f"--all-proxy={proxy}")
 
         all_headers = dict(headers or {})
         if cookies and "cookie" not in {str(k).lower() for k in all_headers}:
@@ -531,7 +667,7 @@ class LinksProvider(BaseProvider):
                     if parsed:
                         done, total = parsed
                         diff = done - last_done
-                        if diff > 0:
+                        if diff > 0 and not (total > 0 and total <= 4096):
                             progress.add_bytes(diff, total)
                         last_done = done
 
@@ -1094,7 +1230,7 @@ class LinksProvider(BaseProvider):
 
     @staticmethod
     def _unpack_dean_edwards(packed_js: str) -> str:
-        """Unpack Dean Edwards / p,a,c,k,e,d JavaScript used by video hosts like MixDrop/MxDrop."""
+        """Unpack Dean Edwards / p,a,c,k,e,d JavaScript used by video hosts like MixDrop/MxDrop/Filemoon/Streamwish."""
         m = re.search(r'}\s*\(\s*[\x27\x22](.*)[\x27\x22]\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*[\x27\x22](.*)[\x27\x22]\.split\([\x27\x22]\|[\x27\x22]\)', packed_js, re.DOTALL)
         if not m:
             return ""
@@ -1117,7 +1253,7 @@ class LinksProvider(BaseProvider):
         return re.sub(r'\b[0-9a-zA-Z]+\b', repl, p)
 
     async def _resolve_mxdrop(self, url: str, file_ref: dict[str, Any], progress: JobState, proxy: str | None = None) -> tuple[str, str | None, dict[str, str]]:
-        """Resolve a dynamic Mixdrop / Mxdrop URL directly on Colab so the security token binds to Colab's IP."""
+        """Resolve a dynamic Mixdrop / Mxdrop URL directly on Colab so the security token binds to Colab's/Proxy's IP."""
         progress.log(f"Resolving fresh stream token on Colab for: {url[:80]}...")
         headers = file_ref.get("headers") or (file_ref.get("meta") or {}).get("headers") or {}
         referer = str(headers.get("Referer") or headers.get("referer") or "")
@@ -1153,12 +1289,11 @@ class LinksProvider(BaseProvider):
             "Referer": referer or "https://archivebate.com/",
         }
 
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=fetch_headers, proxy=proxy) as client:
-            resp = await client.get(embed_url)
-            resp.raise_for_status()
-            html = resp.text
+        _, page_html, _, active_proxy = await self._fetch_webpage(
+            embed_url, fetch_headers, progress, proxy=proxy, auto_proxy=True,
+        )
 
-        unpacked = self._unpack_dean_edwards(html)
+        unpacked = self._unpack_dean_edwards(page_html)
         m_wurl = re.search(r'MDCore\.wurl\s*=\s*[\x22\x27]([^\x22\x27]+)[\x22\x27]', unpacked)
         if not m_wurl:
             raise ProviderFailure("DOWNLOAD_FAILED", f"Could not extract MDCore.wurl from embed page on {embed_domain}")
@@ -1172,32 +1307,42 @@ class LinksProvider(BaseProvider):
         if m_vfile and m_vfile.group(1):
             out_name = file_ref.get("name") or f"{file_id}.mp4"
 
-        dl_headers = {
+        dl_headers: dict[str, str] = {
             "User-Agent": fetch_headers["User-Agent"],
             "Referer": f"{embed_domain}/",
             "Origin": embed_domain,
         }
+        if active_proxy:
+            dl_headers["_active_proxy"] = active_proxy
         progress.log(f"Successfully generated Colab-bound stream URL: {wurl[:80]}...")
         return wurl, out_name, dl_headers
 
     async def _download_mxdrop(self, url: str, dest_dir: Path, name: str | None, progress: JobState, file_ref: dict[str, Any], proxy: str | None = None) -> list[Path]:
         resolved_url = None
-        dl_headers = {}
+        dl_headers: dict[str, str] = {}
         final_name = name
+        active_proxy = proxy
         try:
-            resolved_url, resolved_name, dl_headers = await self._resolve_mxdrop(url, file_ref, progress, proxy=proxy)
+            res = await self._resolve_mxdrop(url, file_ref, progress, proxy=active_proxy)
+            resolved_url, resolved_name, dl_headers = res[0], res[1], dict(res[2] or {})
+            active_proxy = dl_headers.pop("_active_proxy", None) or active_proxy
             if not final_name:
                 final_name = resolved_name
         except Exception as exc:
+            if "mxcontent.net" in url.lower():
+                raise ProviderFailure(
+                    "DOWNLOAD_FAILED",
+                    f"[IP-Guard] Stopped direct download of IP-bound MixDrop CDN URL because embed token resolution failed ({exc}).",
+                )
             progress.log(f"Notice: Could not resolve embed token on Colab ({exc}), trying direct URL...")
             resolved_url = url
-            dl_headers = file_ref.get("headers") or (file_ref.get("meta") or {}).get("headers") or {}
+            dl_headers = dict(file_ref.get("headers") or (file_ref.get("meta") or {}).get("headers") or {})
 
-        progress.log(f"Downloading MixDrop stream via aria2c (16 connections)...")
+        progress.log("Downloading MixDrop stream...")
         try:
             try:
-                if proxy:
-                    return await self._download_aria2(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=proxy)
+                if active_proxy:
+                    return await self._download_aria2(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=active_proxy)
                 elif dl_headers:
                     return await self._download_aria2(resolved_url, dest_dir, final_name, progress, headers=dl_headers)
                 else:
@@ -1205,8 +1350,10 @@ class LinksProvider(BaseProvider):
             except TypeError:
                 return await self._download_aria2(resolved_url, dest_dir, final_name, progress)
         except Exception as exc:
+            if isinstance(exc, ProviderFailure) and self._is_ip_bound_token_error(exc.message):
+                raise
             progress.log(f"aria2c failed ({exc}); falling back to HTTP stream downloader")
-            return await self._download_http_stream(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=proxy)
+            return await self._download_http_stream(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=active_proxy)
 
     async def _resolve_doodstream(
         self,
@@ -1221,29 +1368,19 @@ class LinksProvider(BaseProvider):
         page_url = str(file_ref.get("page_url") or (file_ref.get("meta") or {}).get("page_url") or "").strip()
         referer = str(headers.get("Referer") or headers.get("referer") or "").strip()
 
+        dood_hosts = ("dood", "playmogo", "ds2play", "d000", "do0od", "dSVplay")
         embed_url = ""
         url_low = url.lower()
         if not page_url and "archivebate.com" in url_low:
             page_url = url
-        if any(h in url_low for h in ("dood", "playmogo", "ds2play")) and ("/e/" in url or "/d/" in url):
+        if any(h in url_low for h in dood_hosts) and ("/e/" in url or "/d/" in url):
             embed_url = url
-        elif page_url and any(h in page_url.lower() for h in ("dood", "playmogo", "ds2play")) and ("/e/" in page_url or "/d/" in page_url):
+        elif page_url and any(h in page_url.lower() for h in dood_hosts) and ("/e/" in page_url or "/d/" in page_url):
             embed_url = page_url
-        elif referer and any(h in referer.lower() for h in ("dood", "playmogo", "ds2play")) and ("/e/" in referer or "/d/" in referer):
+        elif referer and any(h in referer.lower() for h in dood_hosts) and ("/e/" in referer or "/d/" in referer):
             embed_url = referer
-        if "/d/" in embed_url and any(h in embed_url.lower() for h in ("dood", "playmogo", "ds2play")):
+        if "/d/" in embed_url and any(h in embed_url.lower() for h in dood_hosts):
             embed_url = embed_url.replace("/d/", "/e/", 1)
-
-        def _fetch_page(target_url: str, req_headers: dict[str, str]) -> tuple[int, str, str]:
-            try:
-                from curl_cffi import requests as cffi_requests
-                s = cffi_requests.Session(impersonate="chrome")
-                r = s.get(target_url, headers=req_headers, proxy=proxy, timeout=25)
-                return r.status_code, r.text, r.url
-            except Exception:
-                with httpx.Client(follow_redirects=True, timeout=25.0, proxy=proxy) as client:
-                    r = client.get(target_url, headers=req_headers)
-                    return r.status_code, r.text, str(r.url)
 
         req_headers = {
             "User-Agent": str(headers.get("User-Agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
@@ -1252,18 +1389,27 @@ class LinksProvider(BaseProvider):
         if cookies:
             req_headers["Cookie"] = cookies
 
+        active_proxy = proxy
         if not embed_url and page_url and page_url.startswith(("http://", "https://")):
             progress.log(f"[doodstream] Fetching canonical page: {page_url[:80]}...")
-            code, page_html, _ = await asyncio.to_thread(_fetch_page, page_url, req_headers)
-            m_iframe = re.search(r'<iframe[^>]+src=[\x22\x27]([^\x22\x27]+)[\x22\x27]', page_html, re.I)
-            if m_iframe:
+            _, page_html, _, active_proxy = await self._fetch_webpage(
+                page_url, req_headers, progress, proxy=active_proxy, auto_proxy=True,
+            )
+            for m_iframe in re.finditer(r'<iframe[^>]+src=[\x22\x27]([^\x22\x27]+)[\x22\x27]', page_html, re.I):
                 iframe_src = m_iframe.group(1).strip()
                 if iframe_src.startswith("//"):
                     iframe_src = "https:" + iframe_src
-                embed_url = iframe_src
-                progress.log(f"[doodstream] Found player iframe: {embed_url}")
+                if iframe_src.startswith("http"):
+                    embed_url = iframe_src
+                    progress.log(f"[doodstream] Found player iframe: {embed_url}")
+                    break
 
         if not embed_url:
+            if "cloudatacdn.com" in url_low:
+                raise ProviderFailure(
+                    "DOWNLOAD_FAILED",
+                    "Cannot resolve fresh DoodStream token: no canonical page_url or embed /e/ URL available for IP-bound cloudatacdn link.",
+                )
             progress.log("[doodstream] Notice: No embed player found; using direct URL with embed referer")
             dl_headers = {
                 "User-Agent": req_headers["User-Agent"],
@@ -1275,9 +1421,11 @@ class LinksProvider(BaseProvider):
         if page_url:
             embed_headers["Referer"] = page_url
         progress.log(f"[doodstream] Fetching embed player: {embed_url}")
-        code, embed_html, final_embed_url = await asyncio.to_thread(_fetch_page, embed_url, embed_headers)
+        _, embed_html, final_embed_url, active_proxy = await self._fetch_webpage(
+            embed_url, embed_headers, progress, proxy=active_proxy, auto_proxy=True,
+        )
 
-        m_pass = re.search(r'/pass_md5/([^\x22\x27]+)', embed_html)
+        m_pass = re.search(r'/pass_md5/([^\x22\x27\s<>]+)', embed_html)
         if not m_pass:
             raise ProviderFailure("DOWNLOAD_FAILED", f"Could not find /pass_md5/ in DoodStream player HTML on {embed_url}")
 
@@ -1290,7 +1438,10 @@ class LinksProvider(BaseProvider):
 
         pass_headers = dict(req_headers)
         pass_headers["Referer"] = final_embed_url
-        _, pass_body, _ = await asyncio.to_thread(_fetch_page, pass_url, pass_headers)
+        # Must use the exact same proxy circuit so the CDN binds the token to the same exit IP
+        _, pass_body, _, active_proxy = await self._fetch_webpage(
+            pass_url, pass_headers, progress, proxy=active_proxy, auto_proxy=False,
+        )
         cdn_base = pass_body.strip()
         if not cdn_base.startswith("http"):
             raise ProviderFailure("DOWNLOAD_FAILED", f"Invalid pass_md5 response from {pass_url}: {cdn_base[:100]}")
@@ -1311,7 +1462,9 @@ class LinksProvider(BaseProvider):
             "User-Agent": req_headers["User-Agent"],
             "Referer": f"{embed_domain}/",
         }
-        progress.log(f"[doodstream] Successfully generated Colab-bound stream URL: {resolved_url[:80]}...")
+        if active_proxy:
+            dl_headers["_active_proxy"] = active_proxy
+        progress.log(f"[doodstream] Successfully generated stream URL: {resolved_url[:80]}...")
         return resolved_url, out_name, dl_headers
 
     async def _download_doodstream(
@@ -1328,40 +1481,186 @@ class LinksProvider(BaseProvider):
         final_name = name
         active_proxy = proxy
         try:
-            resolved_url, resolved_name, dl_headers = await self._resolve_doodstream(url, file_ref, progress, proxy=active_proxy)
+            res = await self._resolve_doodstream(url, file_ref, progress, proxy=active_proxy)
+            resolved_url, resolved_name, dl_headers = res[0], res[1], dict(res[2] or {})
+            active_proxy = dl_headers.pop("_active_proxy", None) or active_proxy
             if not final_name or final_name.startswith("video_download_"):
                 final_name = resolved_name or final_name
         except Exception as exc:
-            if not active_proxy:
-                progress.log(f"[doodstream] Datacenter IP challenged ({exc}); activating proxy to resolve fresh token...")
-                active_proxy = await self._ensure_tor_proxy(progress)
-                if active_proxy:
-                    try:
-                        resolved_url, resolved_name, dl_headers = await self._resolve_doodstream(url, file_ref, progress, proxy=active_proxy)
-                        if not final_name or final_name.startswith("video_download_"):
-                            final_name = resolved_name or final_name
-                    except Exception as proxy_exc:
-                        progress.log(f"[doodstream] Notice: Proxy resolution error ({proxy_exc}), trying direct URL...")
-                        if "referer" not in {k.lower() for k in dl_headers}:
-                            dl_headers["Referer"] = "https://playmogo.com/"
-                else:
-                    if "referer" not in {k.lower() for k in dl_headers}:
-                        dl_headers["Referer"] = "https://playmogo.com/"
-            else:
-                progress.log(f"[doodstream] Notice: Resolution error ({exc}), trying direct URL...")
-                if "referer" not in {k.lower() for k in dl_headers}:
-                    dl_headers["Referer"] = "https://playmogo.com/"
+            # Fail-fast ("tự dừng"): never fall back to downloading a browser-captured cloudatacdn URL
+            # because its token is bound to the user's home IP and will always return 14B "error_wrong_ip".
+            if "cloudatacdn.com" in url.lower() or "/e/" in url.lower() or "archivebate.com" in url.lower():
+                raise ProviderFailure(
+                    "DOWNLOAD_FAILED",
+                    f"[IP-Guard] Stopped direct download of IP-bound DoodStream link because fresh token resolution failed ({exc}).",
+                )
+            progress.log(f"[doodstream] Notice: Resolution error ({exc}), trying direct URL...")
+            if "referer" not in {k.lower() for k in dl_headers}:
+                dl_headers["Referer"] = "https://playmogo.com/"
 
-        progress.log(f"Downloading DoodStream via aria2c (16 connections)...")
+        progress.log("Downloading DoodStream media...")
         try:
-            downloaded = await self._download_aria2(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=active_proxy)
+            if active_proxy:
+                downloaded = await self._download_aria2(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=active_proxy)
+            else:
+                downloaded = await self._download_aria2(resolved_url, dest_dir, final_name, progress, headers=dl_headers)
             self._validate_downloaded_files(downloaded)
             return downloaded
         except Exception as exc:
+            # If the resolved token reported error_wrong_ip, rotate to a fresh isolated Tor circuit and re-resolve once
+            if self._is_ip_bound_token_error(str(exc)):
+                base_tor = await self._ensure_tor_proxy(progress)
+                if base_tor:
+                    fresh_circuit = self._isolated_proxy(base_tor, uuid.uuid4().hex[:8])
+                    progress.log("[IP-Guard] Token IP mismatch detected; rotating isolated proxy circuit and re-resolving token...")
+                    res = await self._resolve_doodstream(url, file_ref, progress, proxy=fresh_circuit)
+                    resolved_url, resolved_name, dl_headers = res[0], res[1], dict(res[2] or {})
+                    active_proxy = dl_headers.pop("_active_proxy", None) or fresh_circuit
+                    downloaded = await self._download_http_stream(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=active_proxy)
+                    self._validate_downloaded_files(downloaded)
+                    return downloaded
+                raise
             progress.log(f"aria2c failed ({exc}); falling back to HTTP stream downloader...")
             downloaded = await self._download_http_stream(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=active_proxy)
             self._validate_downloaded_files(downloaded)
             return downloaded
+
+    async def _resolve_universal_page(
+        self,
+        url: str,
+        file_ref: dict[str, Any],
+        progress: JobState,
+        proxy: str | None = None,
+    ) -> tuple[str, str | None, dict[str, str]]:
+        """Universal webpage/embed resolver for any video or file hosting website when direct CDN links are IP-blocked."""
+        headers = dict(file_ref.get("headers") or (file_ref.get("meta") or {}).get("headers") or {})
+        cookies = str(file_ref.get("cookies") or (file_ref.get("meta") or {}).get("cookies") or "").strip()
+        page_url = str(file_ref.get("page_url") or (file_ref.get("meta") or {}).get("page_url") or "").strip()
+        referer = str(headers.get("Referer") or headers.get("referer") or "").strip()
+
+        target_page = page_url
+        if not target_page and referer.startswith(("http://", "https://")) and referer.rstrip("/").count("/") >= 3:
+            target_page = referer
+        if not target_page:
+            raise ProviderFailure("DOWNLOAD_FAILED", "No canonical page_url or embed Referer available for universal page resolution")
+
+        req_headers = {
+            "User-Agent": str(headers.get("User-Agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        if cookies:
+            req_headers["Cookie"] = cookies
+
+        progress.log(f"[IP-Guard] Resolving fresh stream/file token from page: {target_page[:80]}...")
+        _, page_html, final_page_url, active_proxy = await self._fetch_webpage(
+            target_page, req_headers, progress, proxy=proxy, auto_proxy=True,
+        )
+
+        # Follow player iframe if the canonical page embeds an external video host
+        active_html = page_html
+        active_url = final_page_url
+        for m_iframe in re.finditer(r'<iframe[^>]+src=[\x22\x27]([^\x22\x27]+)[\x22\x27]', page_html, re.I):
+            iframe_src = m_iframe.group(1).strip()
+            if iframe_src.startswith("//"):
+                iframe_src = "https:" + iframe_src
+            if iframe_src.startswith(("http://", "https://")) and not any(
+                ad in iframe_src.lower() for ad in ("google", "doubleclick", "exoclick", "juicyads", "magsrv", "recaptcha", "turnstile")
+            ):
+                iframe_headers = dict(req_headers)
+                iframe_headers["Referer"] = final_page_url
+                progress.log(f"[IP-Guard] Following embedded player iframe: {iframe_src[:80]}...")
+                _, iframe_html, final_iframe_url, active_proxy = await self._fetch_webpage(
+                    iframe_src, iframe_headers, progress, proxy=active_proxy, auto_proxy=True,
+                )
+                if iframe_html.strip():
+                    active_html = iframe_html
+                    active_url = final_iframe_url
+                    break
+
+        parsed_active = urlparse(active_url)
+        active_domain = f"{parsed_active.scheme}://{parsed_active.netloc}"
+        unpacked = self._unpack_dean_edwards(active_html)
+        combined_text = f"{unpacked}\n{active_html}" if unpacked else active_html
+
+        dl_headers: dict[str, str] = {
+            "User-Agent": req_headers["User-Agent"],
+            "Referer": f"{active_domain}/",
+            "Origin": active_domain,
+        }
+        if active_proxy:
+            dl_headers["_active_proxy"] = active_proxy
+
+        # 1. Check /pass_md5/ pattern (DoodStream and all clone hosts)
+        m_pass = re.search(r'/pass_md5/([^\x22\x27\s<>]+)', combined_text)
+        if m_pass:
+            pass_path = m_pass.group(0)
+            token = pass_path.rstrip("/").split("/")[-1]
+            pass_url = f"{active_domain}{pass_path}"
+            pass_headers = dict(req_headers)
+            pass_headers["Referer"] = active_url
+            _, pass_body, _, active_proxy = await self._fetch_webpage(
+                pass_url, pass_headers, progress, proxy=active_proxy, auto_proxy=False,
+            )
+            cdn_base = pass_body.strip()
+            if cdn_base.startswith("http"):
+                chars = string.ascii_letters + string.digits
+                rand_str = ''.join(random.choices(chars, k=10))
+                resolved_url = f"{cdn_base}{rand_str}?token={token}&expiry={int(time.time() * 1000)}"
+                if active_proxy:
+                    dl_headers["_active_proxy"] = active_proxy
+                return resolved_url, file_ref.get("name"), dl_headers
+
+        # 2. Check MDCore.wurl pattern (MixDrop / MxDrop clones)
+        m_wurl = re.search(r'MDCore\.wurl\s*=\s*[\x22\x27]([^\x22\x27]+)[\x22\x27]', combined_text)
+        if m_wurl:
+            wurl = m_wurl.group(1).strip()
+            if wurl.startswith("//"):
+                wurl = "https:" + wurl
+            if wurl.startswith("http"):
+                return wurl, file_ref.get("name"), dl_headers
+
+        # 3. Check HLS (.m3u8) or direct media (.mp4/.mkv/.webm) in unpacked JS / player config
+        media_patterns = (
+            r'(?:file|src|source|hls|mp4)\s*[:=]\s*[\x22\x27](https?://[^\x22\x27\s<>]+?\.(?:m3u8|mpd|mp4|mkv|webm)[^\x22\x27\s<>]*)[\x22\x27]',
+            r'[\x22\x27](https?://[^\x22\x27\s<>\\]+?\.(?:m3u8|mpd|mp4|mkv|webm)(?:\?[^\x22\x27\s<>\\]*)?)[\x22\x27]',
+        )
+        for pat in media_patterns:
+            for m_media in re.finditer(pat, combined_text, re.I):
+                candidate = html.unescape(m_media.group(1).replace(r"\/", "/")).strip()
+                low_cand = candidate.lower()
+                if any(skip in low_cand for skip in ("preview", "thumb", "sprite", ".vtt", ".srt", ".jpg", ".png")):
+                    continue
+                progress.log(f"[IP-Guard] Extracted fresh media URL from page: {candidate[:80]}...")
+                return candidate, file_ref.get("name"), dl_headers
+
+        raise ProviderFailure("DOWNLOAD_FAILED", f"Could not extract fresh media stream from {active_url}")
+
+    async def _download_universal_page(
+        self,
+        url: str,
+        dest_dir: Path,
+        name: str | None,
+        progress: JobState,
+        file_ref: dict[str, Any],
+        proxy: str | None = None,
+    ) -> list[Path]:
+        res = await self._resolve_universal_page(url, file_ref, progress, proxy=proxy)
+        resolved_url, resolved_name, dl_headers = res[0], res[1], dict(res[2] or {})
+        active_proxy = dl_headers.pop("_active_proxy", None) or proxy
+        final_name = name or resolved_name
+        cookies = str(file_ref.get("cookies") or (file_ref.get("meta") or {}).get("cookies") or "").strip()
+        if ".m3u8" in resolved_url.lower() or ".mpd" in resolved_url.lower():
+            downloaded = await self._download_stream_nm3u8dl(
+                resolved_url, dest_dir, final_name, progress,
+                headers=dl_headers, cookies=cookies, proxy=active_proxy,
+            )
+        else:
+            downloaded = await self._download_aria2(
+                resolved_url, dest_dir, final_name, progress,
+                headers=dl_headers, proxy=active_proxy, cookies=cookies,
+            )
+        self._validate_downloaded_files(downloaded)
+        return downloaded
 
     async def _dispatch_download(
         self, link_type: str, is_stream: bool, url: str, urls: list[str],
@@ -1410,6 +1709,9 @@ class LinksProvider(BaseProvider):
                     except TypeError:
                         return await self._download_aria2(urls, dest_dir, name, progress)
             except Exception as exc:
+                if isinstance(exc, ProviderFailure) and self._is_ip_bound_token_error(exc.message):
+                    progress.log(f"[IP-Guard] Stopped direct HTTP fallback because URL token is IP-bound or expired ({exc.message}).")
+                    raise
                 progress.log(f"aria2c failed ({exc}); falling back to browser-compatible HTTP stream downloader...")
                 return await self._download_http_stream(urls, dest_dir, name, progress, headers=headers, proxy=proxy, cookies=cookies)
 
@@ -1478,6 +1780,7 @@ class LinksProvider(BaseProvider):
         )
 
         # Check token expiration timestamp in stream/direct URL
+        exp_val = None
         try:
             parsed_url = urlparse(url)
             parsed_query = parse_qs(parsed_url.query)
@@ -1510,11 +1813,9 @@ class LinksProvider(BaseProvider):
             msg = str(exc.message).lower()
             is_blocked = (
                 exc.code in ("DOWNLOAD_FAILED",)
-                and any(err in msg for err in (
-                    "403", "forbidden", "429", "blocked", "file not found",
-                    "error response", "error_wrong_ip", "error instead of file", "error payload"
-                ))
+                and self._is_ip_or_captcha_blocked(msg)
             )
+            is_token_ip_bound = self._is_ip_bound_token_error(msg)
 
             # Fallback DoodStream: If not already tried as doodstream and indicators exist
             if not downloaded and link_type != "doodstream":
@@ -1529,8 +1830,25 @@ class LinksProvider(BaseProvider):
                         progress.log(f"[Fallback] DoodStream resolver failed: {dood_exc}")
                         downloaded = None
 
-            # Fallback 1: If stream failed and we have canonical page_url, retry with yt-dlp
-            # (skip yt-dlp for archivebate/playmogo/dooood as yt-dlp does not support them)
+            # Universal Page/Embed Resolver: For ANY website with a canonical page_url or embed Referer when blocked/IP-bound
+            if (
+                not downloaded
+                and is_blocked
+                and link_type not in ("doodstream", "mxdrop", "torrent", "gofile_page")
+                and page_url
+                and page_url != url
+                and page_url.startswith(("http://", "https://"))
+            ):
+                progress.log(f"[IP-Guard] Direct link blocked/IP-bound; resolving fresh token from webpage: {page_url[:80]}...")
+                try:
+                    downloaded = await self._download_universal_page(
+                        url, dest_dir, name, progress, file_ref,
+                    )
+                except Exception as univ_exc:
+                    progress.log(f"[IP-Guard] Universal page resolver notice: {univ_exc}")
+                    downloaded = None
+
+            # Fallback 1: If stream/direct failed and we have canonical page_url, retry with yt-dlp (and auto-proxy if yt-dlp is IP-blocked)
             if (
                 not downloaded
                 and link_type != "doodstream"
@@ -1542,15 +1860,25 @@ class LinksProvider(BaseProvider):
                 clean_page_url = page_url
                 if "pornhub.com" in clean_page_url:
                     clean_page_url = re.sub(r'https?://[a-zA-Z0-9_-]+\.pornhub\.com', 'https://www.pornhub.com', clean_page_url)
-                progress.log(f"[Fallback] Stream download failed. Retrying download from canonical page URL with yt-dlp: {clean_page_url[:80]}...")
+                progress.log(f"[Fallback] Retrying download from canonical page URL with yt-dlp: {clean_page_url[:80]}...")
                 try:
                     downloaded = await self._download_ytdlp(
                         clean_page_url, dest_dir, name, progress,
                         headers=None, cookies=cookies,
                     )
                 except Exception as page_exc:
-                    progress.log(f"[Fallback] Page URL download failed: {page_exc}")
-                    downloaded = None
+                    progress.log(f"[Fallback] Page URL yt-dlp failed ({page_exc}); checking proxy fallback...")
+                    if "pornhub.com" not in clean_page_url:
+                        tor_px = await self._ensure_tor_proxy(progress)
+                        if tor_px:
+                            try:
+                                downloaded = await self._download_ytdlp(
+                                    clean_page_url, dest_dir, name, progress,
+                                    headers=None, cookies=cookies, proxy=self._isolated_proxy(tor_px, uuid.uuid4().hex[:8]),
+                                )
+                            except Exception as ytdlp_px_exc:
+                                progress.log(f"[Fallback] Page URL yt-dlp via proxy failed: {ytdlp_px_exc}")
+                                downloaded = None
 
             # Check if failure was caused by an expired token (HTTP 410 Gone)
             if not downloaded and exp_val and str(exp_val).isdigit():
@@ -1566,23 +1894,28 @@ class LinksProvider(BaseProvider):
                     )
 
             # Fallback 2: If still blocked and not downloaded, retry with SOCKS5 Proxy
-            # (skip Tor for pornhub as Cloudflare blocks Tor exit nodes)
+            # Fail-fast ("tự dừng"): If a raw direct/stream URL failed with an IP-bound token error (like error_wrong_ip)
+            # and has no page resolver, retrying the same browser-bound URL via a Tor exit IP will also fail with wrong_ip.
             if not downloaded and is_blocked and "pornhub.com" not in url and "pornhub.com" not in (page_url or ""):
-                progress.log(f"[Proxy] Download blocked ({exc.message}). Activating TCP SOCKS5 proxy and retrying...")
-                proxy = await self._ensure_tor_proxy(progress)
-                if proxy:
-                    progress.log(f"[Proxy] Retrying via {proxy}...")
-                    try:
-                        downloaded = await self._dispatch_download(
-                            link_type, is_stream, url, urls, dest_dir, name, progress,
-                            headers=headers, cookies=cookies, dec_key=dec_key, file_ref=file_ref, proxy=proxy,
-                            page_url=page_url,
-                        )
-                    except Exception as stream_proxy_exc:
-                        progress.log(f"[Proxy] Retry via proxy failed: {stream_proxy_exc}")
-                        downloaded = None
+                if is_token_ip_bound and link_type in ("direct", "stream", "doodstream", "mxdrop"):
+                    progress.log("[IP-Guard] Stopped redundant proxy retry on raw IP-bound token URL.")
                 else:
-                    progress.log("[Proxy] Proxy unavailable.")
+                    progress.log(f"[Proxy] Download blocked ({exc.message}). Activating TCP SOCKS5 proxy and retrying...")
+                    base_proxy = await self._ensure_tor_proxy(progress)
+                    if base_proxy:
+                        proxy = self._isolated_proxy(base_proxy, uuid.uuid4().hex[:8])
+                        progress.log(f"[Proxy] Retrying via isolated circuit {proxy}...")
+                        try:
+                            downloaded = await self._dispatch_download(
+                                link_type, is_stream, url, urls, dest_dir, name, progress,
+                                headers=headers, cookies=cookies, dec_key=dec_key, file_ref=file_ref, proxy=proxy,
+                                page_url=page_url,
+                            )
+                        except Exception as stream_proxy_exc:
+                            progress.log(f"[Proxy] Retry via proxy failed: {stream_proxy_exc}")
+                            downloaded = None
+                    else:
+                        progress.log("[Proxy] Proxy unavailable.")
 
             if not downloaded:
                 raise exc
@@ -1598,3 +1931,4 @@ class LinksProvider(BaseProvider):
 
     async def upload_file(self, credentials: dict[str, Any], local_path: Path, target_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:
         raise ProviderFailure("NOT_SUPPORTED", "Links provider does not support upload")
+

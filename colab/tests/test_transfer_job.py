@@ -4007,4 +4007,133 @@ def test_doodstream_download_flow(tmp_path, monkeypatch):
     assert seen["dl_headers"]["Referer"] == "https://playmogo.com/"
 
 
+def test_stream_download_14b_error_wrong_ip_does_not_pollute_progress_bytes(tmp_path, monkeypatch):
+    from src.providers.base import stream_download, ProviderFailure
+
+    class Stream:
+        status_code = 200
+        headers = {"content-length": "14", "content-type": "text/plain"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_bytes(self, size):
+            yield b"error_wrong_ip"
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, headers):
+            return Stream()
+
+    monkeypatch.setattr(base_mod.httpx, "AsyncClient", Client)
+    job = JobState("wrong-ip-14b", {})
+    job.start_file("video.mp4", phase="download", size=40 * 1024 * 1024)
+    dest = tmp_path / "video.mp4"
+    try:
+        asyncio.run(stream_download("https://cdn.example.test/video.mp4", dest, job))
+        raise AssertionError("Expected ProviderFailure on 14B error_wrong_ip")
+    except ProviderFailure as exc:
+        assert exc.code == "DOWNLOAD_FAILED"
+        assert "error_wrong_ip" in exc.message
+    assert job.bytes_done == 0
+    assert job.active_files["video.mp4"]["bytes_done"] == 0
+
+
+def test_fail_fast_stops_redundant_retries_on_ip_bound_token(tmp_path, monkeypatch):
+    from src.providers.links import LinksProvider
+    provider = LinksProvider()
+    calls = {"aria2": 0, "http_stream": 0, "proxy": 0}
+
+    async def no_deps():
+        return None
+
+    async def fail_aria2(*args, **kwargs):
+        calls["aria2"] += 1
+        raise ProviderFailure("DOWNLOAD_FAILED", "Server returned error response instead of file (14B): error_wrong_ip")
+
+    async def fail_http(*args, **kwargs):
+        calls["http_stream"] += 1
+        raise AssertionError("Should not fall back to HTTP stream on IP-bound token error")
+
+    async def fake_tor(*args, **kwargs):
+        calls["proxy"] += 1
+        return "socks5://127.0.0.1:9050"
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr(provider, "_download_aria2", fail_aria2)
+    monkeypatch.setattr(provider, "_download_http_stream", fail_http)
+    monkeypatch.setattr(provider, "_ensure_tor_proxy", fake_tor)
+
+    try:
+        asyncio.run(provider.download_file(
+            {},
+            {"url": "https://cdn.anyhost.test/raw/clip.mp4?token=bound_to_home_ip", "name": "clip.mp4"},
+            tmp_path,
+            JobState("fail-fast-ip", {}),
+        ))
+        raise AssertionError("Expected ProviderFailure")
+    except ProviderFailure as exc:
+        assert "error_wrong_ip" in exc.message
+
+    assert calls["aria2"] == 1
+    assert calls["http_stream"] == 0
+    assert calls["proxy"] == 0
+
+
+def test_universal_page_resolver_and_circuit_isolated_proxy_for_any_website(tmp_path, monkeypatch):
+    from src.providers.links import LinksProvider
+    provider = LinksProvider()
+    seen = {}
+
+    async def no_deps():
+        return None
+
+    async def fake_fetch_webpage(target_url, req_headers, progress, proxy=None, auto_proxy=True):
+        circuit_px = proxy or "socks5://vb_test1234:pass@127.0.0.1:9050"
+        if "watch-site.example" in target_url:
+            return 200, '<iframe src="https://embed-host.example/e/vid999"></iframe>', target_url, circuit_px
+        return 200, '<script>var player = {file: "https://cdn-edge.example/stream/fresh_colab_token.mp4?token=ok"};</script>', target_url, circuit_px
+
+    async def fake_aria2(url, dest_dir, name, progress, headers=None, proxy=None, cookies=None):
+        if "old_browser_token" in str(url):
+            raise ProviderFailure("DOWNLOAD_FAILED", "Server returned error response instead of file (14B): error_wrong_ip")
+        seen["resolved_url"] = url
+        seen["proxy"] = proxy
+        seen["referer"] = (headers or {}).get("Referer")
+        out = dest_dir / (name or "video.mp4")
+        out.write_bytes(b"V" * 2048)
+        return [out]
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr(provider, "_fetch_webpage", fake_fetch_webpage)
+    monkeypatch.setattr(provider, "_download_aria2", fake_aria2)
+
+    payload = {
+        "url": "https://cdn-edge.example/stream/old_browser_token.mp4?token=expired",
+        "name": "universal-video.mp4",
+        "size": 2048,
+        "page_url": "https://watch-site.example/videos/999",
+    }
+    out = asyncio.run(provider.download_file({}, payload, tmp_path, JobState("universal-resolve", {})))
+    assert out.name == "universal-video.mp4"
+    assert out.stat().st_size == 2048
+    assert seen["resolved_url"] == "https://cdn-edge.example/stream/fresh_colab_token.mp4?token=ok"
+    assert seen["proxy"] == "socks5://vb_test1234:pass@127.0.0.1:9050"
+    assert seen["referer"] == "https://embed-host.example/"
+
+
 
