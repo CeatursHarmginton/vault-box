@@ -206,7 +206,7 @@ async def run_transfer(job: JobState) -> None:
                 job.log("No image files found for optimization, skipping confirmation.")
                 
             job.set(status="running", step="uploading")
-        if options.get("set_video_thumbnail", True):
+        if options.get("set_video_thumbnail", True) or options.get("trim_intro", False):
             try:
                 from ..utils.video_thumbnail import process_video_thumbnails
                 outputs = await asyncio.to_thread(

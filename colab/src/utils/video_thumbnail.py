@@ -236,6 +236,61 @@ def embed_thumbnail(video_path: Path, thumb_path: Path, progress: JobState | Non
                 pass
 
 
+def trim_video_intro(
+    video_path: Path,
+    trim_seconds: float = 8.0,
+    progress: JobState | None = None,
+) -> bool:
+    """
+    Losslessly trim the first N seconds (intro/bumper/logo) of a video file using ffmpeg -c copy.
+    Runs in milliseconds without re-encoding.
+    """
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        return False
+
+    suffix = video_path.suffix.lower()
+    if suffix not in (".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".ts"):
+        return False
+
+    temp_dir = video_path.parent
+    temp_out = temp_dir / f".trim_{os.getpid()}_{video_path.name}"
+
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{trim_seconds:.2f}",
+            "-i", str(video_path),
+            "-map", "0:v:0",
+            "-map", "0:a?",
+            "-map", "0:s?",
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+        ]
+        if suffix in (".mp4", ".m4v", ".mov"):
+            cmd.extend(["-movflags", "+faststart"])
+        cmd.append(str(temp_out))
+
+        res = subprocess.run(cmd, capture_output=True, timeout=180)
+        if res.returncode == 0 and temp_out.exists() and temp_out.stat().st_size > 0:
+            os.replace(str(temp_out), str(video_path))
+            return True
+        else:
+            if progress:
+                err_snippet = (res.stderr.decode("utf-8", errors="ignore") if res.stderr else "")[-300:]
+                progress.log(f"[Intro] ffmpeg trim warning: {err_snippet.strip()}")
+            return False
+    except Exception as exc:
+        if progress:
+            progress.log(f"[Intro] trim failed for {video_path.name}: {exc}")
+        return False
+    finally:
+        if temp_out.exists():
+            try:
+                temp_out.unlink()
+            except Exception:
+                pass
+
+
 def prepend_cover_frame(
     video_path: Path,
     thumb_path: Path,
@@ -374,18 +429,18 @@ def process_video_thumbnails(
 ) -> list[Path]:
     """
     Process downloaded files:
-    For each video, extracts a representative deep frame at configured percentage (default 20%),
-    embeds it into the container as attached_pic (for MP4/MKV/MOV/M4V), and caches thumbnail
-    bytes for cloud upload metadata (e.g. Google Drive contentHints).
-    Optionally prepends 0.5s of the frame to the video stream to force Google Drive's web preview.
-    Runs fast with zero re-encoding (-c copy).
+    1. Optionally trims intro/bumper (e.g. first 8s) if trim_intro option is True.
+    2. For each video, extracts a representative deep frame at configured percentage (default 20%),
+       embeds it into the container as attached_pic (for MP4/MKV/MOV/M4V), and caches thumbnail
+       bytes for cloud upload metadata (e.g. Google Drive contentHints).
+    3. Runs fast with zero re-encoding (-c copy).
     """
-    if not options.get("set_video_thumbnail", True):
+    if not options.get("set_video_thumbnail", True) and not options.get("trim_intro", False):
         return files
 
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         if progress:
-            progress.log("[Thumbnail] ffmpeg/ffprobe not found; skipping video thumbnailing.")
+            progress.log("[Thumbnail] ffmpeg/ffprobe not found; skipping video processing.")
         return files
 
     supported_exts = {".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".ts"}
@@ -395,7 +450,7 @@ def process_video_thumbnails(
         return files
 
     if progress:
-        progress.log(f"[Thumbnail] Auto-generating deep-frame thumbnails for {len(video_files)} video file(s)...")
+        progress.log(f"[Thumbnail] Processing {len(video_files)} video file(s)...")
 
     with tempfile.TemporaryDirectory(prefix="vb_thumb_") as tmp_dir_str:
         tmp_dir = Path(tmp_dir_str)
@@ -413,6 +468,28 @@ def process_video_thumbnails(
                     continue
                 duration = float(duration_str)
                 if duration < 3.0:
+                    continue
+
+                # 1. Optionally trim intro if enabled
+                if options.get("trim_intro", False):
+                    try:
+                        trim_sec = float(options.get("trim_intro_sec", 8.0))
+                    except (ValueError, TypeError):
+                        trim_sec = 8.0
+                    if trim_sec > 0 and duration > trim_sec + 5.0:
+                        trimmed = trim_video_intro(video_path, trim_sec, progress)
+                        if trimmed:
+                            if progress:
+                                progress.log(f"[Intro] Cut {trim_sec:.1f}s intro from {video_path.name}")
+                            # Re-probe duration after trimming
+                            probe = probe_video(video_path)
+                            if probe:
+                                duration_str = (probe.get("format") or {}).get("duration")
+                                if duration_str:
+                                    duration = float(duration_str)
+
+                # Skip thumbnailing if user explicitly disabled set_video_thumbnail
+                if not options.get("set_video_thumbnail", True):
                     continue
 
                 thumb_file = tmp_dir / f"thumb_{idx}.jpg"
