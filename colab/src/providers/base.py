@@ -185,20 +185,28 @@ class BaseProvider(ABC):
                 return []
             async with sem:
                 dest = local_dir / _safe_name(item.get("name") or item.get("server_filename") or item.get("id") or "file")
+                file_sz = int(item.get("size") or 0)
+                progress.start_file(dest.name, phase="download", size=file_sz)
                 try:
                     path = await download_with_retry(
                         lambda: self.download_file(credentials, item, dest, progress),
                         progress=progress, label=dest.name,
                     )
+                    actual_sz = path.stat().st_size if (path and path.exists()) else file_sz
+                    progress.finish_file(dest.name, phase="download", size=actual_sz)
                     _remember_source_ref(progress, path, item)
                     return [path]
                 except ProviderFailure as exc:
+                    progress.finish_file(dest.name, phase="download")
                     # One unfetchable file must not sink the whole folder: record it and let the
                     # rest through. The folder then stays in the queue (see JobState.failed_items).
                     if not is_skippable_download_failure(exc):
                         raise
                     progress.fail_file(dest.name, exc.code, exc.message)
                     return []
+                except Exception:
+                    progress.finish_file(dest.name, phase="download")
+                    raise
 
         try:
             return [path for batch in await asyncio.gather(*(save(item) for item in items)) for path in batch]
@@ -223,16 +231,25 @@ class BaseProvider(ABC):
             progress.check_cancelled()
             async with sem:
                 rel = "/".join(part for part in (str(root_target.get("relative_path") or "").strip("/"), path.relative_to(local_dir).as_posix()) if part)
+                file_sz = path.stat().st_size if path.exists() else 0
+                progress.start_file(path.name, phase="upload", size=file_sz)
                 try:
                     res = await self.upload_file(credentials, path, {**root_target, "relative_path": rel}, progress)
                     progress.files_uploaded += 1
+                    progress.finish_file(path.name, phase="upload", size=file_sz)
+                    progress.finish_item(path.name, status="done", name=path.name)
                     progress.log(f"[{progress.files_uploaded + progress.files_skipped}/{progress.files_to_upload}] Uploaded: {path.name}")
                     return res
                 except ProviderFailure as exc:
+                    progress.finish_file(path.name, phase="upload")
                     if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
                         progress.files_skipped += 1
+                        progress.finish_item(path.name, status="skipped", name=path.name)
                         progress.log(f"[{progress.files_uploaded + progress.files_skipped}/{progress.files_to_upload}] Skipped: {path.name}")
                         return None
+                    raise
+                except Exception:
+                    progress.finish_file(path.name, phase="upload")
                     raise
 
         results = await asyncio.gather(*(upload(path) for path in paths))

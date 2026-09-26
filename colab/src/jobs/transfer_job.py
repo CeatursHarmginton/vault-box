@@ -83,6 +83,10 @@ async def run_transfer(job: JobState) -> None:
             async with sem:
                 job.check_cancelled()
                 item_name = _item_name(item)
+                item_size = _item_size(item)
+                item_k = _queue_item_key(source, item)
+                job.start_file(item_name, phase="download", size=item_size)
+                job.start_item(item_k, name=item_name)
                 item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
                 item_src = PROVIDERS.get(item_prov, src)
                 item_creds = item.get("credentials") or source.get("credentials") or {}
@@ -91,15 +95,23 @@ async def run_transfer(job: JobState) -> None:
                         lambda: item_src.download_file(item_creds, item, dirs["input"], job),
                         progress=job, label=item_name,
                     )
+                    actual_size = path.stat().st_size if (path and path.exists()) else item_size
+                    job.finish_file(item_name, phase="download", size=actual_size)
+                    if item_k != item_name:
+                        job.file_sizes[item_k] = actual_size
                     job.files_downloaded += 1
                     job.log(f"[{job.files_downloaded}/{job.files_to_download or len(file_items)}] Downloaded: {item_name}")
                     _remember_source_ref(job, path, item)
                     return [path]
                 except ProviderFailure as exc:
+                    job.finish_file(item_name, phase="download")
                     if not is_skippable_download_failure(exc):
                         raise
                     _mark_item_skipped(job, source, item, exc.message)
                     return []
+                except Exception:
+                    job.finish_file(item_name, phase="download")
+                    raise
 
         for item in source.get("items") or []:
             job.check_cancelled()
@@ -526,12 +538,25 @@ async def _download_batch_item(job: JobState, source: dict[str, Any], src: Any, 
         folder_dir.mkdir(parents=True, exist_ok=True)
         return await item_src.download_folder(item_creds, item, folder_dir, job)
     job.files_to_download += 1
-    path = await download_with_retry(
-        lambda: item_src.download_file(item_creds, item, batch_input, job),
-        progress=job, label=_item_name(item),
-    )
-    _remember_source_ref(job, path, item)
-    return [path]
+    item_name = _item_name(item)
+    item_size = _item_size(item)
+    item_k = _queue_item_key(source, item)
+    job.start_file(item_name, phase="download", size=item_size)
+    job.start_item(item_k, name=item_name)
+    try:
+        path = await download_with_retry(
+            lambda: item_src.download_file(item_creds, item, batch_input, job),
+            progress=job, label=item_name,
+        )
+        actual_size = path.stat().st_size if (path and path.exists()) else item_size
+        job.finish_file(item_name, phase="download", size=actual_size)
+        if item_k != item_name:
+            job.file_sizes[item_k] = actual_size
+        _remember_source_ref(job, path, item)
+        return [path]
+    except Exception:
+        job.finish_file(item_name, phase="download")
+        raise
 
 def _download_batches(items: list[dict[str, Any]], root: Path, options: dict[str, Any], job: JobState) -> list[list[dict[str, Any]]]:
     budget = _download_budget(root, options)
@@ -720,7 +745,15 @@ async def _upload_outputs(job: JobState, target: dict[str, Any], options: dict[s
         job.files_to_upload += 1
         job._upload_log_done = 0
         job._upload_log_total = 1
-        await _upload_path_with_retry(job, target, options, dst, files[0], files[0].name, item)
+        f0_sz = files[0].stat().st_size if files[0].exists() else 0
+        job.start_file(files[0].name, phase="upload", size=f0_sz)
+        try:
+            await _upload_path_with_retry(job, target, options, dst, files[0], files[0].name, item)
+            job.finish_file(files[0].name, phase="upload", size=f0_sz)
+            job.finish_item(files[0].name, status="done", name=files[0].name)
+        except Exception:
+            job.finish_file(files[0].name, phase="upload")
+            raise
         return
     job.files_to_upload += len(files)
     job._upload_log_done = 0
@@ -735,7 +768,15 @@ async def _upload_outputs(job: JobState, target: dict[str, Any], options: dict[s
             if gate.abort is not None:
                 return
             rel = path.relative_to(upload_root).as_posix()
-            await _upload_path_with_retry(job, target, options, dst, path, rel, item, gate)
+            file_sz = path.stat().st_size if path.exists() else 0
+            job.start_file(path.name, phase="upload", size=file_sz)
+            try:
+                await _upload_path_with_retry(job, target, options, dst, path, rel, item, gate)
+                job.finish_file(path.name, phase="upload", size=file_sz)
+                job.finish_item(path.name, status="done", name=path.name)
+            except Exception:
+                job.finish_file(path.name, phase="upload")
+                raise
 
     results = await asyncio.gather(*(one(p) for p in sorted(files)), return_exceptions=True)
     if gate.abort is not None:
@@ -829,32 +870,42 @@ async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options
                 raise
 
 async def _upload_one_with_retry(job: JobState, target: dict[str, Any], options: dict[str, Any], dst: Any, path: Path) -> dict[str, Any]:
-    while True:
-        try:
-            source = (job.payload.get("source") or {}).get("items") or []
-            source_ref = {**source[0], "name": path.name} if source and options.get("replace") and hasattr(dst, "replace_file") else None
-            result = await (dst.replace_file(target.get("credentials") or {}, path, source_ref, job) if source_ref else dst.upload_file(target.get("credentials") or {}, path, _upload_target(target.get("folder") or {}, path.name, options), job))
-            job.files_uploaded = 1
-            job.error = None
-            job.log(f"[1/1] Uploaded: {path.name}")
-            return result
-        except ProviderFailure as exc:
-            if _is_rename_failure(exc):
+    file_sz = path.stat().st_size if path.exists() else 0
+    job.start_file(path.name, phase="upload", size=file_sz)
+    try:
+        while True:
+            try:
                 source = (job.payload.get("source") or {}).get("items") or []
-                if source:
-                    _mark_item_skipped(job, job.payload.get("source") or {}, source[0], exc.message)
-                job.files_skipped = 1
-                job.log(f"[1/1] Skipped (rename failed): {path.name}")
-                return {"ok": True, "uploaded": 0, "skipped": 1, "items": []}
-            if _fallback_auto_upload_new_to_replace(job, options, exc):
-                continue
-            if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
-                job.files_skipped = 1
-                job.log(f"[1/1] Skipped (duplicate): {path.name}")
-                return {"ok": True, "uploaded": 0, "skipped": 1, "items": []}
-            if exc.code != "UPLOAD_FAILED":
-                raise
-            await _wait_for_retry_account(job, target, exc)
+                source_ref = {**source[0], "name": path.name} if source and options.get("replace") and hasattr(dst, "replace_file") else None
+                result = await (dst.replace_file(target.get("credentials") or {}, path, source_ref, job) if source_ref else dst.upload_file(target.get("credentials") or {}, path, _upload_target(target.get("folder") or {}, path.name, options), job))
+                job.files_uploaded = 1
+                job.error = None
+                job.finish_file(path.name, phase="upload", size=file_sz)
+                job.log(f"[1/1] Uploaded: {path.name}")
+                return result
+            except ProviderFailure as exc:
+                if _is_rename_failure(exc):
+                    source = (job.payload.get("source") or {}).get("items") or []
+                    if source:
+                        _mark_item_skipped(job, job.payload.get("source") or {}, source[0], exc.message)
+                    job.files_skipped = 1
+                    job.finish_file(path.name, phase="upload")
+                    job.log(f"[1/1] Skipped (rename failed): {path.name}")
+                    return {"ok": True, "uploaded": 0, "skipped": 1, "items": []}
+                if _fallback_auto_upload_new_to_replace(job, options, exc):
+                    continue
+                if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
+                    job.files_skipped = 1
+                    job.finish_file(path.name, phase="upload")
+                    job.log(f"[1/1] Skipped (duplicate): {path.name}")
+                    return {"ok": True, "uploaded": 0, "skipped": 1, "items": []}
+                if exc.code != "UPLOAD_FAILED":
+                    job.finish_file(path.name, phase="upload")
+                    raise
+                await _wait_for_retry_account(job, target, exc)
+    except Exception:
+        job.finish_file(path.name, phase="upload")
+        raise
 
 async def _upload_outputs_with_retry(job: JobState, target: dict[str, Any], options: dict[str, Any], dst: Any, upload_root: Path, item: dict[str, Any]) -> None:
     while True:

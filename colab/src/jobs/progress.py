@@ -24,6 +24,10 @@ class JobState:
     step: str = "pending"
     progress: JobProgress = field(default_factory=JobProgress)
     current_file: str = ""
+    active_files: dict[str, dict[str, Any]] = field(default_factory=dict)
+    file_sizes: dict[str, int] = field(default_factory=dict)
+    downloaded_files: set[str] = field(default_factory=set)
+    uploaded_files: set[str] = field(default_factory=set)
     bytes_done: int = 0
     bytes_total: int = 0
     speed: float = 0
@@ -90,6 +94,56 @@ class JobState:
         self._last_item_end_time = now
         self.updated_at = now
 
+    def start_file(self, name: str, phase: str = "download", size: int = 0) -> None:
+        if not name:
+            return
+        now = time.time()
+        base_name = name.replace("\\", "/").rstrip("/").split("/")[-1]
+        self.current_file = base_name or name
+        file_info = {
+            "name": base_name or name,
+            "phase": phase,
+            "size": size,
+            "bytes_done": 0,
+            "started_at": now,
+        }
+        self.active_files[name] = file_info
+        if base_name and base_name != name:
+            self.active_files[base_name] = file_info
+        if size > 0:
+            self.file_sizes[name] = size
+            if base_name:
+                self.file_sizes[base_name] = size
+        self.updated_at = now
+
+    def finish_file(self, name: str, phase: str = "download", size: int = 0) -> None:
+        if not name:
+            return
+        now = time.time()
+        base_name = name.replace("\\", "/").rstrip("/").split("/")[-1]
+        self.active_files.pop(name, None)
+        if base_name:
+            self.active_files.pop(base_name, None)
+        if phase == "download":
+            self.downloaded_files.add(name)
+            if base_name:
+                self.downloaded_files.add(base_name)
+        elif phase == "upload":
+            self.uploaded_files.add(name)
+            if base_name:
+                self.uploaded_files.add(base_name)
+        if size > 0:
+            self.file_sizes[name] = size
+            if base_name:
+                self.file_sizes[base_name] = size
+        if self.current_file in (name, base_name):
+            if self.active_files:
+                first_active = next(iter(self.active_files.values()))
+                self.current_file = str(first_active.get("name") or next(iter(self.active_files.keys())))
+            else:
+                self.current_file = ""
+        self.updated_at = now
+
     def log(self, message: str) -> None:
         self.logs.append(message)
         self.logs = self.logs[-200:]
@@ -133,6 +187,14 @@ class JobState:
             self.bytes_total = self._phase_total
             setattr(self.progress, phase, min(100, self._phase_done / self._phase_total * 100))
             self._phase_total_by_name[phase] = self._phase_total
+        matched_key = total_key or self.current_file
+        if matched_key:
+            base_k = matched_key.replace("\\", "/").rstrip("/").split("/")[-1]
+            target_entry = self.active_files.get(matched_key) or self.active_files.get(base_k)
+            if target_entry:
+                target_entry["bytes_done"] = target_entry.get("bytes_done", 0) + n
+                if total > 0 and not target_entry.get("size"):
+                    target_entry["size"] = total
         now = time.time()
         elapsed = now - self._tick_at
         if elapsed >= 1:
@@ -193,6 +255,10 @@ class JobState:
             "progress": self.progress.__dict__,
             "phases": phases,
             "currentFile": self.current_file,
+            "activeFiles": self.active_files,
+            "fileSizes": self.file_sizes,
+            "downloadedFiles": list(self.downloaded_files),
+            "uploadedFiles": list(self.uploaded_files),
             "bytesDone": self._phase_done or self.bytes_done,
             "bytesTotal": self._phase_total or self.bytes_total,
             "bytesOverallDone": sum(self._phase_done_by_name.values()) or self.bytes_done,

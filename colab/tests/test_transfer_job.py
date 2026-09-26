@@ -3845,3 +3845,53 @@ def test_relay_monitor_swallows_dead_socket_and_stop_cancels_tasks():
 
     tasks = asyncio.run(scenario())
     assert tasks == {}
+
+
+class ActiveFilesTrackingTests(TestCase):
+    def test_active_files_and_sizes_lifecycle(self):
+        job = JobState("test-active-files", {"options": {}})
+        self.assertEqual(job.active_files, {})
+        self.assertEqual(job.file_sizes, {})
+        self.assertEqual(job.downloaded_files, set())
+        self.assertEqual(job.uploaded_files, set())
+
+        # Start downloading 2 files in parallel
+        job.start_file("vid1.mp4", phase="download", size=1000)
+        job.start_file("vid2.mp4", phase="download", size=2000)
+
+        self.assertIn("vid1.mp4", job.active_files)
+        self.assertIn("vid2.mp4", job.active_files)
+        self.assertEqual(job.active_files["vid1.mp4"]["phase"], "download")
+        self.assertEqual(job.file_sizes["vid1.mp4"], 1000)
+        self.assertEqual(job.file_sizes["vid2.mp4"], 2000)
+
+        # Stream bytes for vid1.mp4
+        job.add_bytes(500, total_key="vid1.mp4")
+        self.assertEqual(job.active_files["vid1.mp4"]["bytes_done"], 500)
+
+        # Finish vid1.mp4 download
+        job.finish_file("vid1.mp4", phase="download", size=1050)
+        self.assertNotIn("vid1.mp4", job.active_files)
+        self.assertIn("vid2.mp4", job.active_files)
+        self.assertIn("vid1.mp4", job.downloaded_files)
+        self.assertEqual(job.file_sizes["vid1.mp4"], 1050)
+
+        # Start uploading vid1.mp4 while vid2.mp4 finishes downloading
+        job.start_file("vid1.mp4", phase="upload", size=1050)
+        self.assertEqual(job.active_files["vid1.mp4"]["phase"], "upload")
+
+        job.finish_file("vid2.mp4", phase="download", size=2000)
+        job.finish_file("vid1.mp4", phase="upload", size=1050)
+
+        self.assertEqual(job.active_files, {})
+        self.assertIn("vid1.mp4", job.uploaded_files)
+        self.assertIn("vid2.mp4", job.downloaded_files)
+
+        # Check view()
+        v = job.view()
+        self.assertEqual(v["activeFiles"], {})
+        self.assertEqual(v["fileSizes"]["vid1.mp4"], 1050)
+        self.assertEqual(v["fileSizes"]["vid2.mp4"], 2000)
+        self.assertIn("vid1.mp4", v["uploadedFiles"])
+        self.assertIn("vid1.mp4", v["downloadedFiles"])
+
