@@ -126,7 +126,7 @@ class LinksProvider(BaseProvider):
 
     @classmethod
     async def _ensure_tor_proxy(cls, progress: JobState | None = None) -> str | None:
-        """Set up Tor as SOCKS5 proxy on 127.0.0.1:9050 (pure TCP, works 100% in Colab)."""
+        """Set up Tor as SOCKS5 proxy on 127.0.0.1:9050 and HTTP proxy on 127.0.0.1:9080 (pure TCP, works 100% in Colab)."""
         global _proxy_ready, PROXY_SETUP_LOCK
         if _proxy_ready:
             return TOR_PROXY
@@ -139,7 +139,7 @@ class LinksProvider(BaseProvider):
                 return None
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "curl", "-s", "--socks5", "127.0.0.1:9050", "--connect-timeout", "3", "http://ifconfig.me",
+                    "curl", "-s", "--socks5", "127.0.0.1:9050", "--connect-timeout", "3", "https://api.ipify.org",
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                 )
                 out, _ = await proc.communicate()
@@ -151,25 +151,33 @@ class LinksProvider(BaseProvider):
 
             try:
                 if progress:
-                    progress.log("[Proxy] Starting Tor SOCKS5 proxy for IP bypass (TCP-based)...")
+                    progress.log("[Proxy] Starting Tor SOCKS5/HTTP proxy for IP bypass (TCP-based)...")
                 def _setup():
                     if not shutil.which("tor"):
                         subprocess.run(["apt-get", "update", "-qq"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         subprocess.run(["apt-get", "install", "-y", "-qq", "tor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    subprocess.run(["service", "tor", "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    torrc = Path("/etc/tor/torrc")
+                    if torrc.exists():
+                        try:
+                            txt = torrc.read_text(encoding="utf-8", errors="ignore")
+                            if "HTTPTunnelPort 9080" not in txt:
+                                torrc.write_text(txt + "\nHTTPTunnelPort 127.0.0.1:9080\n", encoding="utf-8")
+                        except Exception:
+                            pass
+                    subprocess.run(["service", "tor", "restart"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 await asyncio.to_thread(_setup)
 
                 for _ in range(8):
                     await asyncio.sleep(1)
                     proc = await asyncio.create_subprocess_exec(
-                        "curl", "-s", "--socks5", "127.0.0.1:9050", "--connect-timeout", "4", "http://ifconfig.me",
+                        "curl", "-s", "--socks5", "127.0.0.1:9050", "--connect-timeout", "4", "https://api.ipify.org",
                         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                     )
                     out, _ = await proc.communicate()
                     if proc.returncode == 0 and out.strip():
                         _proxy_ready = True
                         if progress:
-                            progress.log(f"[Proxy] Tor SOCKS5 proxy active (Exit IP: {out.decode().strip()})")
+                            progress.log(f"[Proxy] Tor proxy active (Exit IP: {out.decode(errors='ignore').strip()[:60]})")
                         return TOR_PROXY
             except Exception as exc:
                 if progress:
@@ -198,7 +206,7 @@ class LinksProvider(BaseProvider):
         # DoodStream / Playmogo / CloudataCDN / Archivebate
         dood_domains = [
             "cloudatacdn.com", "playmogo.com", "archivebate.com", "doods.pro",
-            "doodstream", "ds2play", "do0od", "d000d", "d0000d",
+            "dooood.com", "dooood", "doodstream", "ds2play", "do0od", "d000d", "d0000d",
             "dood.to", "dood.watch", "dood.so", "dood.ws", "dood.pm",
             "dood.re", "dood.li", "dood.cx", "dood.wf", "dood.la",
             "dood.sh", "dood.video", "dood.stream",
@@ -441,7 +449,10 @@ class LinksProvider(BaseProvider):
             "--uri-selector=adaptive",
         ]
         if proxy:
-            cmd.append(f"--all-proxy={proxy}")
+            aria_proxy = "http://127.0.0.1:9080" if "127.0.0.1:9050" in proxy else proxy
+            if aria_proxy.startswith("socks"):
+                raise ProviderFailure("DOWNLOAD_FAILED", "aria2c requires HTTP proxy, falling back to stream downloader")
+            cmd.append(f"--all-proxy={aria_proxy}")
 
         all_headers = dict(headers or {})
         if cookies and "cookie" not in {str(k).lower() for k in all_headers}:
@@ -1315,23 +1326,40 @@ class LinksProvider(BaseProvider):
         resolved_url = url
         dl_headers = dict(file_ref.get("headers") or (file_ref.get("meta") or {}).get("headers") or {})
         final_name = name
+        active_proxy = proxy
         try:
-            resolved_url, resolved_name, dl_headers = await self._resolve_doodstream(url, file_ref, progress, proxy=proxy)
+            resolved_url, resolved_name, dl_headers = await self._resolve_doodstream(url, file_ref, progress, proxy=active_proxy)
             if not final_name or final_name.startswith("video_download_"):
                 final_name = resolved_name or final_name
         except Exception as exc:
-            progress.log(f"[doodstream] Notice: Resolution error ({exc}), trying direct URL...")
-            if "referer" not in {k.lower() for k in dl_headers}:
-                dl_headers["Referer"] = "https://playmogo.com/"
+            if not active_proxy:
+                progress.log(f"[doodstream] Datacenter IP challenged ({exc}); activating proxy to resolve fresh token...")
+                active_proxy = await self._ensure_tor_proxy(progress)
+                if active_proxy:
+                    try:
+                        resolved_url, resolved_name, dl_headers = await self._resolve_doodstream(url, file_ref, progress, proxy=active_proxy)
+                        if not final_name or final_name.startswith("video_download_"):
+                            final_name = resolved_name or final_name
+                    except Exception as proxy_exc:
+                        progress.log(f"[doodstream] Notice: Proxy resolution error ({proxy_exc}), trying direct URL...")
+                        if "referer" not in {k.lower() for k in dl_headers}:
+                            dl_headers["Referer"] = "https://playmogo.com/"
+                else:
+                    if "referer" not in {k.lower() for k in dl_headers}:
+                        dl_headers["Referer"] = "https://playmogo.com/"
+            else:
+                progress.log(f"[doodstream] Notice: Resolution error ({exc}), trying direct URL...")
+                if "referer" not in {k.lower() for k in dl_headers}:
+                    dl_headers["Referer"] = "https://playmogo.com/"
 
         progress.log(f"Downloading DoodStream via aria2c (16 connections)...")
         try:
-            downloaded = await self._download_aria2(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=proxy)
+            downloaded = await self._download_aria2(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=active_proxy)
             self._validate_downloaded_files(downloaded)
             return downloaded
         except Exception as exc:
             progress.log(f"aria2c failed ({exc}); falling back to HTTP stream downloader...")
-            downloaded = await self._download_http_stream(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=proxy)
+            downloaded = await self._download_http_stream(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=active_proxy)
             self._validate_downloaded_files(downloaded)
             return downloaded
 
@@ -1430,7 +1458,7 @@ class LinksProvider(BaseProvider):
         link_type = self._classify_link(url)
         if link_type == "direct":
             check_sources = f"{page_url} {headers.get('Referer', '')} {headers.get('referer', '')}".lower()
-            if any(d in check_sources for d in ("archivebate.com", "playmogo.com", "doods.pro", "doodstream", "cloudatacdn.com", "dood.")):
+            if any(d in check_sources for d in ("archivebate.com", "playmogo.com", "doods.pro", "dooood.com", "doodstream", "cloudatacdn.com", "dood.")):
                 link_type = "doodstream"
 
         progress.log(f"[links] {link_type}: {url[:120]}")
@@ -1482,13 +1510,16 @@ class LinksProvider(BaseProvider):
             msg = str(exc.message).lower()
             is_blocked = (
                 exc.code in ("DOWNLOAD_FAILED",)
-                and any(err in msg for err in ("403", "forbidden", "429", "blocked", "file not found", "error response"))
+                and any(err in msg for err in (
+                    "403", "forbidden", "429", "blocked", "file not found",
+                    "error response", "error_wrong_ip", "error instead of file", "error payload"
+                ))
             )
 
             # Fallback DoodStream: If not already tried as doodstream and indicators exist
             if not downloaded and link_type != "doodstream":
                 dood_ctx = f"{url} {page_url} {headers.get('Referer', '')} {headers.get('referer', '')}".lower()
-                if any(d in dood_ctx for d in ("archivebate.com", "playmogo.com", "doods.pro", "cloudatacdn.com", "doodstream", "ds2play", "dood.")):
+                if any(d in dood_ctx for d in ("archivebate.com", "playmogo.com", "doods.pro", "dooood.com", "cloudatacdn.com", "doodstream", "ds2play", "dood.")):
                     progress.log("[Fallback] Direct download failed. Retrying with native DoodStream resolver...")
                     try:
                         downloaded = await self._download_doodstream(
@@ -1499,7 +1530,15 @@ class LinksProvider(BaseProvider):
                         downloaded = None
 
             # Fallback 1: If stream failed and we have canonical page_url, retry with yt-dlp
-            if not downloaded and page_url and page_url != url and page_url.startswith(("http://", "https://")):
+            # (skip yt-dlp for archivebate/playmogo/dooood as yt-dlp does not support them)
+            if (
+                not downloaded
+                and link_type != "doodstream"
+                and page_url
+                and page_url != url
+                and page_url.startswith(("http://", "https://"))
+                and not any(d in page_url.lower() for d in ("archivebate.com", "playmogo.com", "dooood.com", "doods.pro"))
+            ):
                 clean_page_url = page_url
                 if "pornhub.com" in clean_page_url:
                     clean_page_url = re.sub(r'https?://[a-zA-Z0-9_-]+\.pornhub\.com', 'https://www.pornhub.com', clean_page_url)
