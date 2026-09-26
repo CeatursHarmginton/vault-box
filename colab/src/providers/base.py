@@ -378,6 +378,20 @@ def _download_error_payload(path: Path, content_type: str, strict: bool) -> dict
     if path.stat().st_size > 4096:
         return None
     raw = path.read_bytes().lstrip()
+    video_exts = (".mp4", ".mkv", ".ts", ".webm", ".avi", ".mov", ".flv", ".mp3", ".m4a")
+    clean_ext = path.name.lower().replace(".part", "")
+    is_video = any(clean_ext.endswith(ext) for ext in video_exts)
+    if is_video or not raw.startswith((b"{", b"[")):
+        raw_lower = raw.lower()
+        text_errors = (
+            b"file not found", b"404 not found", b"not found", b"403 forbidden", b"forbidden",
+            b"access denied", b"link expired", b"url expired", b"invalid token", b"video deleted",
+            b"ip not allowed", b"bad request", b"not authorized", b"unauthorized",
+            b"<html", b"<!doctype html", b"error"
+        )
+        if any(err in raw_lower for err in text_errors):
+            msg = raw.decode("utf-8", errors="replace").strip() or f"{path.stat().st_size} bytes error payload"
+            return {"errno": 404 if b"not found" in raw_lower else 403, "message": msg[:200], "body": msg}
     if not raw.startswith((b"{", b"[")):
         return None
     try:

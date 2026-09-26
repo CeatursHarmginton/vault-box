@@ -3938,4 +3938,73 @@ class ActiveFilesTrackingTests(TestCase):
         self.assertEqual(job.files_downloaded, 0)
 
 
+def test_doodstream_classification_and_14b_error_rejection(tmp_path):
+    from src.providers.links import LinksProvider
+    from src.providers.base import _download_error_payload, ProviderFailure
+
+    provider = LinksProvider()
+    assert provider._classify_link("https://aa390s.cloudatacdn.com/u5kj/abc?token=123&expiry=456") == "doodstream"
+    assert provider._classify_link("https://playmogo.com/e/xyz123") == "doodstream"
+    assert provider._classify_link("https://archivebate.com/watch/16505586") == "doodstream"
+    assert provider._classify_link("https://doods.pro/e/xyz123") == "doodstream"
+
+    # 14-byte "File not found" response should be caught by both _download_error_payload and _validate_downloaded_files
+    err_file = tmp_path / "video.mp4"
+    err_file.write_bytes(b"File not found")
+    err_info = _download_error_payload(err_file, "text/plain", False)
+    assert err_info is not None
+    assert "File not found" in err_info["message"]
+
+    try:
+        provider._validate_downloaded_files([err_file])
+        assert False, "Expected ProviderFailure for 14B 'File not found' file"
+    except ProviderFailure as exc:
+        assert exc.code == "DOWNLOAD_FAILED"
+        assert "File not found" in exc.message
+        assert not err_file.exists()
+
+
+def test_doodstream_download_flow(tmp_path, monkeypatch):
+    from src.providers.links import LinksProvider
+    provider = LinksProvider()
+    seen = {}
+
+    async def no_deps():
+        return None
+
+    async def fake_resolve(url, file_ref, progress, proxy=None):
+        seen["resolved_from"] = url
+        seen["page_url"] = file_ref.get("page_url")
+        return (
+            "https://aa390s.cloudatacdn.com/u5kj/fresh_token_1234567890?token=abc&expiry=999",
+            "resolved_video.mp4",
+            {"User-Agent": "Chrome", "Referer": "https://playmogo.com/"},
+        )
+
+    async def fake_aria2(url, dest_dir, name, progress, headers=None, proxy=None, cookies=None):
+        seen["dl_url"] = url
+        seen["dl_headers"] = headers
+        out = dest_dir / (name or "video.mp4")
+        out.write_bytes(b"0" * 1024)
+        return [out]
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr(provider, "_resolve_doodstream", fake_resolve)
+    monkeypatch.setattr(provider, "_download_aria2", fake_aria2)
+
+    payload = {
+        "url": "https://aa390s.cloudatacdn.com/u5kj/old_browser_token?token=old&expiry=111",
+        "name": "bejeni-sweet.mp4",
+        "size": 1024,
+        "page_url": "https://archivebate.com/watch/16505586",
+        "headers": {"Referer": "https://playmogo.com/"},
+    }
+    out = asyncio.run(provider.download_file({}, payload, tmp_path, JobState("dood-test", {})))
+    assert out.name == "bejeni-sweet.mp4"
+    assert out.stat().st_size == 1024
+    assert seen["page_url"] == "https://archivebate.com/watch/16505586"
+    assert "fresh_token_1234567890" in seen["dl_url"]
+    assert seen["dl_headers"]["Referer"] == "https://playmogo.com/"
+
+
 

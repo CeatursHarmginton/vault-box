@@ -5,8 +5,10 @@ import hashlib
 import html
 import json
 import os
+import random
 import re
 import shutil
+import string
 import subprocess
 import sys
 import tempfile
@@ -192,6 +194,17 @@ class LinksProvider(BaseProvider):
         # Direct & Embed resolvers for Mixdrop / Mxdrop / Mxcontent
         if any(h in url_lower for h in ["mxcontent.net", "mxdrop.to", "mxdrop.top", "mixdrop.co", "mixdrop.to", "mixdrop.bz", "mixdrop.ch"]):
             return "mxdrop"
+
+        # DoodStream / Playmogo / CloudataCDN / Archivebate
+        dood_domains = [
+            "cloudatacdn.com", "playmogo.com", "archivebate.com", "doods.pro",
+            "doodstream", "ds2play", "do0od", "d000d", "d0000d",
+            "dood.to", "dood.watch", "dood.so", "dood.ws", "dood.pm",
+            "dood.re", "dood.li", "dood.cx", "dood.wf", "dood.la",
+            "dood.sh", "dood.video", "dood.stream",
+        ]
+        if any(d in url_lower for d in dood_domains):
+            return "doodstream"
 
         ytdlp_domains = [
             "youtube", "youtu.be", "tiktok", "bilibili", "vimeo", 
@@ -393,7 +406,7 @@ class LinksProvider(BaseProvider):
             out_name = name or safe_name(unquote(Path(urlparse(one).path).name) or "download")
             try:
                 progress.log(f"Starting browser-compatible download: {out_name}")
-                return [await stream_download(
+                downloaded = [await stream_download(
                     one,
                     dest_dir / out_name,
                     progress,
@@ -402,6 +415,8 @@ class LinksProvider(BaseProvider):
                     auth_fail_message="Direct link rejected Colab; this host likely binds the URL to the original browser/IP",
                     proxy=proxy,
                 )]
+                self._validate_downloaded_files(downloaded)
+                return downloaded
             except ProviderFailure as exc:
                 last = exc
         if last:
@@ -451,7 +466,9 @@ class LinksProvider(BaseProvider):
         try:
             downloaded = await self._run_aria2_cmd(cmd, dest_dir, progress)
             expected = dest_dir / name if name else None
-            return [expected] if expected and expected.exists() else downloaded
+            res = [expected] if expected and expected.exists() else downloaded
+            self._validate_downloaded_files(res)
+            return res
         finally:
             if uri_file:
                 uri_file.unlink(missing_ok=True)
@@ -514,7 +531,32 @@ class LinksProvider(BaseProvider):
 
         after = set(dest_dir.iterdir()) if dest_dir.exists() else set()
         new_files = [p for p in (after - before) if p.is_file() and not p.name.endswith(".aria2") and not p.name.startswith(".vaultbox-aria2-")]
-        return new_files or [p for p in dest_dir.iterdir() if p.is_file() and not p.name.endswith(".aria2") and not p.name.startswith(".vaultbox-aria2-")]
+        res = new_files or [p for p in dest_dir.iterdir() if p.is_file() and not p.name.endswith(".aria2") and not p.name.startswith(".vaultbox-aria2-")]
+        self._validate_downloaded_files(res)
+        return res
+
+    @staticmethod
+    def _validate_downloaded_files(files: list[Path]) -> None:
+        text_errors = (
+            b"file not found", b"404 not found", b"not found", b"403 forbidden", b"forbidden",
+            b"access denied", b"link expired", b"url expired", b"invalid token", b"video deleted",
+            b"ip not allowed", b"bad request", b"not authorized", b"unauthorized",
+            b"<html", b"<!doctype html", b"error"
+        )
+        for f in files:
+            if not f.is_file():
+                continue
+            sz = f.stat().st_size
+            if sz == 0:
+                f.unlink(missing_ok=True)
+                raise ProviderFailure("DOWNLOAD_FAILED", f"Downloaded file {f.name} is empty (0 bytes)")
+            if sz <= 4096:
+                content = f.read_bytes()
+                raw_low = content.lower()
+                if any(err in raw_low for err in text_errors):
+                    f.unlink(missing_ok=True)
+                    sample = content.decode("utf-8", errors="ignore").strip()
+                    raise ProviderFailure("DOWNLOAD_FAILED", f"Server returned error payload ({sample[:100]}) instead of media content for {f.name}")
 
     async def _download_stream_nm3u8dl(
         self,
@@ -1155,6 +1197,144 @@ class LinksProvider(BaseProvider):
             progress.log(f"aria2c failed ({exc}); falling back to HTTP stream downloader")
             return await self._download_http_stream(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=proxy)
 
+    async def _resolve_doodstream(
+        self,
+        url: str,
+        file_ref: dict[str, Any],
+        progress: JobState,
+        proxy: str | None = None,
+    ) -> tuple[str, str | None, dict[str, str]]:
+        progress.log(f"[doodstream] Resolving fresh stream token on Colab for: {url[:80]}...")
+        headers = dict(file_ref.get("headers") or (file_ref.get("meta") or {}).get("headers") or {})
+        cookies = str(file_ref.get("cookies") or (file_ref.get("meta") or {}).get("cookies") or "").strip()
+        page_url = str(file_ref.get("page_url") or (file_ref.get("meta") or {}).get("page_url") or "").strip()
+        referer = str(headers.get("Referer") or headers.get("referer") or "").strip()
+
+        embed_url = ""
+        url_low = url.lower()
+        if not page_url and "archivebate.com" in url_low:
+            page_url = url
+        if any(h in url_low for h in ("dood", "playmogo", "ds2play")) and ("/e/" in url or "/d/" in url):
+            embed_url = url
+        elif page_url and any(h in page_url.lower() for h in ("dood", "playmogo", "ds2play")) and ("/e/" in page_url or "/d/" in page_url):
+            embed_url = page_url
+        elif referer and any(h in referer.lower() for h in ("dood", "playmogo", "ds2play")) and ("/e/" in referer or "/d/" in referer):
+            embed_url = referer
+        if "/d/" in embed_url and any(h in embed_url.lower() for h in ("dood", "playmogo", "ds2play")):
+            embed_url = embed_url.replace("/d/", "/e/", 1)
+
+        def _fetch_page(target_url: str, req_headers: dict[str, str]) -> tuple[int, str, str]:
+            try:
+                from curl_cffi import requests as cffi_requests
+                s = cffi_requests.Session(impersonate="chrome")
+                r = s.get(target_url, headers=req_headers, proxy=proxy, timeout=25)
+                return r.status_code, r.text, r.url
+            except Exception:
+                with httpx.Client(follow_redirects=True, timeout=25.0, proxy=proxy) as client:
+                    r = client.get(target_url, headers=req_headers)
+                    return r.status_code, r.text, str(r.url)
+
+        req_headers = {
+            "User-Agent": str(headers.get("User-Agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        if cookies:
+            req_headers["Cookie"] = cookies
+
+        if not embed_url and page_url and page_url.startswith(("http://", "https://")):
+            progress.log(f"[doodstream] Fetching canonical page: {page_url[:80]}...")
+            code, page_html, _ = await asyncio.to_thread(_fetch_page, page_url, req_headers)
+            m_iframe = re.search(r'<iframe[^>]+src=[\x22\x27]([^\x22\x27]+)[\x22\x27]', page_html, re.I)
+            if m_iframe:
+                iframe_src = m_iframe.group(1).strip()
+                if iframe_src.startswith("//"):
+                    iframe_src = "https:" + iframe_src
+                embed_url = iframe_src
+                progress.log(f"[doodstream] Found player iframe: {embed_url}")
+
+        if not embed_url:
+            progress.log("[doodstream] Notice: No embed player found; using direct URL with embed referer")
+            dl_headers = {
+                "User-Agent": req_headers["User-Agent"],
+                "Referer": referer or "https://playmogo.com/",
+            }
+            return url, file_ref.get("name"), dl_headers
+
+        embed_headers = dict(req_headers)
+        if page_url:
+            embed_headers["Referer"] = page_url
+        progress.log(f"[doodstream] Fetching embed player: {embed_url}")
+        code, embed_html, final_embed_url = await asyncio.to_thread(_fetch_page, embed_url, embed_headers)
+
+        m_pass = re.search(r'/pass_md5/([^\x22\x27]+)', embed_html)
+        if not m_pass:
+            raise ProviderFailure("DOWNLOAD_FAILED", f"Could not find /pass_md5/ in DoodStream player HTML on {embed_url}")
+
+        pass_path = m_pass.group(0)
+        token = pass_path.rstrip("/").split("/")[-1]
+
+        embed_parsed = urlparse(final_embed_url)
+        embed_domain = f"{embed_parsed.scheme}://{embed_parsed.netloc}"
+        pass_url = f"{embed_domain}{pass_path}"
+
+        pass_headers = dict(req_headers)
+        pass_headers["Referer"] = final_embed_url
+        _, pass_body, _ = await asyncio.to_thread(_fetch_page, pass_url, pass_headers)
+        cdn_base = pass_body.strip()
+        if not cdn_base.startswith("http"):
+            raise ProviderFailure("DOWNLOAD_FAILED", f"Invalid pass_md5 response from {pass_url}: {cdn_base[:100]}")
+
+        chars = string.ascii_letters + string.digits
+        rand_str = ''.join(random.choices(chars, k=10))
+        resolved_url = f"{cdn_base}{rand_str}?token={token}&expiry={int(time.time() * 1000)}"
+
+        out_name = file_ref.get("name")
+        if not out_name or out_name.startswith("video_download_"):
+            m_title = re.search(r'<title>(.*?)\s*-\s*DoodStream</title>', embed_html, re.I)
+            if m_title and m_title.group(1):
+                clean_title = safe_name(m_title.group(1).strip())
+                if clean_title:
+                    out_name = f"{clean_title}.mp4"
+
+        dl_headers = {
+            "User-Agent": req_headers["User-Agent"],
+            "Referer": f"{embed_domain}/",
+        }
+        progress.log(f"[doodstream] Successfully generated Colab-bound stream URL: {resolved_url[:80]}...")
+        return resolved_url, out_name, dl_headers
+
+    async def _download_doodstream(
+        self,
+        url: str,
+        dest_dir: Path,
+        name: str | None,
+        progress: JobState,
+        file_ref: dict[str, Any],
+        proxy: str | None = None,
+    ) -> list[Path]:
+        resolved_url = url
+        dl_headers = dict(file_ref.get("headers") or (file_ref.get("meta") or {}).get("headers") or {})
+        final_name = name
+        try:
+            resolved_url, resolved_name, dl_headers = await self._resolve_doodstream(url, file_ref, progress, proxy=proxy)
+            if not final_name or final_name.startswith("video_download_"):
+                final_name = resolved_name or final_name
+        except Exception as exc:
+            progress.log(f"[doodstream] Notice: Resolution error ({exc}), trying direct URL...")
+            if "referer" not in {k.lower() for k in dl_headers}:
+                dl_headers["Referer"] = "https://playmogo.com/"
+
+        progress.log(f"Downloading DoodStream via aria2c (16 connections)...")
+        try:
+            downloaded = await self._download_aria2(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=proxy)
+            self._validate_downloaded_files(downloaded)
+            return downloaded
+        except Exception as exc:
+            progress.log(f"aria2c failed ({exc}); falling back to HTTP stream downloader...")
+            downloaded = await self._download_http_stream(resolved_url, dest_dir, final_name, progress, headers=dl_headers, proxy=proxy)
+            self._validate_downloaded_files(downloaded)
+            return downloaded
+
     async def _dispatch_download(
         self, link_type: str, is_stream: bool, url: str, urls: list[str],
         dest_dir: Path, name: str | None, progress: JobState, *,
@@ -1169,6 +1349,8 @@ class LinksProvider(BaseProvider):
             return await self._download_torrent(url, dest_dir, progress)
         elif link_type == "mxdrop":
             return await self._download_mxdrop(url, dest_dir, name, progress, file_ref, proxy=proxy)
+        elif link_type == "doodstream":
+            return await self._download_doodstream(url, dest_dir, name, progress, file_ref, proxy=proxy)
         elif is_stream:
             return await self._download_stream_nm3u8dl(url, dest_dir, name, progress, headers=headers, cookies=cookies, dec_key=dec_key, proxy=proxy, page_url=page_url)
         elif link_type == "gofile_page":
@@ -1214,13 +1396,13 @@ class LinksProvider(BaseProvider):
         """
         await self._ensure_deps()
 
-        url = file_ref.get("id") or file_ref.get("path") or ""
+        url = file_ref.get("id") or file_ref.get("path") or file_ref.get("url") or ""
         if not url:
             raise ProviderFailure("DOWNLOAD_FAILED", "No URL provided")
         urls = [str(item) for item in (file_ref.get("urls") or []) if str(item or "").startswith(("http://", "https://"))]
         urls = urls or [str(url)]
         try:
-            expected_size = int(file_ref.get("size") or file_ref.get("file_size") or file_ref.get("bytes") or 0)
+            expected_size = int(file_ref.get("size") or file_ref.get("file_size") or file_ref.get("bytes") or (file_ref.get("meta") or {}).get("size") or 0)
         except (TypeError, ValueError):
             expected_size = 0
         headers = file_ref.get("headers") or (file_ref.get("meta") or {}).get("headers") or {}
@@ -1246,6 +1428,10 @@ class LinksProvider(BaseProvider):
 
         name = safe_name(raw_name) if raw_name else None
         link_type = self._classify_link(url)
+        if link_type == "direct":
+            check_sources = f"{page_url} {headers.get('Referer', '')} {headers.get('referer', '')}".lower()
+            if any(d in check_sources for d in ("archivebate.com", "playmogo.com", "doods.pro", "doodstream", "cloudatacdn.com", "dood.")):
+                link_type = "doodstream"
 
         progress.log(f"[links] {link_type}: {url[:120]}")
 
@@ -1296,8 +1482,21 @@ class LinksProvider(BaseProvider):
             msg = str(exc.message).lower()
             is_blocked = (
                 exc.code in ("DOWNLOAD_FAILED",)
-                and any(err in msg for err in ("403", "forbidden", "429", "blocked"))
+                and any(err in msg for err in ("403", "forbidden", "429", "blocked", "file not found", "error response"))
             )
+
+            # Fallback DoodStream: If not already tried as doodstream and indicators exist
+            if not downloaded and link_type != "doodstream":
+                dood_ctx = f"{url} {page_url} {headers.get('Referer', '')} {headers.get('referer', '')}".lower()
+                if any(d in dood_ctx for d in ("archivebate.com", "playmogo.com", "doods.pro", "cloudatacdn.com", "doodstream", "ds2play", "dood.")):
+                    progress.log("[Fallback] Direct download failed. Retrying with native DoodStream resolver...")
+                    try:
+                        downloaded = await self._download_doodstream(
+                            page_url or url, dest_dir, name, progress, file_ref,
+                        )
+                    except Exception as dood_exc:
+                        progress.log(f"[Fallback] DoodStream resolver failed: {dood_exc}")
+                        downloaded = None
 
             # Fallback 1: If stream failed and we have canonical page_url, retry with yt-dlp
             if not downloaded and page_url and page_url != url and page_url.startswith(("http://", "https://")):
@@ -1353,6 +1552,7 @@ class LinksProvider(BaseProvider):
             raise ProviderFailure("DOWNLOAD_FAILED", "Download completed but no files found on disk")
 
         result = downloaded[0]
+        self._validate_downloaded_files([result])
         if expected_size and result.stat().st_size < expected_size:
             raise ProviderFailure("DOWNLOAD_INCOMPLETE", f"Downloaded {result.stat().st_size} bytes, expected {expected_size}")
         return result
