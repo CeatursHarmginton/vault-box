@@ -76,19 +76,23 @@ async def run_transfer(job: JobState) -> None:
 
         downloaded: list[Path] = []
         has_folder_source = False
-        sem = asyncio.Semaphore(max(1, FOLDER_DOWNLOAD_CONCURRENCY))
+        concurrency = int(options.get("download_concurrency") or FOLDER_DOWNLOAD_CONCURRENCY)
+        sem = asyncio.Semaphore(max(1, concurrency))
 
         async def download_one(item: dict[str, Any]) -> list[Path]:
             async with sem:
                 job.check_cancelled()
+                item_name = _item_name(item)
                 item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
                 item_src = PROVIDERS.get(item_prov, src)
                 item_creds = item.get("credentials") or source.get("credentials") or {}
                 try:
                     path = await download_with_retry(
                         lambda: item_src.download_file(item_creds, item, dirs["input"], job),
-                        progress=job, label=_item_name(item),
+                        progress=job, label=item_name,
                     )
+                    job.files_downloaded += 1
+                    job.log(f"[{job.files_downloaded}/{job.files_to_download or len(file_items)}] Downloaded: {item_name}")
                     _remember_source_ref(job, path, item)
                     return [path]
                 except ProviderFailure as exc:
@@ -120,22 +124,25 @@ async def run_transfer(job: JobState) -> None:
                     _mark_item_skipped(job, source, item, f"{job.files_failed - failed_before} file(s) unavailable after retries")
             else:
                 continue
-        if str(source.get("provider") or "").lower() == "links":
-            for item in file_items:
-                downloaded.extend(await download_one(item))
-            downloaded = [
-                p for p in sorted(dirs["input"].rglob("*")) 
-                if p.is_file() 
-                and not p.name.endswith((".aria2", ".ytdl", ".part", ".tmp"))
-                and not (p.name.lower() in ("cookies.txt", "cookie.txt", "cookies.json") or p.name.lower().startswith("cookie"))
-                and ".part-Frag" not in p.name
-                and not p.name.startswith(".tmp")
-                and not p.name.startswith(".")
-                and p.stat().st_size > 0
-            ]
-        else:
-            for batch in await asyncio.gather(*(download_one(item) for item in file_items)):
-                downloaded.extend(batch)
+        if file_items:
+            effective_concurrency = max(1, min(concurrency, len(file_items)))
+            job.log(f"Downloading {len(file_items)} file(s), up to {effective_concurrency} in parallel")
+            if str(source.get("provider") or "").lower() == "links":
+                for batch in await asyncio.gather(*(download_one(item) for item in file_items)):
+                    downloaded.extend(batch)
+                downloaded = [
+                    p for p in sorted(dirs["input"].rglob("*")) 
+                    if p.is_file() 
+                    and not p.name.endswith((".aria2", ".ytdl", ".part", ".tmp"))
+                    and not (p.name.lower() in ("cookies.txt", "cookie.txt", "cookies.json") or p.name.lower().startswith("cookie"))
+                    and ".part-Frag" not in p.name
+                    and not p.name.startswith(".tmp")
+                    and not p.name.startswith(".")
+                    and p.stat().st_size > 0
+                ]
+            else:
+                for batch in await asyncio.gather(*(download_one(item) for item in file_items)):
+                    downloaded.extend(batch)
         if not downloaded and options.get("optimize_image") and job.files_skipped:
             job.log("No image files found for optimization.")
             _mark_remaining_items_completed(job, source)
@@ -345,16 +352,24 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         batch_output.mkdir(parents=True, exist_ok=True)
         job.set(status="running", step="downloading")
         failed_before = job.files_failed
+        concurrency = int(options.get("download_concurrency") or FOLDER_DOWNLOAD_CONCURRENCY)
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def _download_one_opt(batch_item: dict[str, Any]) -> list[Path]:
+            async with sem:
+                try:
+                    return await _download_batch_item(job, source, src, batch_item, batch_input)
+                except ProviderFailure as exc:
+                    # Retries are already exhausted inside the download; move to the next queue item
+                    # and leave this one in the queue so it can be picked up again later.
+                    if not is_skippable_download_failure(exc):
+                        raise
+                    _mark_item_skipped(job, source, batch_item, exc.message)
+                    return []
+
         downloaded = []
-        for batch_item in batch_items:
-            try:
-                downloaded.extend(await _download_batch_item(job, source, src, batch_item, batch_input))
-            except ProviderFailure as exc:
-                # Retries are already exhausted inside the download; move to the next queue item
-                # and leave this one in the queue so it can be picked up again later.
-                if not is_skippable_download_failure(exc):
-                    raise
-                _mark_item_skipped(job, source, batch_item, exc.message)
+        for batch in await asyncio.gather(*(_download_one_opt(batch_item) for batch_item in batch_items)):
+            downloaded.extend(batch)
         item_failed = job.files_failed > failed_before
         if item_failed:
             for batch_item in batch_items:
@@ -431,7 +446,8 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
 async def _run_plain_file_batches(job: JobState, dirs: dict[str, Path], source: dict[str, Any], target: dict[str, Any], options: dict[str, Any], src: Any, dst: Any, file_items: list[dict[str, Any]]) -> None:
     job.files_to_download = len(file_items)
     groups = _download_batches(file_items, dirs["input"], options, job)
-    sem = asyncio.Semaphore(max(1, FOLDER_DOWNLOAD_CONCURRENCY))
+    concurrency = int(options.get("download_concurrency") or FOLDER_DOWNLOAD_CONCURRENCY)
+    sem = asyncio.Semaphore(max(1, concurrency))
 
     async def download_one(item: dict[str, Any], batch_input: Path) -> list[Path]:
         async with sem:
@@ -465,10 +481,20 @@ async def _run_plain_file_batches(job: JobState, dirs: dict[str, Path], source: 
         for item in batch_items:
             job.start_item(_queue_item_key(source, item), name=_item_name(item))
         job.set(status="running", step="downloading")
+        effective_concurrency = max(1, min(concurrency, len(batch_items)))
+        job.log(f"Downloading batch {index + 1}/{len(groups)} ({len(batch_items)} files), up to {effective_concurrency} in parallel")
         if str(source.get("provider") or "").lower() == "links":
-            downloaded = []
-            for item in batch_items:
-                downloaded.extend(await download_one(item, batch_input))
+            downloaded = [path for batch in await asyncio.gather(*(download_one(item, batch_input) for item in batch_items)) for path in batch]
+            downloaded = [
+                p for p in sorted(batch_input.rglob("*"))
+                if p.is_file()
+                and not p.name.endswith((".aria2", ".ytdl", ".part", ".tmp"))
+                and not (p.name.lower() in ("cookies.txt", "cookie.txt", "cookies.json") or p.name.lower().startswith("cookie"))
+                and ".part-Frag" not in p.name
+                and not p.name.startswith(".tmp")
+                and not p.name.startswith(".")
+                and p.stat().st_size > 0
+            ]
         else:
             downloaded = [path for batch in await asyncio.gather(*(download_one(item, batch_input) for item in batch_items)) for path in batch]
         downloaded = [p for p in downloaded if p.is_file()]

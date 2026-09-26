@@ -2838,6 +2838,46 @@ class TransferJobTests(TestCase):
         self.assertEqual(src.max_active, 2)
         self.assertEqual(len(dst.calls), 1)
 
+    def test_links_downloads_are_concurrent_with_custom_concurrency(self):
+        class Source(base_mod.BaseProvider):
+            name = "links"
+
+            def __init__(self):
+                self.active = 0
+                self.max_active = 0
+
+            async def validate_credentials(self, credentials):
+                return {"ok": True}
+
+            async def download_file(self, credentials, file_ref, local_path, progress):
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                await asyncio.sleep(0.02)
+                self.active -= 1
+                out = local_path / f"{file_ref['id']}.txt"
+                out.write_text(str(file_ref["id"]))
+                return out
+
+            async def upload_file(self, credentials, local_path, target_ref, progress):
+                return {"ok": True}
+
+        src = Source()
+        dst = UploadRecorder()
+        old_providers = dict(PROVIDERS)
+        PROVIDERS.update({"links": src, "fake-dst": dst})
+        try:
+            job = JobState("links-download-parallel", {
+                "source": {"provider": "links", "items": [{"type": "file", "id": str(i), "name": f"{i}.txt"} for i in range(6)]},
+                "target": {"provider": "fake-dst", "folder": {}},
+                "options": {"download_concurrency": 3, "cleanupAfterFinish": True},
+            })
+            asyncio.run(run_transfer(job))
+        finally:
+            PROVIDERS.clear()
+            PROVIDERS.update(old_providers)
+
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(src.max_active, 3)
     def test_folder_uploads_are_concurrent_and_bounded(self):
         class Provider(base_mod.BaseProvider):
             name = "parallel"

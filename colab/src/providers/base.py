@@ -168,7 +168,9 @@ class BaseProvider(ABC):
         progress.log(f"{self.name} list folder {folder_ref.get('name') or folder_ref.get('path') or folder_ref.get('id')}: {len(items)} item(s)")
         eligible = [item for item in items if not (item.get("type") == "folder" or item.get("is_folder") or item.get("isdir")) and not _skip_optimize_item(item, progress)]
         progress.files_to_download += len(eligible)
-        sem = _sem or asyncio.Semaphore(max(1, FOLDER_DOWNLOAD_CONCURRENCY))
+        options = (progress.payload or {}).get("options", {}) if hasattr(progress, "payload") else {}
+        conc = int(options.get("download_concurrency") or FOLDER_DOWNLOAD_CONCURRENCY)
+        sem = _sem or asyncio.Semaphore(max(1, conc))
         log_token = _DOWNLOAD_LOG_CONTEXT.set({"done": 0, "total": len(eligible), "lock": asyncio.Lock()})
 
         async def save(item: dict[str, Any]) -> list[Path]:
