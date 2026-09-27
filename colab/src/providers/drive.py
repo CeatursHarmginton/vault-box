@@ -97,29 +97,42 @@ class DriveProvider(BaseProvider):
     def _token(self, c: dict[str, Any]) -> str:
         token = c.get("access_token") or c.get("token") or c.get("web_access_token")
         if not token:
+            cookies = c.get("cookies") or {}
+            if any(cookies.get(k) for k in ("SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID")):
+                return "SAPISIDHASH"
             raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive access token missing")
         return str(token)
 
     def _web_session(self, c: dict[str, Any]) -> bool:
-        return self._token(c).lower().startswith("sapisidhash ")
+        if c.get("auth_mode") == "web_session":
+            return True
+        cookies = c.get("cookies") or {}
+        if any(cookies.get(k) for k in ("SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID", "SID", "HSID", "SSID")):
+            return True
+        token = str(c.get("access_token") or c.get("token") or c.get("web_access_token") or "").lower()
+        return token.startswith("sapisidhash ")
 
     def _cookie_header(self, c: dict[str, Any]) -> str:
         return "; ".join(f"{k}={v}" for k, v in (c.get("cookies") or {}).items() if k and v)
 
     def _web_auth(self, c: dict[str, Any]) -> str:
-        token = self._token(c)
         cookies = c.get("cookies") or {}
         sapisid = cookies.get("SAPISID") or cookies.get("__Secure-3PAPISID") or cookies.get("__Secure-1PAPISID")
-        if token.lower().startswith("sapisidhash ") and sapisid:
+        if sapisid:
+            origin = (c.get("auth_headers") or {}).get("X-Origin") or (c.get("auth_headers") or {}).get("x-origin") or DRIVE_WEB_ORIGIN
             ts = str(int(time.time()))
-            return f"SAPISIDHASH {ts}_{hashlib.sha1(f'{ts} {sapisid} {DRIVE_WEB_ORIGIN}'.encode('utf-8')).hexdigest()}"
+            digest = hashlib.sha1(f"{ts} {sapisid} {origin}".encode("utf-8")).hexdigest()
+            return f"SAPISIDHASH {ts}_{digest}"
+        token = self._token(c)
+        if token and not token.lower().startswith("sapisidhash "):
+            return f"Bearer {token}"
         return token
 
     def _web_headers(self, c: dict[str, Any], extra: dict[str, str] | None = None, *, auth: bool = True) -> dict[str, str]:
         headers = {
             "origin": DRIVE_WEB_ORIGIN,
             "referer": DRIVE_WEB_ORIGIN + "/",
-            "user-agent": "Mozilla/5.0",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "x-goog-authuser": str(c.get("authuser") or "0"),
         }
         cookie = self._cookie_header(c)
@@ -134,7 +147,7 @@ class DriveProvider(BaseProvider):
 
     def _web_key(self, c: dict[str, Any]) -> str:
         keys = c.get("api_keys") or {}
-        return str(keys.get("drivefrontend-pa.clients6.google.com") or keys.get("clients6.google.com") or "")
+        return str(keys.get("drivefrontend-pa.clients6.google.com") or keys.get("clients6.google.com") or "AIzaSyD_InbmSFufIEps5UAt2NmB_3LvBH3Sz_8")
 
     def _api_parent(self, ref: Any) -> str:
         raw = ref if isinstance(ref, str) else (ref.get("id") or ref.get("path") or "root")
