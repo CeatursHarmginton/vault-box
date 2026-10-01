@@ -1,0 +1,394 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+class JobCancelled(RuntimeError):
+    pass
+
+@dataclass
+class JobProgress:
+    download: float = 0
+    extract: float = 0
+    optimize: float = 0
+    upload: float = 0
+
+@dataclass
+class JobState:
+    job_id: str
+    payload: dict[str, Any]
+    status: str = "pending"
+    step: str = "pending"
+    progress: JobProgress = field(default_factory=JobProgress)
+    current_file: str = ""
+    active_files: dict[str, dict[str, Any]] = field(default_factory=dict)
+    file_sizes: dict[str, int] = field(default_factory=dict)
+    downloaded_files: set[str] = field(default_factory=set)
+    uploaded_files: set[str] = field(default_factory=set)
+    bytes_done: int = 0
+    bytes_total: int = 0
+    speed: float = 0
+    logs: list[str] = field(default_factory=list)
+    error: dict[str, Any] | None = None
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    cancel: bool = False
+    _tick_at: float = field(default_factory=time.time)
+    _tick_bytes: int = 0
+    _phase: str = ""
+    _phase_done: int = 0
+    _phase_total: int = 0
+    _phase_total_keys: set[tuple[str, str]] = field(default_factory=set)
+    _phase_done_by_name: dict[str, int] = field(default_factory=dict)
+    _phase_total_by_name: dict[str, int] = field(default_factory=dict)
+    files_downloaded: int = 0
+    files_to_download: int = 0
+    files_uploaded: int = 0
+    files_skipped: int = 0
+    files_failed: int = 0
+    files_to_upload: int = 0
+    confirm_event: threading.Event = field(default_factory=threading.Event, compare=False, hash=False)
+    confirm_action: str | None = None
+    optimized_files: list[dict[str, Any]] = field(default_factory=list)
+    completed_items: list[dict[str, Any]] = field(default_factory=list)
+    failed_items: list[dict[str, Any]] = field(default_factory=list)
+    failed_files: list[dict[str, Any]] = field(default_factory=list)
+    item_timings: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _last_item_end_time: float | None = field(default=None, compare=False, hash=False)
+
+    def start_item(self, key: str, name: str = "") -> None:
+        now = time.time()
+        timing = {
+            "startTime": now,
+            "endTime": None,
+            "duration": 0,
+            "status": "active",
+            "name": name,
+        }
+        self.item_timings[key] = timing
+        if name and name not in self.item_timings:
+            self.item_timings[name] = timing
+        self.updated_at = now
+
+    def finish_item(self, key: str, status: str = "done", name: str = "", duration: float | None = None) -> None:
+        now = time.time()
+        existing = self.item_timings.get(key) or (self.item_timings.get(name) if name else {}) or {}
+        start_t = float(existing.get("startTime") or getattr(self, "_last_item_end_time", None) or self.created_at or (now - 1.0))
+        if duration is not None and duration > 0:
+            dur = round(duration, 2)
+        else:
+            dur = max(0.1, round(now - start_t, 2))
+        timing = {
+            "startTime": start_t,
+            "endTime": now,
+            "duration": dur,
+            "status": status,
+            "name": name or existing.get("name", ""),
+        }
+        self.item_timings[key] = timing
+        if name:
+            self.item_timings[name] = timing
+        self._last_item_end_time = now
+        self.updated_at = now
+
+    def start_file(self, name: str, phase: str = "download", size: int = 0, key: str | None = None) -> None:
+        if not name:
+            return
+        now = time.time()
+        base_name = name.replace("\\", "/").rstrip("/").split("/")[-1]
+        self.current_file = base_name or name
+        file_info = {
+            "name": base_name or name,
+            "phase": phase,
+            "size": size,
+            "bytes_done": 0,
+            "started_at": now,
+        }
+        self.active_files[name] = file_info
+        if base_name and base_name != name:
+            self.active_files[base_name] = file_info
+        if key:
+            self.active_files[key] = file_info
+        if size > 0:
+            self.file_sizes[name] = size
+            if base_name:
+                self.file_sizes[base_name] = size
+            if key:
+                self.file_sizes[key] = size
+        self.updated_at = now
+
+    def finish_file(self, name: str, phase: str = "download", size: int = 0, key: str | None = None) -> None:
+        if not name:
+            return
+        now = time.time()
+        base_name = name.replace("\\", "/").rstrip("/").split("/")[-1]
+        self.active_files.pop(name, None)
+        if base_name:
+            self.active_files.pop(base_name, None)
+        if key:
+            self.active_files.pop(key, None)
+        if phase == "download":
+            self.downloaded_files.add(name)
+            if base_name:
+                self.downloaded_files.add(base_name)
+            if key:
+                self.downloaded_files.add(key)
+        elif phase == "upload":
+            self.uploaded_files.add(name)
+            if base_name:
+                self.uploaded_files.add(base_name)
+            if key:
+                self.uploaded_files.add(key)
+        if size > 0:
+            self.file_sizes[name] = size
+            if base_name:
+                self.file_sizes[base_name] = size
+            if key:
+                self.file_sizes[key] = size
+        if self.current_file in (name, base_name, key):
+            if self.active_files:
+                first_active = next(iter(self.active_files.values()))
+                self.current_file = str(first_active.get("name") or next(iter(self.active_files.keys())))
+            else:
+                self.current_file = ""
+        self.updated_at = now
+
+    def log(self, message: str) -> None:
+        self.logs.append(message)
+        self.logs = self.logs[-200:]
+        self.updated_at = time.time()
+
+    def fail_file(self, name: str, code: str, message: str) -> None:
+        """Record a file the provider would not hand over, so the run can move on without it."""
+        self.files_failed += 1
+        self.failed_files.append({"name": name, "code": code, "message": message})
+        self.failed_files = self.failed_files[-200:]
+        self.log(f"[SKIP] Download failed after retries, skipping file: {name} ({message})")
+
+    def set(self, *, status: str | None = None, step: str | None = None, current_file: str | None = None) -> None:
+        changed = False
+        if status and status != self.status:
+            self.status = status
+            changed = True
+        if step and step != self.step:
+            self.step = step
+            changed = True
+        if current_file is not None:
+            self.current_file = current_file
+        self.updated_at = time.time()
+        if changed:
+            self.save_state()
+
+    def add_bytes(self, n: int, total: int = 0, phase: str = "download", total_key: str | None = None) -> None:
+        if phase != self._phase:
+            # Phases interleave across optimize batches (download A, upload A, download B, ...).
+            # Resume this phase's own running totals so the bar never restarts per batch.
+            self._phase = phase
+            self._phase_done = self._phase_done_by_name.get(phase, 0)
+            self._phase_total = self._phase_total_by_name.get(phase, 0)
+        if total_key and total:
+            key = (phase, total_key)
+            if key not in self._phase_total_keys:
+                self._phase_total += total
+                self._phase_total_keys.add(key)
+        elif total and total != self._phase_total:
+            self._phase_done = 0
+            self._phase_total = total
+        self.bytes_done += n
+        self._phase_done += n
+        self._phase_done_by_name[phase] = self._phase_done
+        if self._phase_total:
+            self.bytes_total = self._phase_total
+            setattr(self.progress, phase, min(100, self._phase_done / self._phase_total * 100))
+            self._phase_total_by_name[phase] = self._phase_total
+        matched_key = total_key or self.current_file
+        if matched_key:
+            base_k = matched_key.replace("\\", "/").rstrip("/").split("/")[-1]
+            target_entry = self.active_files.get(matched_key) or self.active_files.get(base_k)
+            if target_entry:
+                target_entry["bytes_done"] = target_entry.get("bytes_done", 0) + n
+                if total > 0 and not target_entry.get("size"):
+                    target_entry["size"] = total
+        now = time.time()
+        elapsed = now - self._tick_at
+        if elapsed >= 1:
+            self.speed = (self.bytes_done - self._tick_bytes) / elapsed
+            self._tick_at = now
+            self._tick_bytes = self.bytes_done
+        self.updated_at = now
+
+    def set_phase_progress(
+        self,
+        done_bytes: int = 0,
+        total_bytes: int = 0,
+        pct: float = 0.0,
+        speed: float = 0.0,
+        phase: str = "download",
+    ) -> None:
+        if phase != self._phase:
+            self._phase = phase
+        if total_bytes > 0:
+            self._phase_total = total_bytes
+            self.bytes_total = total_bytes
+            self._phase_total_by_name[phase] = total_bytes
+        if done_bytes > 0:
+            self._phase_done = done_bytes
+            self.bytes_done = done_bytes
+            self._phase_done_by_name[phase] = done_bytes
+        elif (self._phase_total > 0 or total_bytes > 0) and pct > 0:
+            tot = total_bytes or self._phase_total
+            calc_done = int(tot * (pct / 100.0))
+            self._phase_done = calc_done
+            self.bytes_done = calc_done
+            self._phase_done_by_name[phase] = calc_done
+        if pct > 0:
+            setattr(self.progress, phase, min(100.0, pct))
+        elif self._phase_total > 0:
+            setattr(self.progress, phase, min(100.0, (self._phase_done / self._phase_total) * 100.0))
+        if speed > 0:
+            self.speed = speed
+        now = time.time()
+        self.updated_at = now
+
+    def check_cancelled(self) -> None:
+        if self.cancel:
+            raise JobCancelled("JOB_CANCELLED")
+
+    def view(self) -> dict[str, Any]:
+        options = self.payload.get("options") or {}
+        phases = ["download"]
+        if options.get("extract"):
+            phases.append("extract")
+        if options.get("optimize_image"):
+            phases.append("optimize")
+        phases.append("upload")
+        return {
+            "jobId": self.job_id,
+            "status": self.status,
+            "step": self.step,
+            "progress": self.progress.__dict__,
+            "phases": phases,
+            "options": options,
+            "currentFile": self.current_file,
+            "activeFiles": self.active_files,
+            "fileSizes": self.file_sizes,
+            "downloadedFiles": list(self.downloaded_files),
+            "uploadedFiles": list(self.uploaded_files),
+            "bytesDone": self._phase_done or self.bytes_done,
+            "bytesTotal": self._phase_total or self.bytes_total,
+            "bytesOverallDone": sum(self._phase_done_by_name.values()) or self.bytes_done,
+            "bytesOverallTotal": sum(self._phase_total_by_name.values()) or self.bytes_total,
+            "bytesCumulative": self.bytes_done,
+            "speed": self.speed,
+            "logs": self.logs[-50:],
+            "error": self.error,
+            "createdAt": self.created_at,
+            "updatedAt": self.updated_at,
+            "filesDownloaded": self.files_downloaded,
+            "filesToDownload": self.files_to_download,
+            "filesUploaded": self.files_uploaded,
+            "filesSkipped": self.files_skipped,
+            "filesFailed": self.files_failed,
+            "filesToUpload": self.files_to_upload,
+            "optimizedFiles": self.optimized_files,
+            "completedItems": self.completed_items,
+            "failedItems": self.failed_items,
+            "failedFiles": self.failed_files[-50:],
+            "itemTimings": self.item_timings,
+            "confirmAction": self.confirm_action,
+            # Source item list, so the app can rebuild the per-item queue view after a
+            # restart or when it reconnects to a job it did not start itself.
+            "items": [item for item in ((self.payload.get("source") or {}).get("items") or []) if isinstance(item, dict)],
+            "targetProvider": (self.payload.get("target") or {}).get("provider"),
+            "targetAccountId": (self.payload.get("target") or {}).get("accountId") or (self.payload.get("target") or {}).get("account_id"),
+        }
+
+    def save_state(self) -> None:
+        try:
+            from ..config import JOBS_DIR
+            job_dir = JOBS_DIR / self.job_id
+            job_dir.mkdir(parents=True, exist_ok=True)
+            state_file = job_dir / "job_state.json"
+            
+            safe_payload = {}
+            if isinstance(self.payload, dict):
+                for k, v in self.payload.items():
+                    if k in ("source", "target") and isinstance(v, dict):
+                        safe_payload[k] = {sk: sv for sk, sv in v.items() if sk != "credentials"}
+                    else:
+                        safe_payload[k] = v
+
+            data = {
+                "job_id": self.job_id,
+                "payload": safe_payload,
+                "status": self.status,
+                "step": self.step,
+                "progress": self.progress.__dict__,
+                "current_file": self.current_file,
+                "downloaded_files": list(self.downloaded_files),
+                "uploaded_files": list(self.uploaded_files),
+                "bytes_done": self.bytes_done,
+                "bytes_total": self.bytes_total,
+                "files_downloaded": self.files_downloaded,
+                "files_to_download": self.files_to_download,
+                "files_uploaded": self.files_uploaded,
+                "files_to_upload": self.files_to_upload,
+                "files_skipped": self.files_skipped,
+                "files_failed": self.files_failed,
+                "completed_items": self.completed_items,
+                "failed_items": self.failed_items,
+                "item_timings": self.item_timings,
+                "logs": self.logs[-200:],
+                "error": self.error,
+                "created_at": self.created_at,
+                "updated_at": self.updated_at,
+            }
+            state_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    @classmethod
+    def load_from_state_file(cls, path: Path) -> JobState | None:
+        try:
+            if not path.is_file():
+                return None
+            data = json.loads(path.read_text(encoding="utf-8"))
+            job_id = data.get("job_id") or path.parent.name
+            payload = data.get("payload") or {}
+            job = cls(job_id=job_id, payload=payload)
+            saved_status = data.get("status", "interrupted")
+            saved_step = data.get("step", "interrupted")
+            if saved_status in {"running", "downloading", "uploading", "extracting", "pending"}:
+                job.status = "interrupted"
+                job.step = "interrupted"
+                job.error = {"code": "INTERRUPTED", "message": "Local server was stopped or restarted while transfer was in progress. Click 'Resume Transfer' to continue.", "details": {}}
+                job.logs = data.get("logs") or []
+                job.logs.append("[System] Local server restarted while transfer was in progress. Click 'Resume Transfer' to continue.")
+            else:
+                job.status = saved_status
+                job.step = saved_step
+                job.error = data.get("error")
+                job.logs = data.get("logs") or []
+            job.created_at = data.get("created_at", time.time())
+            job.updated_at = data.get("updated_at", time.time())
+            job.files_downloaded = data.get("files_downloaded", 0)
+            job.files_to_download = data.get("files_to_download", 0)
+            job.files_uploaded = data.get("files_uploaded", 0)
+            job.files_to_upload = data.get("files_to_upload", 0)
+            job.files_skipped = data.get("files_skipped", 0)
+            job.files_failed = data.get("files_failed", 0)
+            job.downloaded_files = set(data.get("downloaded_files") or [])
+            job.uploaded_files = set(data.get("uploaded_files") or [])
+            job.completed_items = data.get("completed_items") or []
+            job.failed_items = data.get("failed_items") or []
+            job.item_timings = data.get("item_timings") or {}
+            job.bytes_done = data.get("bytes_done", 0)
+            job.bytes_total = data.get("bytes_total", 0)
+            return job
+        except Exception:
+            return None

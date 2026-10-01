@@ -1,0 +1,545 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import mimetypes
+import re
+import time
+import zlib
+from pathlib import Path, PurePosixPath
+from typing import Any
+from urllib.parse import urlparse, urlunparse
+
+import httpx
+
+from .base import BaseProvider, ProviderFailure, dict_lock, is_verify_error, owner_store, safe_name, stream_download, track_client
+from ..config import TERABOX_UPLOAD_CONCURRENCY
+from ..jobs.progress import JobCancelled, JobState
+
+DEFAULT_HOST = "https://www.terabox.com"
+VALIDATION_HOSTS = ("https://www.terabox.com", "https://www.1024terabox.com", "https://www.terabox.app", "https://dm.terabox.com", "https://dm.terabox.app")
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+CONST = {"app_id": "250528", "web": "1", "channel": "dubox", "clienttype": "0"}
+PART = 4 * 1024 * 1024
+LOCATE_TTL = 600.0
+UPLOAD_CONCURRENCY = TERABOX_UPLOAD_CONCURRENCY
+JS_PAT = (r"fn%28%22([0-9A-Fa-f]+)%22%29", r'"jsToken"\s*:\s*"([0-9A-Fa-f]+)"', r"jsToken['\"]?\s*[:=]\s*['\"]([0-9A-Fa-f]+)['\"]")
+BD_PAT = (r'"bdstoken"\s*:\s*"([0-9a-f]{32})"', r"bdstoken['\"]?\s*[:=]\s*['\"]([0-9a-f]{32})['\"]")
+TOKEN_EXPIRED = {"4000020", "4000023", "450016"}
+DLINK_SUFFIXES = ("terabox.com", "nephobox.com")
+DLINK_PREFIXES = ("dm", "kul")
+
+def _dlink_candidates(dlink: str, entry: dict[str, Any] | None = None) -> list[str]:
+    """The same dlink pointed at sibling CDN edges.
+
+    A single edge can keep answering `need verify` while its neighbours serve the bytes, so
+    each verify round moves the download to the next host in this list.
+    """
+    parsed = urlparse(dlink)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return [dlink] if dlink else []
+    out = [dlink]
+
+    def add(host: str) -> None:
+        host = host.strip().lower().rstrip(".")
+        if not host or not any(host == s or host.endswith("." + s) for s in DLINK_SUFFIXES):
+            return
+        mirrored = urlunparse((parsed.scheme, host, parsed.path, parsed.params, parsed.query, parsed.fragment))
+        if mirrored not in out:
+            out.append(mirrored)
+
+    prefix, _, suffix = parsed.netloc.lower().partition(".")
+    if not any(suffix == s or suffix.endswith("." + s) for s in DLINK_SUFFIXES):
+        suffix = "terabox.com"
+    src = str((entry or {}).get("src_location") or "").strip().lower()
+    if src and src.replace("-", "").isalnum():
+        for host_suffix in dict.fromkeys([suffix, *DLINK_SUFFIXES]):
+            add(f"{src}-d.{host_suffix}")
+    for host_suffix in dict.fromkeys([suffix, *DLINK_SUFFIXES]):
+        for host_prefix in dict.fromkeys([prefix.removesuffix("-d"), *DLINK_PREFIXES]):
+            if host_prefix:
+                add(f"{host_prefix}-d.{host_suffix}")
+    return out
+
+def _cookie_dict(c: dict[str, Any]) -> dict[str, str]:
+    cookies = dict(c.get("cookies") or {})
+    raw = str(c.get("cookie") or "")
+    for part in raw.split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            cookies[k.strip()] = v.strip()
+    if c.get("ndus"):
+        cookies["ndus"] = str(c["ndus"])
+    return {k: v for k, v in cookies.items() if k and v}
+
+def _first(patterns: tuple[str, ...], text: str) -> str:
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            return m.group(1)
+    return ""
+
+def _read_part(path: Path, idx: int, part_size: int) -> bytes:
+    with path.open("rb") as fh:
+        fh.seek(idx * PART)
+        return fh.read(part_size)
+
+def _hashes(path: Path) -> dict[str, Any]:
+    file_hash = hashlib.md5()
+    slice_hash = hashlib.md5()
+    crc = 0
+    chunks = []
+    left = 256 * 1024
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(PART), b""):
+            file_hash.update(chunk)
+            crc = zlib.crc32(chunk, crc)
+            if left:
+                take = min(left, len(chunk))
+                slice_hash.update(chunk[:take])
+                left -= take
+            chunks.append(hashlib.md5(chunk).hexdigest())
+    return {"file": file_hash.hexdigest(), "slice": slice_hash.hexdigest(), "crc32": crc & 0xFFFFFFFF, "chunks": chunks or [hashlib.md5(b"").hexdigest()]}
+
+class TeraBoxSession:
+    def __init__(self, credentials: dict[str, Any], *, track_clients: bool = False) -> None:
+        self.cookies = _cookie_dict(credentials)
+        self.base = str(credentials.get("region_host") or DEFAULT_HOST).rstrip("/")
+        self.jstoken = str(credentials.get("jstoken") or credentials.get("jsToken") or "")
+        self.bdstoken = str(credentials.get("bdstoken") or "")
+        self._track_clients = track_clients
+
+    def client(self) -> httpx.AsyncClient:
+        """Shared keep-alive client for API calls: saves a TCP+TLS handshake per request."""
+        client = getattr(self, "_api_client", None)
+        if client is None or getattr(client, "is_closed", False):
+            client = httpx.AsyncClient(cookies=self.cookies, timeout=httpx.Timeout(None, connect=30.0), follow_redirects=True, headers={"User-Agent": UA})
+            self._api_client = track_client(client) if self._track_clients else client
+        return client
+
+    def upload_client(self) -> httpx.AsyncClient:
+        """Separate pool for superfile2 parts: no redirect following, wider connection budget."""
+        client = getattr(self, "_upload_client", None)
+        if client is None or getattr(client, "is_closed", False):
+            client = httpx.AsyncClient(cookies=self.cookies, timeout=httpx.Timeout(None, connect=30.0), headers={"User-Agent": UA}, limits=httpx.Limits(max_connections=64, max_keepalive_connections=32))
+            self._upload_client = track_client(client) if self._track_clients else client
+        return client
+
+    async def aclose(self) -> None:
+        for name in ("_api_client", "_upload_client"):
+            client = getattr(self, name, None)
+            if client is not None and not getattr(client, "is_closed", False):
+                await client.aclose()
+
+    def headers(self, *, referer: str = "", json_accept: bool = True) -> dict[str, str]:
+        h = {"User-Agent": UA, "Accept": "application/json, text/plain, */*" if json_accept else "text/html,*/*", "Accept-Language": "en-US,en;q=0.9", "Referer": referer or f"{self.base}/main?category=all", "X-Requested-With": "XMLHttpRequest"}
+        if not json_accept:
+            h.pop("X-Requested-With", None)
+        return h
+
+    def params(self, **extra: Any) -> dict[str, str]:
+        out = dict(CONST)
+        if self.jstoken:
+            out["jsToken"] = self.jstoken
+        out.update({k: str(v) for k, v in extra.items() if v is not None})
+        return out
+
+    async def request_json(self, method: str, url: str, *, context: str, _verified: bool = False, **kw: Any) -> dict[str, Any]:
+        resp = await self.client().request(method, url, **kw)
+        self.cookies.update({k: v for k, v in resp.cookies.items() if v})
+        if resp.status_code in (401, 403):
+            raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", f"TeraBox rejected credentials during {context}")
+        try:
+            data = resp.json()
+        except Exception as exc:
+            raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", f"TeraBox returned non-JSON during {context}") from exc
+        errno = data.get("errno", data.get("errcode"))
+        if errno not in (None, 0, "0"):
+            code = int(errno) if str(errno).lstrip("-").isdigit() else -1
+            if str(code) in TOKEN_EXPIRED and not _verified:
+                # What the web client does for "need verify"/token expiry: re-scrape jsToken
+                # from the logged-in page and replay the call once with the fresh token.
+                await self.bootstrap_tokens(force=True)
+                params = kw.get("params")
+                if isinstance(params, dict) and self.jstoken:
+                    params["jsToken"] = self.jstoken
+                return await self.request_json(method, url, context=context, _verified=True, **kw)
+            if code in {111, -62, 6, -6, 4000023}:
+                raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", f"TeraBox session invalid ({context})", {"errno": code})
+            if code in {31034, -32}:
+                raise ProviderFailure("PROVIDER_RATE_LIMITED", f"TeraBox rate limited ({context})", {"errno": code})
+            if code == -9:
+                raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"TeraBox path not found ({context})")
+            if is_verify_error({"errno": code, "message": data.get("errmsg") or ""}):
+                # Verification still demanded after a token refresh: recoverable, so the caller
+                # retries on a delay instead of failing the whole job.
+                raise ProviderFailure("PROVIDER_NEEDS_VERIFY", f"TeraBox wants verification ({context})", {"errno": code, "body": data})
+            failure_code = "UPLOAD_FAILED" if any(token in context for token in ("upload", "precreate", "create folder", "rename", "filemanager")) else "DOWNLOAD_FAILED"
+            raise ProviderFailure(failure_code, f"TeraBox API error ({context})", {"errno": code, "body": data})
+        return data
+
+    async def bootstrap_tokens(self, *, force: bool = False) -> None:
+        if self.jstoken and self.bdstoken and not force:
+            return
+        resp = await self.client().get(f"{self.base}/main?category=all", timeout=30, headers=self.headers(json_accept=False))
+        self.cookies.update({k: v for k, v in resp.cookies.items() if v})
+        html = resp.text
+        self.jstoken = ("" if force else self.jstoken) or _first(JS_PAT, html)
+        self.bdstoken = ("" if force else self.bdstoken) or _first(BD_PAT, html)
+
+    async def ready(self) -> None:
+        if not self.cookies.get("ndus"):
+            raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "TeraBox ndus cookie missing")
+        hosts = [self.base, *[h for h in VALIDATION_HOSTS if h != self.base]]
+        for host in hosts:
+            try:
+                data = await self.request_json("GET", f"{host}/passport/get_info", context="get_info", params=self.params(), headers=self.headers(referer=f"{host}/main?category=all"))
+                if "data" in data:
+                    self.base = host
+                    break
+            except ProviderFailure:
+                continue
+        await self.bootstrap_tokens()
+
+class TeraBoxProvider(BaseProvider):
+    name = "terabox"
+
+    def _folder_locks(self, owner: Any) -> dict[Any, asyncio.Lock]:
+        return owner_store(f"{self.name}:folders", owner).setdefault("locks", {})
+
+    def _folder_cache(self, owner: Any) -> dict[Any, str]:
+        return owner_store(f"{self.name}:folders", owner).setdefault("cache", {})
+
+    async def _session(self, credentials: dict[str, Any]) -> TeraBoxSession:
+        """One ready() session per (job loop, credentials): skips get_info + token scrape per file."""
+        store = owner_store(f"{self.name}:session", credentials)
+        async with dict_lock(store.setdefault("locks", {}), "session"):
+            s = store.get("session")
+            if s is None:
+                s = TeraBoxSession(credentials, track_clients=True)
+                await s.ready()
+                store["session"] = s
+            return s
+
+    async def validate_credentials(self, credentials: dict[str, Any]) -> dict[str, Any]:
+        s = TeraBoxSession(credentials)
+        try:
+            await s.ready()
+            return {"ok": True, "region_host": s.base}
+        finally:
+            await s.aclose()
+
+    async def list_files(self, credentials: dict[str, Any], path_or_id: str) -> dict[str, Any]:
+        s = TeraBoxSession(credentials)
+        try:
+            await s.ready()
+            data = await s.request_json("GET", f"{s.base}/api/list", context=f"list {path_or_id}", params=s.params(order="time", desc=1, dir=path_or_id or "/", num=1000, page=1, showempty=0), headers=s.headers())
+            return {"items": [{"id": i.get("path"), "path": i.get("path"), "name": i.get("server_filename"), "type": "folder" if i.get("isdir") else "file", "size": i.get("size", 0)} for i in data.get("list") or []]}
+        finally:
+            await s.aclose()
+
+    async def _dlink(self, s: TeraBoxSession, path: str) -> dict[str, Any]:
+        data = await s.request_json("GET", f"{s.base}/api/filemetas", context=f"filemetas {path}", params=s.params(target=json.dumps([path], ensure_ascii=False), dlink=1), headers=s.headers())
+        info = (data.get("info") or [{}])[0]
+        if not info.get("dlink"):
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"TeraBox file not found: {path}")
+        return info
+
+    async def _resolve_file_paths(self, credentials: dict[str, Any], ref: dict[str, Any]) -> list[str]:
+        path = str(ref.get("path") or ref.get("id") or "")
+        if not path:
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "TeraBox path missing")
+        return [path]
+
+    async def _create_folder(self, s: TeraBoxSession, path: str) -> None:
+        try:
+            await s.request_json("POST", f"{s.base}/api/create", context=f"create folder {path}", params=s.params(a="commit"), data={"path": path, "isdir": "1", "block_list": "[]"}, headers={**s.headers(), "Content-Type": "application/x-www-form-urlencoded"})
+        except ProviderFailure as exc:
+            text = f"{exc.message} {exc.details}".lower()
+            if not any(token in text for token in ("repeat", "exist", "already", "-8")):
+                raise
+
+    async def _find_child_folder(self, s: TeraBoxSession, parent: str, name: str) -> str:
+        data = await s.request_json("GET", f"{s.base}/api/list", context=f"list {parent}", params=s.params(order="time", desc=1, dir=parent or "/", num=1000, page=1, showempty=0), headers=s.headers())
+        for item in data.get("list") or []:
+            if item.get("isdir") and item.get("server_filename") == name and item.get("path"):
+                return str(item["path"])
+        return ""
+
+    async def _ensure_relative_parent(self, s: TeraBoxSession, parent: str, relative_path: str) -> str:
+        cache = self._folder_cache(s)
+        locks = self._folder_locks(s)
+        current = parent.rstrip("/") or "/"
+        for part in [p for p in Path(relative_path).parent.as_posix().split("/") if p and p != "."]:
+            key = (current, part)
+            known = cache.get(key)
+            if known:
+                current = known
+                continue
+            # Single-flight per (parent, name): concurrent uploads must not create the same folder twice.
+            async with dict_lock(locks, key):
+                known = cache.get(key)
+                if not known:
+                    known = await self._find_child_folder(s, current, part)
+                    if not known:
+                        known = f"{current}/{part}" if current != "/" else f"/{part}"
+                        await self._create_folder(s, known)
+                    cache[key] = known
+            current = known
+        return current
+
+    async def download_file(self, credentials: dict[str, Any], file_ref: dict[str, Any], local_path: Path, progress: JobState) -> Path:
+        s = await self._session(credentials)
+        path = (await self._resolve_file_paths(credentials, file_ref))[0]
+        file_ref["path"] = path
+        meta = await self._dlink(s, path)
+        name = file_ref.get("name") or meta.get("server_filename") or PurePosixPath(path).name
+        dest = local_path if local_path.suffix else local_path / safe_name(name)
+        progress.set(step="downloading", current_file=dest.name)
+
+        def dl_headers() -> dict[str, str]:
+            # Referer matters: without it the CDN is markedly more likely to answer the dlink
+            # with `need verify` instead of bytes.
+            return {
+                "User-Agent": UA,
+                "Referer": f"{s.base}/",
+                "Accept": "*/*",
+                "Cookie": "; ".join(f"{k}={v}" for k, v in s.cookies.items()),
+            }
+
+        async def verify(round_index: int) -> dict[str, Any]:
+            """Re-verify the session the way the web client does, then hand back a fresh link.
+
+            Round 0 retries the freshly issued dlink (new jsToken + cookies); later rounds move
+            to a sibling CDN edge, since one edge can keep refusing what its neighbours serve.
+            """
+            await s.bootstrap_tokens(force=True)
+            fresh = await self._dlink(s, path)
+            urls = _dlink_candidates(str(fresh.get("dlink") or meta.get("dlink") or ""), fresh)
+            return {"url": urls[min(round_index, len(urls) - 1)], "headers": dl_headers()}
+
+        return await stream_download(str(meta["dlink"]), dest, progress, headers=dl_headers(), on_verify=verify)
+
+    async def _upload_hosts(self, s: TeraBoxSession) -> list[str]:
+        """locateupload is session-wide, not per-file: resolve it once per job (TTL 10 min)."""
+        store = owner_store(f"{self.name}:locate", s)
+        async with dict_lock(store.setdefault("locks", {}), "locate"):
+            cached = store.get("hosts")
+            if cached and time.monotonic() - float(store.get("at") or 0) < LOCATE_TTL:
+                return list(cached)
+            hosts = await self._locate_upload_hosts(s)
+            store["hosts"] = list(hosts)
+            store["at"] = time.monotonic()
+            return list(hosts)
+
+    async def _locate_upload_hosts(self, s: TeraBoxSession) -> list[str]:
+        hosts = []
+        try:
+            prefix = (urlparse(s.base).hostname or "").split(".", 1)[0]
+            # "www-d.terabox.com" does not resolve; only region prefixes (dm, jp, ...) have a -d host.
+            if prefix and prefix != "www":
+                hosts.append(f"https://{prefix}-d.terabox.com")
+        except Exception:
+            pass
+        hosts.extend(["https://d.terabox.com", "https://dm-d.terabox.com"])
+        seen: set[str] = set()
+        client = s.client()
+        for host in hosts:
+            if host in seen:
+                continue
+            seen.add(host)
+            try:
+                resp = await client.get(
+                    f"{host}/rest/2.0/pcs/file",
+                    params={"method": "locateupload"},
+                    timeout=5,
+                    headers={**s.headers(referer=f"{s.base}/vietnamese/main?category=all"), "Content-Type": "application/json;charset=UTF-8"},
+                )
+                s.cookies.update({k: v for k, v in resp.cookies.items() if v})
+                payload = resp.json()
+            except Exception:
+                continue
+            host_value = payload.get("host")
+            if host_value:
+                return [f"https://{str(host_value).removeprefix('https://').removeprefix('http://').strip('/')}"]
+            servers = [str(item) for item in (payload.get("server") or []) if item]
+            if servers:
+                return [f"https://{server.removeprefix('https://').removeprefix('http://').strip('/')}" for server in servers]
+        return ["https://dm1-cdata.terabox.com", "https://dm2-cdata.terabox.com", "https://kul-cdata.terabox.com"]
+
+    async def _precreate_upload(self, s: TeraBoxSession, remote_path: str, parent: str, size: int, hashes: dict[str, Any], rtype: str = "2") -> dict[str, Any]:
+        form = {
+            "path": remote_path,
+            "autoinit": "1",
+            "target_path": parent,
+            "block_list": json.dumps(hashes["chunks"]),
+            "size": str(size),
+            "rtype": rtype,
+            "file_limit_switch_v34": "true",
+            "g_identity": "",
+            "local_mtime": "0",
+            "content-md5": hashes["file"],
+            "slice-md5": hashes["slice"],
+            "content-crc32": str(hashes["crc32"]),
+        }
+        last: dict[str, Any] = {}
+        for attempt in range(2):
+            resp = await s.client().post(f"{s.base}/api/precreate", params=s.params(jsToken=s.jstoken), data=form, headers={**s.headers(), "Content-Type": "application/x-www-form-urlencoded"})
+            s.cookies.update({k: v for k, v in resp.cookies.items() if v})
+            try:
+                payload = resp.json()
+            except Exception as exc:
+                if attempt == 0:
+                    await s.bootstrap_tokens(force=True)
+                    continue
+                raise ProviderFailure("UPLOAD_FAILED", f"TeraBox returned non-JSON during precreate {remote_path}") from exc
+            last = payload
+            errno = str(payload.get("errno", payload.get("errcode", "")))
+            if errno in TOKEN_EXPIRED and attempt == 0:
+                await s.bootstrap_tokens(force=True)
+                continue
+            if resp.status_code >= 400:
+                raise ProviderFailure("UPLOAD_FAILED", f"TeraBox precreate HTTP {resp.status_code}", {"body": resp.text[:300]})
+            if payload.get("errno", payload.get("errcode")) not in (None, 0, "0"):
+                code = int(errno) if errno.lstrip("-").isdigit() else -1
+                if code in {111, -62, 6, -6, 4000023}:
+                    raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "TeraBox session invalid (precreate)", {"errno": code, "body": payload})
+                if code in {31034, -32}:
+                    raise ProviderFailure("PROVIDER_RATE_LIMITED", "TeraBox rate limited (precreate)", {"errno": code, "body": payload})
+                raise ProviderFailure("UPLOAD_FAILED", f"TeraBox precreate failed", {"body": payload})
+            return payload
+        raise ProviderFailure("UPLOAD_FAILED", "TeraBox precreate failed", {"body": last})
+
+    async def _upload_part(self, client: httpx.AsyncClient, s: TeraBoxSession, host: str, local_path: Path, remote_path: str, upload_id: str, idx: int, part_size: int, mime: str) -> None:
+        data = await asyncio.to_thread(_read_part, local_path, idx, part_size)
+        resp = await client.post(
+            f"{host}/rest/2.0/pcs/superfile2",
+            params={**CONST, "method": "upload", "path": remote_path, "uploadid": upload_id, "partseq": str(idx)},
+            files={"file": ("blob", data, mime)},
+            headers={"Origin": s.base, "Referer": f"{s.base}/"},
+        )
+        s.cookies.update({k: v for k, v in resp.cookies.items() if v})
+        if resp.status_code >= 400:
+            raise ProviderFailure("UPLOAD_FAILED", f"TeraBox upload part {idx} failed HTTP {resp.status_code}", {"body": resp.text[:200]})
+        try:
+            payload = resp.json()
+        except Exception as exc:
+            raise ProviderFailure("UPLOAD_FAILED", f"TeraBox upload part {idx} returned non-JSON") from exc
+        errno = payload.get("errno") if payload.get("errno") is not None else payload.get("error_code")
+        if errno not in (None, 0, "0"):
+            if str(errno) in TOKEN_EXPIRED:
+                await s.bootstrap_tokens(force=True)
+            raise ProviderFailure("UPLOAD_FAILED", f"TeraBox upload part {idx} failed", {"errno": errno, "body": payload})
+
+    async def _upload_parts(self, s: TeraBoxSession, host: str, local_path: Path, remote_path: str, upload_id: str, size: int, mime: str, progress: JobState, concurrency: int) -> None:
+        part_sizes = [0] if size == 0 else [min(PART, size - off) for off in range(0, size, PART)]
+        sem = asyncio.Semaphore(max(1, int(concurrency or 1)))
+        lock = asyncio.Lock()
+        client = s.upload_client()
+
+        async def run(idx: int, part_size: int) -> None:
+            async with sem:
+                last: ProviderFailure | None = None
+                for attempt in range(4):
+                    progress.check_cancelled()
+                    try:
+                        await self._upload_part(client, s, host, local_path, remote_path, upload_id, idx, part_size, mime)
+                        async with lock:
+                            progress.add_bytes(part_size, size, "upload", remote_path)
+                        return
+                    except ProviderFailure as exc:
+                        last = exc
+                        if attempt < 3:
+                            await asyncio.sleep(0.5 * (attempt + 1))
+                raise last or ProviderFailure("UPLOAD_FAILED", f"TeraBox upload part {idx} failed")
+
+        await asyncio.gather(*(run(i, part_size) for i, part_size in enumerate(part_sizes)))
+
+    async def upload_file(self, credentials: dict[str, Any], local_path: Path, target_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:
+        s = await self._session(credentials)
+        rel = str(target_ref.get("relative_path") or local_path.name)
+        parent = await self._ensure_relative_parent(s, str(target_ref.get("id") or target_ref.get("path") or "/"), rel)
+        name = Path(rel).name
+        remote_path = f"{parent}/{name}" if parent != "/" else f"/{name}"
+        size = local_path.stat().st_size
+        hashes = await asyncio.to_thread(_hashes, local_path)
+        progress.set(step="uploading", current_file=name)
+        
+        options = progress.payload.get("options") or {}
+        replace = bool(options.get("replace"))
+        rtype = "3" if replace else "2"
+        
+        pre = await self._precreate_upload(s, remote_path, parent, size, hashes, rtype=rtype)
+        upload_id = pre.get("uploadid") or pre.get("upload_id")
+        if not upload_id:
+            raise ProviderFailure("UPLOAD_FAILED", "TeraBox precreate did not return uploadid")
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        last = ""
+        uploaded = False
+        part_count = 1 if size == 0 else (size + PART - 1) // PART
+        thread_count = int(options.get("upload_threads") or options.get("uploadThreads") or options.get("download_threads") or options.get("threads_per_item") or options.get("downloadThreads") or UPLOAD_CONCURRENCY)
+        ladder = tuple(dict.fromkeys((thread_count, UPLOAD_CONCURRENCY, 16, 8, 4, 2, 1))) if part_count > 1 else (thread_count,)
+        for index, host in enumerate(await self._upload_hosts(s)):
+            if index:
+                # A different host will not accept the previous host's uploadid.
+                pre = await self._precreate_upload(s, remote_path, parent, size, hashes, rtype=rtype)
+                upload_id = pre.get("uploadid") or pre.get("upload_id") or upload_id
+            for concurrency in ladder:
+                try:
+                    await self._upload_parts(s, host, local_path, remote_path, str(upload_id), size, mime, progress, concurrency)
+                    uploaded = True
+                    break
+                except (JobCancelled, asyncio.CancelledError):
+                    raise
+                except ProviderFailure as exc:
+                    last = exc.message
+                    if exc.code in ("INVALID_PROVIDER_CREDENTIALS", "PROVIDER_RATE_LIMITED"):
+                        raise
+                except Exception as exc:
+                    last = str(exc)
+            if uploaded:
+                break
+        if not uploaded:
+            raise ProviderFailure("UPLOAD_FAILED", f"TeraBox upload parts failed: {last}")
+        return await s.request_json("POST", f"{s.base}/api/create", context=f"upload create {remote_path}", params=s.params(a="commit"), data={
+            "path": remote_path, "size": str(size), "isdir": "0", "uploadid": str(upload_id), "target_path": parent, "block_list": json.dumps(hashes["chunks"]), "content-md5": hashes["file"], "slice-md5": hashes["slice"], "content-crc32": str(hashes["crc32"]), "rtype": rtype, "local_mtime": "0",
+        }, headers={**s.headers(), "Content-Type": "application/x-www-form-urlencoded"})
+
+    async def replace_file(self, credentials: dict[str, Any], local_path: Path, source_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:
+        relay = source_ref.get("relay") if isinstance(source_ref.get("relay"), dict) else {}
+        source_path = str(source_ref.get("path") or source_ref.get("id") or relay.get("sourcePath") or relay.get("sourceId") or "")
+        if not source_path:
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "TeraBox source path missing")
+        parent = str(PurePosixPath(source_path).parent)
+        parent = "/" if parent == "." else parent
+        old_name = PurePosixPath(source_path).name
+        options = progress.payload.setdefault("options", {})
+        old_replace = options.get("replace")
+        options["replace"] = True
+        try:
+            await self.upload_file(credentials, local_path, {"id": parent, "relative_path": old_name}, progress)
+        finally:
+            if old_replace is None:
+                options.pop("replace", None)
+            else:
+                options["replace"] = old_replace
+        return {"ok": True, "old_path": source_path, "new_name": old_name, "renamed": False}
+
+    async def delete_file(self, credentials: dict[str, Any], file_ref: dict[str, Any]) -> dict[str, Any]:
+        s = await self._session(credentials)
+        path = str(file_ref.get("path") or file_ref.get("id") or "")
+        if not path:
+            return {"ok": False, "error": "Path missing"}
+        try:
+            return await s.request_json(
+                "POST",
+                f"{s.base}/api/filemanager",
+                context=f"delete {path}",
+                params=s.params(opera="delete"),
+                data={"filelist": json.dumps([path], ensure_ascii=False)},
+                headers={**s.headers(), "Content-Type": "application/x-www-form-urlencoded"}
+            )
+        finally:
+            await s.aclose()
+

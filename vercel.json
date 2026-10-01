@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "cleanUrls": true,
+  "rewrites": [
+    {
+      "source": "/",
+      "destination": "/Web Tracking Vaultbox/index.html"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/Web Tracking Vaultbox/$1"
+    }
+  ]
+}

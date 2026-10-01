@@ -1,0 +1,12 @@
+{
+  "name": "vaultbox-server-tracking",
+  "version": "1.0.0",
+  "description": "Realtime server tracking and live log monitor for VaultBox Colab & Cloudflare servers",
+  "scripts": {
+    "start": "serve -p 5173",
+    "dev": "serve -p 5173"
+  },
+  "devDependencies": {
+    "serve": "^14.2.4"
+  }
+}

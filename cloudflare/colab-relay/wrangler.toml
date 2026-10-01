@@ -1,0 +1,13 @@
+name = "vaultbox-colab-relay"
+main = "worker.js"
+compatibility_date = "2026-09-10"
+account_id = "f0c646c5607363168a28288df7ccc141"
+workers_dev = true
+
+[[durable_objects.bindings]]
+name = "COLAB_RELAY"
+class_name = "ColabRelayRoom"
+
+[[migrations]]
+tag = "v1_colab_relay"
+new_sqlite_classes = ["ColabRelayRoom"]

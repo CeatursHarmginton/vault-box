@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>VaultBox Server Tracking - Colab & Cloudflare</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22%2338bdf8%22 stroke-width=%222%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22><polygon points=%2213 2 3 14 12 14 11 22 21 10 12 10 13 2%22/></svg>">
+  <link rel="stylesheet" href="css/styles.css">
+  <link rel="stylesheet" href="css/terminal.css">
+</head>
+<body>
+  <!-- Header Bar -->
+  <header class="app-header">
+    <div class="brand-section">
+      <div class="brand-logo" id="brandLogo">
+        <!-- SVG Zap Icon injected via JS -->
+      </div>
+      <div class="brand-text-container">
+        <div class="brand-title">VaultBox Tracking</div>
+        <div class="brand-subtitle">Realtime Colab / Cloudflare</div>
+      </div>
+    </div>
+
+    <!-- Header Stats (Desktop) -->
+    <div class="header-stats">
+      <div class="stat-chip" title="Total active servers in the last 12 hours">
+        <span class="pulse-dot offline"></span>
+        <span>Total: <span class="stat-chip-val" id="totalServersStat">0</span></span>
+      </div>
+
+      <div class="stat-chip" title="Servers currently connected and online">
+        <span class="pulse-dot online"></span>
+        <span>Online: <span class="stat-chip-val" id="onlineServersStat" style="color: var(--success);">0</span></span>
+      </div>
+
+      <div class="stat-chip" title="Active transfer or optimization jobs running">
+        <span class="pulse-dot active"></span>
+        <span>Jobs: <span class="stat-chip-val" id="activeJobsStat" style="color: var(--accent);">0</span></span>
+      </div>
+
+      <div class="stat-chip" title="WebSocket Live Streaming Status">
+        <span class="pulse-dot" id="wsStatusDot"></span>
+        <span id="wsStatusText">Connecting...</span>
+      </div>
+    </div>
+
+    <!-- Header Actions -->
+    <div class="header-actions">
+      <span class="header-sync-time" style="font-size: 11px; color: var(--text-muted); display: flex; align-items: center; gap: 4px;">
+        <span id="clockIconWrap"></span>
+        <span id="lastSyncTime">--:--:--</span>
+      </span>
+      <button class="btn btn-sm header-action-btn" id="refreshBtn" title="Manually refresh server list">
+        <span id="refreshIconWrap"></span>
+        <span class="btn-text">Refresh</span>
+      </button>
+      <button class="btn btn-sm header-action-btn" id="clearJobsBtn" title="Clear all jobs history across servers" style="color: var(--danger); border-color: rgba(248, 113, 113, 0.25);">
+        <span id="trashIconWrap"></span>
+        <span class="btn-text">Clear Jobs</span>
+      </button>
+      <button class="btn btn-sm btn-icon-only header-action-btn" id="relayConfigBtn" title="Configure Cloudflare Relay URL">
+        <span id="settingsIconWrap"></span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Mobile Segmented Tab Navigation -->
+  <div class="mobile-tab-nav" id="mobileTabNav">
+    <button class="mobile-tab-btn active" data-tab="servers" id="mobTabServers">
+      <span id="mobServerIcon"></span>
+      <span>Servers (<span id="mobServerCount">0</span>)</span>
+    </button>
+    <button class="mobile-tab-btn" data-tab="job" id="mobTabJob">
+      <span id="mobJobIcon"></span>
+      <span>Active Job</span>
+    </button>
+    <button class="mobile-tab-btn" data-tab="terminal" id="mobTabTerminal">
+      <span id="mobTermIcon"></span>
+      <span>Live Logs</span>
+    </button>
+  </div>
+
+  <!-- Main Container -->
+  <div class="app-container">
+    <!-- Sidebar: Server List -->
+    <aside class="sidebar" id="sidebarSection">
+      <div class="sidebar-header">
+        <div class="search-box">
+          <span class="search-icon" id="searchIconWrap"></span>
+          <input type="text" class="search-input" id="serverSearchInput" placeholder="Search servers, room ID...">
+        </div>
+
+        <div class="filter-pills">
+          <button class="filter-pill active" data-filter="all">All</button>
+          <button class="filter-pill" data-filter="online">Online 🟢</button>
+          <button class="filter-pill" data-filter="active">Jobs ⚡</button>
+          <button class="filter-pill" data-filter="offline">Offline (&lt;12h)</button>
+        </div>
+      </div>
+
+      <!-- Servers List Container -->
+      <div class="servers-list" id="serversList">
+        <div class="empty-state-box">
+          <div class="empty-state-icon" id="loadingIconWrap"></div>
+          <div style="font-weight: 700; font-size: 13px; color: var(--text-primary);">Loading servers...</div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="main-content" id="mainContentSection">
+      <!-- Server Hero Banner -->
+      <div id="serverBannerContainer"></div>
+
+      <!-- Job Card Section -->
+      <div class="jobs-container" id="jobContainer"></div>
+
+      <!-- Terminal Logs Section -->
+      <div id="terminalContainer"></div>
+    </main>
+  </div>
+
+  <!-- JavaScript Entry Point -->
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

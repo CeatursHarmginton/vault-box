@@ -1,0 +1,370 @@
+/* ==========================================================================
+   VaultBox Exact Live Console Styles (Rich Syntax Highlighting)
+   ========================================================================== */
+
+.colab-console-wrapper {
+  background: #090a10;
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+}
+
+.colab-console-wrapper.fullscreen {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 99999;
+  border-radius: 0;
+  border: none;
+}
+
+.colab-console-header {
+  background: #141724;
+  border-bottom: 1px solid var(--panel-border);
+  padding: 8px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.console-title-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.console-window-dots {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.console-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  opacity: 0.9;
+}
+.console-dot.red { background: #ff5f56; }
+.console-dot.yellow { background: #ffbd2e; }
+.console-dot.green { background: #27c93f; }
+
+.console-title {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+.console-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.console-search-input {
+  background: #090a10;
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  padding: 3px 8px 3px 22px;
+  color: var(--text);
+  font-size: 10.5px;
+  font-family: var(--font-mono);
+  width: 110px;
+  outline: none;
+  transition: width 0.2s ease, border-color 0.15s ease;
+}
+
+.console-search-input:focus {
+  width: 150px;
+  border-color: var(--src-color);
+}
+
+.console-search-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.console-search-icon {
+  position: absolute;
+  left: 6px;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.console-filter-chips {
+  display: flex;
+  gap: 3px;
+}
+
+.console-filter-chip {
+  padding: 2px 7px;
+  font-size: 10px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  border-radius: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--panel-border);
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.console-filter-chip.active {
+  background: var(--src-bg);
+  border-color: var(--src-border);
+  color: var(--src-color);
+}
+
+.console-scroll-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.console-scroll-input {
+  accent-color: var(--src-color);
+  cursor: pointer;
+}
+
+/* Console Log Viewport */
+.colab-console-body {
+  padding: 14px 16px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.8;
+  color: #e2e8f0;
+  min-height: 220px;
+  max-height: 420px;
+  overflow-y: auto;
+  word-break: break-all;
+  white-space: pre-wrap;
+  user-select: text;
+  letter-spacing: 0.15px;
+}
+
+.colab-console-wrapper.fullscreen .colab-console-body {
+  max-height: none;
+  flex: 1;
+}
+
+/* ==========================================================================
+   Syntax Colored Lines & Tags
+   ========================================================================== */
+.log-line {
+  display: block;
+  padding: 2px 6px;
+  margin: 1.5px 0;
+  border-radius: 4px;
+  transition: background 0.15s ease;
+}
+
+.log-line:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* Log Tag Badges */
+.log-tag {
+  font-weight: 700;
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 10.5px;
+  margin-right: 6px;
+  display: inline-block;
+  line-height: 1.4;
+  letter-spacing: 0.2px;
+}
+
+.log-tag-done {
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.16);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+}
+
+.log-tag-cleanup {
+  color: #f59e0b;
+  background: rgba(245, 158, 11, 0.16);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+}
+
+.log-tag-download {
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.16);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+}
+
+.log-tag-upload {
+  color: #c084fc;
+  background: rgba(192, 132, 252, 0.16);
+  border: 1px solid rgba(192, 132, 252, 0.35);
+}
+
+.log-tag-backup {
+  color: #60a5fa;
+  background: rgba(96, 165, 250, 0.16);
+  border: 1px solid rgba(96, 165, 250, 0.35);
+}
+
+.log-tag-assembly {
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.16);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+}
+
+.log-tag-ip {
+  color: #a78bfa;
+  background: rgba(167, 139, 250, 0.16);
+  border: 1px solid rgba(167, 139, 250, 0.35);
+}
+
+.log-tag-trace {
+  color: #94a3b8;
+  background: rgba(148, 163, 184, 0.16);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+}
+
+.log-tag-retry {
+  color: #fb923c;
+  background: rgba(251, 146, 60, 0.16);
+  border: 1px solid rgba(251, 146, 60, 0.35);
+}
+
+.log-tag-error {
+  color: #f87171;
+  background: rgba(248, 113, 113, 0.2);
+  border: 1px solid rgba(248, 113, 113, 0.4);
+}
+
+.log-tag-success {
+  color: #34d399;
+  background: rgba(52, 211, 153, 0.16);
+  border: 1px solid rgba(52, 211, 153, 0.35);
+}
+
+.log-tag-default {
+  color: #93c5fd;
+  background: rgba(59, 130, 246, 0.14);
+  border: 1px solid rgba(59, 130, 246, 0.3);
+}
+
+/* Category Specific Line Styling */
+.log-line-done {
+  color: #fbbf24;
+  font-weight: 500;
+}
+
+.log-line-cleanup {
+  color: #f59e0b;
+  font-weight: 500;
+}
+
+.log-line-summary {
+  color: #38bdf8;
+  font-weight: 600;
+  background: rgba(56, 189, 248, 0.08);
+  border-left: 3px solid #38bdf8;
+  padding: 3px 8px;
+  margin: 4px 0;
+  border-radius: 0 4px 4px 0;
+}
+
+.log-line-retry {
+  color: #fdba74;
+}
+
+.log-line-final {
+  color: #cbd5e1;
+}
+
+.log-line-backup {
+  color: #f1f5f9;
+}
+
+.log-line-download {
+  color: #e2e8f0;
+}
+
+.log-line-upload {
+  color: #e2e8f0;
+}
+
+.log-line-trace {
+  color: #94a3b8;
+}
+
+.log-line-ip {
+  color: #cbd5e1;
+}
+
+.log-line.log-error {
+  color: #f87171 !important;
+  background: rgba(248, 113, 113, 0.12);
+  border-left: 3px solid #ef4444;
+  padding: 4px 8px;
+  margin: 4px 0;
+  border-radius: 0 4px 4px 0;
+  font-weight: 500;
+}
+
+.log-line.log-success {
+  color: #34d399 !important;
+  font-weight: 600;
+}
+
+.log-line.log-warn {
+  color: #fbbf24 !important;
+}
+
+/* Inline Highlight Token Colors */
+.log-highlight-pct {
+  color: #f0c040;
+  font-weight: 700;
+}
+
+.log-highlight-size {
+  color: #38bdf8;
+  font-weight: 600;
+}
+
+.log-highlight-url {
+  color: #64748b;
+  text-decoration: underline;
+  word-break: break-all;
+}
+
+.log-highlight-code {
+  color: #f87171;
+  font-weight: 700;
+  background: rgba(248, 113, 113, 0.15);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.log-index {
+  color: var(--src-color);
+  font-weight: 700;
+  margin-right: 4px;
+}
+
+.log-empty {
+  color: var(--muted);
+  font-style: italic;
+  text-align: center;
+  padding: 36px 0;
+  font-size: 11.5px;
+}
