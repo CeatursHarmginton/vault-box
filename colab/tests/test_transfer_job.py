@@ -4360,6 +4360,43 @@ def test_transfer_strategy_file_by_file(tmp_path, monkeypatch):
     assert "up_a.txt" in events
     assert "up_b.txt" in events
     assert job.files_uploaded == 2
+    assert any("[1/2] Uploaded: a.txt" in line for line in job.logs)
+    assert any("[2/2] Uploaded: b.txt" in line for line in job.logs)
+
+
+def test_transfer_strategy_file_by_file_upload_count_monotonic(tmp_path, monkeypatch):
+    dirs = {"input": tmp_path / "input", "output": tmp_path / "output"}
+    dirs["input"].mkdir()
+    dirs["output"].mkdir()
+
+    class MockSource:
+        async def download_file(self, credentials, item, local_path, progress):
+            out = local_path / item["name"]
+            out.write_text("data")
+            return out
+
+    class MockTarget:
+        async def upload_file(self, credentials, local_path, target_ref, progress):
+            return {"ok": True}
+
+    monkeypatch.setattr(transfer_job_mod, "job_dirs", lambda job_id: dirs)
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "links", MockSource())
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "drive", MockTarget())
+
+    items = [{"id": f"http://example.com/file{i}.mp4", "name": f"file{i}.mp4", "type": "file"} for i in range(1, 6)]
+    payload = {
+        "source": {"provider": "links", "items": items},
+        "target": {"provider": "drive", "credentials": {}, "folder": {}},
+        "options": {"transfer_strategy": "file_by_file", "download_concurrency": 1, "upload_concurrency": 1, "cleanupAfterFinish": True},
+    }
+    job = JobState("test-strat-pipe-monotonic", payload)
+    asyncio.run(run_transfer(job))
+
+    assert job.status == "completed"
+    assert job.files_uploaded == 5
+    assert job.files_to_upload == 5
+    for i in range(1, 6):
+        assert any(f"[{i}/5] Uploaded: file{i}.mp4" in line for line in job.logs)
 
 
 def test_transfer_strategy_smart_folder(tmp_path, monkeypatch):

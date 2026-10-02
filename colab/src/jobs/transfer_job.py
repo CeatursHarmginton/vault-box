@@ -46,6 +46,7 @@ async def run_transfer(job: JobState) -> None:
         job.files_uploaded = 0
         job.files_skipped = 0
         job.files_to_upload = 0
+        job._upload_log_done = 0
 
         job.log(f"Job start: {source.get('provider')} -> {target.get('provider')}")
         job.log(f"Accounts: source={source.get('accountId') or source.get('account_id') or '-'} target={target.get('accountId') or target.get('account_id') or '-'}")
@@ -539,6 +540,9 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
 
 async def _run_plain_file_batches(job: JobState, dirs: dict[str, Path], source: dict[str, Any], target: dict[str, Any], options: dict[str, Any], src: Any, dst: Any, file_items: list[dict[str, Any]]) -> None:
     job.files_to_download = len(file_items)
+    if not options.get("extract") and (not job.files_to_upload or not getattr(job, "_pipeline_preallocated", False)):
+        job.files_to_upload = max(job.files_to_upload, len(file_items))
+        job._pipeline_preallocated = True
     groups = _download_batches(file_items, dirs["input"], options, job)
     is_links_provider = (
         str(source.get("provider") or "").lower() == "links"
@@ -749,9 +753,10 @@ async def _run_file_pipeline_batches(
 ) -> None:
     file_items = [it for it in items if not (it.get("type") == "folder" or it.get("is_folder"))]
     folder_items = [it for it in items if (it.get("type") == "folder" or it.get("is_folder"))]
-    job.files_to_download = len(file_items)
-    if not options.get("extract"):
-        job.files_to_upload = len(file_items)
+    if not job.files_to_download or job.files_to_download < len(file_items):
+        job.files_to_download = len(file_items)
+    if not options.get("extract") and (not job.files_to_upload or not getattr(job, "_pipeline_preallocated", False)):
+        job.files_to_upload = max(job.files_to_upload, len(file_items))
         job._pipeline_preallocated = True
     dl_concurrency = int(options.get("download_concurrency") or options.get("downloadConcurrency") or FOLDER_DOWNLOAD_CONCURRENCY)
     ul_concurrency = int(options.get("upload_concurrency") or options.get("uploadConcurrency") or options.get("upload_parallel") or UPLOAD_FILE_CONCURRENCY)
@@ -1157,8 +1162,6 @@ async def _upload_outputs(job: JobState, target: dict[str, Any], options: dict[s
     if len(files) == 1 and item_type != "folder":
         if not getattr(job, "_pipeline_preallocated", False):
             job.files_to_upload += 1
-        job._upload_log_done = 0
-        job._upload_log_total = getattr(job, "files_to_upload", 1) or 1
         f0_sz = files[0].stat().st_size if files[0].exists() else 0
         job.start_file(files[0].name, phase="upload", size=f0_sz)
         try:
@@ -1171,7 +1174,6 @@ async def _upload_outputs(job: JobState, target: dict[str, Any], options: dict[s
         return
     if not getattr(job, "_pipeline_preallocated", False):
         job.files_to_upload += len(files)
-    job._upload_log_done = 0
     upload_concurrency = int(options.get("upload_concurrency") or options.get("uploadConcurrency") or options.get("upload_parallel") or UPLOAD_FILE_CONCURRENCY)
     workers = max(1, min(upload_concurrency, len(files)))
     gate = _UploadGate()
@@ -1280,14 +1282,16 @@ async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options
             job.files_uploaded += 1
             job.error = None
             job._upload_log_done = getattr(job, "_upload_log_done", 0) + 1
-            job.log(f"[{job._upload_log_done}/{getattr(job, '_upload_log_total', job.files_to_upload)}] Uploaded: {path.name}")
+            total_up = getattr(job, "files_to_upload", 0) or getattr(job, "_upload_log_total", 0) or job._upload_log_done or 1
+            job.log(f"[{job._upload_log_done}/{total_up}] Uploaded: {path.name}")
             return
         except _ItemSkippedFailure as exc:
             failed_ref = item if (item.get("id") or item.get("path") or item.get("relay")) else (source_ref or item)
             _mark_item_skipped(job, job.payload.get("source") or {}, failed_ref, exc.message)
             job.files_skipped += 1
             job._upload_log_done = getattr(job, "_upload_log_done", 0) + 1
-            job.log(f"[{job._upload_log_done}/{getattr(job, '_upload_log_total', job.files_to_upload)}] [SKIP] Upload failed for {path.name}: {exc.message}. Skipping to next file...")
+            total_up = getattr(job, "files_to_upload", 0) or getattr(job, "_upload_log_total", 0) or job._upload_log_done or 1
+            job.log(f"[{job._upload_log_done}/{total_up}] [SKIP] Upload failed for {path.name}: {exc.message}. Skipping to next file...")
             return
         except ProviderFailure as exc:
             if _is_rename_failure(exc):
@@ -1295,14 +1299,16 @@ async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options
                 _mark_item_skipped(job, job.payload.get("source") or {}, failed_ref, exc.message)
                 job.files_skipped += 1
                 job._upload_log_done = getattr(job, "_upload_log_done", 0) + 1
-                job.log(f"[{job._upload_log_done}/{getattr(job, '_upload_log_total', job.files_to_upload)}] Skipped (rename failed): {path.name}")
+                total_up = getattr(job, "files_to_upload", 0) or getattr(job, "_upload_log_total", 0) or job._upload_log_done or 1
+                job.log(f"[{job._upload_log_done}/{total_up}] Skipped (rename failed): {path.name}")
                 return
             auto_replace = bool(options.get("_auto_confirm_upload_new")) and not options.get("replace")
             if not auto_replace:
                 if "duplicated" in exc.message.lower() or "repeated" in exc.message.lower():
                     job.files_skipped += 1
                     job._upload_log_done = getattr(job, "_upload_log_done", 0) + 1
-                    job.log(f"[{job._upload_log_done}/{getattr(job, '_upload_log_total', job.files_to_upload)}] Skipped (duplicate): {path.name}")
+                    total_up = getattr(job, "files_to_upload", 0) or getattr(job, "_upload_log_total", 0) or job._upload_log_done or 1
+                    job.log(f"[{job._upload_log_done}/{total_up}] Skipped (duplicate): {path.name}")
                     return
                 if exc.code != "UPLOAD_FAILED":
                     raise
@@ -1319,7 +1325,8 @@ async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options
                 _mark_item_skipped(job, job.payload.get("source") or {}, failed_ref, exc.message)
                 job.files_skipped += 1
                 job._upload_log_done = getattr(job, "_upload_log_done", 0) + 1
-                job.log(f"[{job._upload_log_done}/{getattr(job, '_upload_log_total', job.files_to_upload)}] [SKIP] Upload error on {path.name}: {exc.message}. Continuing with remaining files...")
+                total_up = getattr(job, "files_to_upload", 0) or getattr(job, "_upload_log_total", 0) or job._upload_log_done or 1
+                job.log(f"[{job._upload_log_done}/{total_up}] [SKIP] Upload error on {path.name}: {exc.message}. Continuing with remaining files...")
                 return
 
 async def _upload_one_with_retry(job: JobState, target: dict[str, Any], options: dict[str, Any], dst: Any, path: Path) -> dict[str, Any]:
