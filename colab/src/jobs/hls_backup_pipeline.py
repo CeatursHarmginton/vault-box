@@ -16,9 +16,138 @@ from ..providers import PROVIDERS
 from ..providers.base import ProviderFailure, safe_name
 from .progress import JobState
 
+try:
+    from ..config import IS_KAGGLE
+except Exception:
+    IS_KAGGLE = bool(
+        os.environ.get("KAGGLE_KERNEL_RUN_TYPE")
+        or os.environ.get("KAGGLE_CONTAINER_NAME")
+        or os.environ.get("KAGGLE_URL_BASE")
+        or Path("/kaggle").exists()
+    )
+
 DEFAULT_CHUNK_SEGMENTS = 150
 DEFAULT_CHUNK_MB = 250
 DEFAULT_SEGMENT_CONCURRENCY = 6
+
+
+def _get_disk_free(dir_path: Path) -> int:
+    """Safely return free disk space in bytes for given directory path."""
+    try:
+        check_p = dir_path if dir_path.exists() else dir_path.parent
+        while not check_p.exists() and check_p.parent != check_p:
+            check_p = check_p.parent
+        return shutil.disk_usage(check_p).free
+    except Exception:
+        return 10 * 1024 * 1024 * 1024
+
+
+def _emergency_cleanup_disk(
+    work_dir: Path | None = None,
+    parts_dir: Path | None = None,
+    uploaded_names: set[str] | None = None,
+) -> int:
+    """Free as much local disk space as possible when disk is tight or [Errno 28] occurs."""
+    freed = 0
+    import gc
+    gc.collect()
+
+    if parts_dir and parts_dir.is_dir():
+        for p in list(parts_dir.glob("part_*.ts")):
+            if uploaded_names is None or p.name in uploaded_names:
+                try:
+                    sz = p.stat().st_size
+                    p.unlink(missing_ok=True)
+                    freed += sz
+                except Exception:
+                    pass
+
+    if work_dir and work_dir.is_dir():
+        for f in list(work_dir.glob("concat_*.txt")) + list(work_dir.glob("*.tmp")):
+            try:
+                sz = f.stat().st_size
+                f.unlink(missing_ok=True)
+                freed += sz
+            except Exception:
+                pass
+
+    gc.collect()
+    return freed
+
+
+def should_skip_merge_due_to_space(
+    work_dir: Path,
+    total_segments: int,
+    completed_parts: list[dict[str, Any]],
+    accumulated_bytes: int = 0,
+    downloaded_segs: int = 0,
+    chunk_segments: int = DEFAULT_CHUNK_SEGMENTS,
+    chunk_mb: int = DEFAULT_CHUNK_MB,
+    is_kaggle: bool = False,
+    options: dict[str, Any] | None = None,
+) -> tuple[bool, str, int, int]:
+    """
+    Determine if final assembly video merge should be skipped due to limited disk space (e.g. on Kaggle),
+    and whether local parts should be deleted immediately after upload to prevent running out of space (Errno 28).
+
+    Condition:
+    - If user explicitly requested skip_merge / skip_final_assembly / parts_only / low_disk_mode.
+    - If total estimated size of all parts exceeds 50% of available free disk space (or free disk < 2x estimated size + buffer),
+      local disk cannot hold both all parts and the merged video file simultaneously.
+    - On Kaggle environment where disk quota is strictly limited and shared across files in the batch.
+    """
+    opts = options or {}
+    if opts.get("skip_final_assembly") or opts.get("skip_merge") or opts.get("parts_only") or opts.get("low_disk_mode"):
+        return True, "Chế độ bỏ qua ghép video được chỉ định bởi tùy chọn", 0, _get_disk_free(work_dir)
+
+    free_disk = _get_disk_free(work_dir)
+
+    known_bytes = sum(cp.get("bytes", 0) for cp in completed_parts) + accumulated_bytes
+    known_segs = sum(cp.get("segment_count", 0) for cp in completed_parts) + downloaded_segs
+
+    if known_segs > 0 and known_bytes > 0:
+        avg_seg = known_bytes / known_segs
+        estimated_total_bytes = int(total_segments * avg_seg) if total_segments > 0 else known_bytes
+    else:
+        num_parts = max(1, (total_segments + chunk_segments - 1) // chunk_segments) if total_segments > 0 else 1
+        estimated_total_bytes = num_parts * chunk_mb * 1024 * 1024
+
+    half_free = int(free_disk * 0.5)
+    required_space = (estimated_total_bytes * 2) + (1024 * 1024 * 1024)
+
+    if estimated_total_bytes > half_free:
+        est_mb = estimated_total_bytes / (1024 * 1024)
+        free_mb = free_disk / (1024 * 1024)
+        return (
+            True,
+            f"Tổng dung lượng phân đoạn ước tính (~{est_mb:.1f} MB) vượt quá 50% đĩa trống ({free_mb:.1f} MB)",
+            estimated_total_bytes,
+            free_disk,
+        )
+
+    if required_space > free_disk:
+        req_mb = required_space / (1024 * 1024)
+        free_mb = free_disk / (1024 * 1024)
+        return (
+            True,
+            f"Dung lượng đĩa trống ({free_mb:.1f} MB) không đủ cho cả phân đoạn và video ghép (~{req_mb:.1f} MB)",
+            estimated_total_bytes,
+            free_disk,
+        )
+
+    if is_kaggle:
+        if estimated_total_bytes > (free_disk * 0.4) or free_disk < (3 * 1024 * 1024 * 1024):
+            est_mb = estimated_total_bytes / (1024 * 1024)
+            free_mb = free_disk / (1024 * 1024)
+            return (
+                True,
+                f"Môi trường Kaggle với đĩa trống hạn chế ({free_mb:.1f} MB, video ~{est_mb:.1f} MB)",
+                estimated_total_bytes,
+                free_disk,
+            )
+
+    return False, "", estimated_total_bytes, free_disk
+
 
 
 def parse_m3u8_playlist(content: str, base_url: str) -> tuple[str | None, list[dict[str, Any]]]:
@@ -117,6 +246,16 @@ async def download_single_segment(
     max_retries: int = 10,
 ) -> int:
     """Download a single TS segment with robust retry, rate accounting, and exponential backoff."""
+    def _safe_write(p: Path, b: bytes) -> None:
+        try:
+            p.write_bytes(b)
+        except OSError as w_err:
+            if w_err.errno in (28, 122) or "no space" in str(w_err).lower():
+                _emergency_cleanup_disk(p.parent.parent, p.parent.parent / "parts")
+                p.write_bytes(b)
+            else:
+                raise
+
     async with sem:
         if progress:
             progress.check_cancelled()
@@ -133,7 +272,7 @@ async def download_single_segment(
                         data = c_resp.content
                         if not data:
                             raise ValueError(f"Segment {seg.get('index')} received empty (0 bytes) content")
-                        dest_path.write_bytes(data)
+                        _safe_write(dest_path, data)
                         return len(data)
                     else:
                         c_resp.raise_for_status()
@@ -143,7 +282,7 @@ async def download_single_segment(
                         data = resp.content
                         if not data:
                             raise ValueError(f"Segment {seg.get('index')} received empty (0 bytes) content")
-                        dest_path.write_bytes(data)
+                        _safe_write(dest_path, data)
                         return len(data)
                     else:
                         resp.raise_for_status()
@@ -164,10 +303,14 @@ async def download_single_segment(
                         if c_resp.status_code == 200:
                             data = c_resp.content
                             if data:
-                                dest_path.write_bytes(data)
+                                _safe_write(dest_path, data)
                                 return len(data)
                     except Exception:
                         pass
+
+                is_disk_full = "no space" in err_str or "errno 28" in err_str or (isinstance(dl_err, OSError) and getattr(dl_err, "errno", None) in (28, 122))
+                if is_disk_full:
+                    _emergency_cleanup_disk(dest_path.parent.parent, dest_path.parent.parent / "parts")
 
                 if attempt >= max_retries - 1:
                     raise ProviderFailure("DOWNLOAD_FAILED", f"Failed to download segment {seg.get('index')} after {max_retries} attempts: {dl_err}") from dl_err
@@ -175,10 +318,12 @@ async def download_single_segment(
                 # Backoff strategy: longer wait for rate limits/overloads (429, 503, 502, 504)
                 if any(c in err_str for c in ("429", "503", "502", "504", "rate", "busy", "limit")):
                     backoff = min(30.0, 3.0 * (attempt + 1))
+                elif is_disk_full:
+                    backoff = min(10.0, 1.0 * (attempt + 1))
                 else:
                     backoff = min(20.0, 1.5 * (attempt + 1))
 
-                if (attempt >= 2 or is_auth_error) and progress:
+                if (attempt >= 2 or is_auth_error or is_disk_full) and progress:
                     progress.log(f"[Download-Retry] Segment {seg.get('index')} thử lại lần {attempt + 2}/{max_retries} sau {backoff:.1f}s (Lỗi: {dl_err})")
 
                 await asyncio.sleep(backoff)
@@ -751,6 +896,28 @@ async def run_resumable_backup_pipeline(
         total_segments = int(folder_manifest_data.get("total_segments_expected") or sum(cp.get("segment_count", 0) for cp in completed_parts))
         job.log(f"[Backup-Resume] Toàn bộ {total_segments} segments đã có đủ trên Cloud đích! Tiến hành ghép hoàn chỉnh: {final_video_name}...")
 
+    # Evaluate disk space & merge feasibility (Space-Saver for Kaggle / low-disk)
+    env_is_kaggle = IS_KAGGLE or bool(options.get("is_kaggle"))
+    skip_final_assembly, skip_reason, estimated_total_bytes, initial_free_disk = should_skip_merge_due_to_space(
+        job_work_dir,
+        total_segments,
+        completed_parts,
+        accumulated_bytes=0,
+        downloaded_segs=0,
+        chunk_segments=chunk_segments,
+        chunk_mb=chunk_mb,
+        is_kaggle=env_is_kaggle,
+        options=options,
+    )
+    keep_local_parts = (not skip_final_assembly) and (initial_free_disk > (estimated_total_bytes * 2.2) + (1024 * 1024 * 1024))
+
+    if skip_final_assembly:
+        job.log(
+            f"[Backup-Resume] [Space-Saver] Phát hiện dung lượng đĩa hạn chế ({skip_reason}). "
+            f"Kích hoạt chế độ tải an toàn: Từng part sẽ upload ngay lên Cloud và xóa bản local. "
+            f"Bỏ qua bước ghép video (Final Assembly) trên runtime để chống tràn bộ nhớ (Errno 28)."
+        )
+
     if completed_parts:
         remote_list_summary = ", ".join(sorted(existing_remote_part_names)) if len(existing_remote_part_names) <= 5 else f"{len(existing_remote_part_names)} parts"
         job.log(f"[Trace] Đã phát hiện {len(existing_remote_part_names)} part(s) trên Cloud đích ({remote_list_summary}). Bỏ qua {len(completed_parts)} part đã hoàn thành.")
@@ -817,6 +984,7 @@ async def run_resumable_backup_pipeline(
 
     async def _upload_manifest() -> None:
         """Build and upload _resume_manifest.json to remote backup folder (with replace)."""
+        is_done = (sum(cp.get("segment_count", 0) for cp in completed_parts) >= total_segments) if total_segments else False
         manifest = {
             "version": 1,
             "transfer_strategy": "backup_resume",
@@ -833,7 +1001,9 @@ async def run_resumable_backup_pipeline(
             "total_segments_expected": total_segments,
             "completed_parts": sorted(completed_parts, key=lambda x: x["part_index"]),
             "last_synced_segment": max((cp["end_seg"] for cp in completed_parts), default=-1),
-            "is_complete": sum(cp.get("segment_count", 0) for cp in completed_parts) >= total_segments if total_segments else False,
+            "is_complete": is_done,
+            "all_parts_uploaded": is_done,
+            "final_assembly_skipped": bool(skip_final_assembly),
             "meta": {
                 **(file_item.get("meta") or {}),
                 "page_url": page_url or file_item.get("page_url") or "",
@@ -913,7 +1083,11 @@ async def run_resumable_backup_pipeline(
         size_mb = p_meta['bytes'] / (1024 * 1024)
 
         if p_name in existing_remote_part_names and any(cp.get("file_name") == p_name for cp in completed_parts):
-            job.log(f"[Trace] Phân đoạn {p_name} đã tồn tại trên Cloud đích. Bỏ qua upload, giữ bản local để ghép nhanh.")
+            if not keep_local_parts or skip_final_assembly:
+                part_file.unlink(missing_ok=True)
+                job.log(f"[Trace] Phân đoạn {p_name} đã tồn tại trên Cloud đích. Đã xóa bản local để giải phóng đĩa.")
+            else:
+                job.log(f"[Trace] Phân đoạn {p_name} đã tồn tại trên Cloud đích. Bỏ qua upload, giữ bản local để ghép nhanh.")
             return
 
         job.log(f"[Trace] Phân đoạn mới: {p_name} ({p_meta['segment_count']} segments, {size_mb:.1f} MB) -> Đang upload lên Cloud đích...")
@@ -929,12 +1103,18 @@ async def run_resumable_backup_pipeline(
         if isinstance(res, dict):
             remote_part_map[p_name] = res
 
-        # Tối ưu giữ lại các file part cục bộ thay vì xóa, giúp final assembly không phải tải lại toàn bộ
-        # Chỉ xóa part nếu dung lượng đĩa Colab quá thấp (<1GB) để chống tràn đĩa
-        if _has_sufficient_disk(parts_local_dir, min_bytes=1024 * 1024 * 1024):
+        # Tối ưu giữ lại các file part cục bộ chỉ khi đủ không gian đĩa an toàn cho toàn bộ video + merge
+        # Nếu skip_final_assembly (do space > 50% free disk hoặc Kaggle), hoặc free disk < 1GB:
+        # Xóa ngay bản local sau khi upload
+        should_keep = (
+            keep_local_parts
+            and not skip_final_assembly
+            and _has_sufficient_disk(parts_local_dir, min_bytes=max(1024 * 1024 * 1024, int(estimated_total_bytes * 2)))
+        )
+        if should_keep:
             job.log(f"[Upload-Pipe] Giữ bản local {p_name} ({size_mb:.1f} MB) để tối ưu ghép nối nhanh ở final stage.")
         else:
-            job.log(f"[Disk-Safety] Dung lượng đĩa cục bộ thấp (<1GB). Dọn dẹp {p_name} sau khi upload để bảo vệ hệ thống.")
+            job.log(f"[Disk-Safety] Đã upload {p_name} ({size_mb:.1f} MB) lên Cloud và xóa bản local để giải phóng không gian đĩa.")
             part_file.unlink(missing_ok=True)
 
         # Always sync manifest after each part — critical for resume safety
@@ -972,6 +1152,13 @@ async def run_resumable_backup_pipeline(
                         job.check_cancelled()
                         err_str = str(dl_err).lower()
                         is_expired = any(c in err_str for c in ("401", "403", "404", "410", "expired", "token", "forbidden"))
+                        is_disk_full = "no space" in err_str or "errno 28" in err_str or (isinstance(dl_err, OSError) and getattr(dl_err, "errno", None) in (28, 122))
+
+                        if is_disk_full:
+                            skip_final_assembly = True
+                            keep_local_parts = False
+                            freed_b = _emergency_cleanup_disk(job_work_dir, parts_local_dir, existing_remote_part_names)
+                            job.log(f"[Backup-Resume] [Space-Saver] Phát hiện sự cố đĩa đầy (Errno 28). Đã dọn dẹp khẩn cấp ({freed_b // (1024*1024)} MB giải phóng). Chuyển sang chế độ không giữ part.")
 
                         job.log(f"[Backup-Resume] Segment {seg['index']} gặp sự cố ({dl_err}). Đang khôi phục kết nối (Vòng {recovery_round + 1}/3)...")
 
@@ -1046,6 +1233,24 @@ async def run_resumable_backup_pipeline(
                     cur_batch_paths.clear()
                     accumulated_bytes = 0
 
+                    # Dynamic space check after each part creation
+                    dyn_skip, dyn_reason, _, _ = should_skip_merge_due_to_space(
+                        job_work_dir,
+                        total_segments,
+                        completed_parts,
+                        accumulated_bytes=0,
+                        downloaded_segs=total_downloaded_segs,
+                        chunk_segments=chunk_segments,
+                        chunk_mb=chunk_mb,
+                        is_kaggle=env_is_kaggle,
+                        options=options,
+                    )
+                    if dyn_skip and not skip_final_assembly:
+                        skip_final_assembly = True
+                        keep_local_parts = False
+                        _emergency_cleanup_disk(job_work_dir, parts_local_dir, existing_remote_part_names)
+                        job.log(f"[Backup-Resume] [Space-Saver] Cập nhật dung lượng: {dyn_reason}. Chuyển sang chế độ không giữ part và bỏ qua Final Assembly.")
+
                     # Launch upload as background task — download continues immediately
                     task = asyncio.create_task(_upload_part_worker(part_path, part_meta))
                     active_upload_tasks.append(task)
@@ -1081,6 +1286,18 @@ async def run_resumable_backup_pipeline(
         # Return None for partial session; caller checks is not None
         return None
 
+    # If skip_final_assembly is active (due to space > 50% free disk, Kaggle limit, or option):
+    if skip_final_assembly:
+        total_synced_mb = sum(cp.get("bytes", 0) for cp in completed_parts) / (1024 * 1024)
+        job.log(
+            f"[Backup-Resume] [Space-Saver] 100% segments ({total_segments} segments, {len(completed_parts)} parts, ~{total_synced_mb:.1f} MB) "
+            f"đã được sao lưu an toàn và hoàn chỉnh lên Cloud tại thư mục '{backup_folder_name}'! "
+            f"Bỏ qua bước ghép video (Final Assembly) trên runtime để tiết kiệm không gian đĩa và tránh lỗi tràn bộ nhớ (Errno 28)."
+        )
+        await _upload_manifest()
+        shutil.rmtree(job_work_dir, ignore_errors=True)
+        return job_work_dir / backup_folder_name
+
     # 5. Final Assembly: Concatenate all parts into final MP4
     job.log(f"[Final-Assembly] 100% segments ({total_segments} segments) đã sao lưu lên Cloud! Bắt đầu ghép file hoàn chỉnh: {final_video_name}...")
     final_output_path = job_work_dir / final_video_name
@@ -1112,19 +1329,18 @@ async def run_resumable_backup_pipeline(
         f"({local_summary}). Chỉ cần tải {len(missing_parts)} part(s) còn thiếu từ {provider_label}..."
     )
 
-    # Estimate total download size for missing parts
+    # Re-check if downloading missing parts would exceed disk space
     total_missing_bytes = sum(cp.get("bytes", 0) for cp in missing_parts)
-    if total_missing_bytes > 0:
-        try:
-            free_disk = shutil.disk_usage(job_work_dir).free
-            needed = total_missing_bytes * 2
-            if needed > free_disk:
-                job.log(
-                    f"[Final-Assembly] Cảnh báo: Cần ~{needed // (1024**2)} MB "
-                    f"nhưng ổ đĩa chỉ còn {free_disk // (1024**2)} MB. Merge có thể thất bại."
-                )
-        except Exception:
-            pass
+    current_free_disk = _get_disk_free(job_work_dir)
+    if total_missing_bytes > 0 and (total_missing_bytes * 2 > current_free_disk or total_missing_bytes > current_free_disk * 0.5):
+        total_synced_mb = sum(cp.get("bytes", 0) for cp in completed_parts) / (1024 * 1024)
+        job.log(
+            f"[Final-Assembly] [Space-Saver] Dung lượng các part cần tải lại (~{total_missing_bytes // (1024*1024)} MB) "
+            f"vượt quá không gian đĩa an toàn ({current_free_disk // (1024*1024)} MB). "
+            f"Bỏ qua bước ghép video để bảo vệ hệ thống. Toàn bộ {len(completed_parts)} parts (~{total_synced_mb:.1f} MB) đã có đủ trên Cloud tại '{backup_folder_name}'."
+        )
+        shutil.rmtree(job_work_dir, ignore_errors=True)
+        return job_work_dir / backup_folder_name
 
     # If there are missing parts, ensure we have fresh remote items to download from
     if missing_parts:

@@ -953,6 +953,17 @@ async def _run_backup_resume_batches(
                 job.files_skipped += 1
                 job.log(f"[Backup-Resume] [SKIP] Lỗi xử lý luồng cho {item_name}: {exc}. Bỏ qua mục này và tiếp tục xử lý các mục còn lại...")
                 continue
+            finally:
+                for temp_d in (dirs.get("input"), dirs.get("work"), dirs.get("output")):
+                    if temp_d and isinstance(temp_d, Path) and temp_d.is_dir():
+                        for child in list(temp_d.glob("backup_pipe_*")) + list(temp_d.glob("*.tmp")):
+                            try:
+                                if child.is_dir():
+                                    shutil.rmtree(child, ignore_errors=True)
+                                else:
+                                    child.unlink(missing_ok=True)
+                            except Exception:
+                                pass
         else:
             # Fallback to standard pipeline batch for regular files
             await _run_file_pipeline_batches(job, dirs, source, target, options, src, dst, [item])
