@@ -16,7 +16,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse, urljoin
 
 TOR_PROXY = "socks5://127.0.0.1:9050"
 PROXY_SETUP_LOCK: asyncio.Lock | None = None
@@ -253,6 +253,7 @@ class LinksProvider(BaseProvider):
         proxy: str | None = None,
         auto_proxy: bool = True,
         session_cookies: dict[str, str] | None = None,
+        post_data: bytes | str | None = None,
     ) -> tuple[int, str, str, str | None]:
         """Universal webpage fetcher with browser TLS impersonation, domain proxy memory, and parallel 3-circuit racing."""
         def _do_fetch(active_px: str | None) -> tuple[int, str, str]:
@@ -261,7 +262,10 @@ class LinksProvider(BaseProvider):
                 s = cffi_requests.Session(impersonate="chrome")
                 if session_cookies:
                     s.cookies.update(session_cookies)
-                r = s.get(target_url, headers=req_headers, proxy=active_px, timeout=20)
+                if post_data is not None:
+                    r = s.post(target_url, data=post_data, headers=req_headers, proxy=active_px, timeout=20)
+                else:
+                    r = s.get(target_url, headers=req_headers, proxy=active_px, timeout=20)
                 if session_cookies is not None:
                     try:
                         for k, v in s.cookies.items():
@@ -271,7 +275,10 @@ class LinksProvider(BaseProvider):
                 return r.status_code, r.text, str(r.url)
             except Exception:
                 with httpx.Client(follow_redirects=True, timeout=20.0, proxy=active_px, cookies=session_cookies) as client:
-                    r = client.get(target_url, headers=req_headers)
+                    if post_data is not None:
+                        r = client.post(target_url, content=post_data if isinstance(post_data, (bytes, str)) else json.dumps(post_data), headers=req_headers)
+                    else:
+                        r = client.get(target_url, headers=req_headers)
                     if session_cookies is not None:
                         try:
                             for k, v in client.cookies.items():
@@ -375,13 +382,14 @@ class LinksProvider(BaseProvider):
         if any(h in url_lower for h in ["mxcontent.net", "mxdrop.to", "mxdrop.top", "mixdrop.co", "mixdrop.to", "mixdrop.bz", "mixdrop.ch"]):
             return "mxdrop"
 
-        # DoodStream / Playmogo / CloudataCDN / Archivebate
+        # DoodStream / Playmogo / CloudataCDN / Archivebate / MyVidPlay / Livecamsrip
         dood_domains = [
             "cloudatacdn.com", "playmogo.com", "archivebate.com", "doods.pro",
             "dooood.com", "dooood", "doodstream", "ds2play", "do0od", "d000d", "d0000d",
             "dood.to", "dood.watch", "dood.so", "dood.ws", "dood.pm",
             "dood.re", "dood.li", "dood.cx", "dood.wf", "dood.la",
-            "dood.sh", "dood.video", "dood.stream",
+            "dood.sh", "dood.video", "dood.stream", "myvidplay.com", "myvidplay",
+            "livecamsrip.com", "dsvplay.com", "dsvplay", "dood.yt", "dood.club",
         ]
         if any(d in url_lower for d in dood_domains):
             return "doodstream"
@@ -1770,10 +1778,10 @@ class LinksProvider(BaseProvider):
         page_url = str(file_ref.get("page_url") or (file_ref.get("meta") or {}).get("page_url") or "").strip()
         referer = str(headers.get("Referer") or headers.get("referer") or "").strip()
 
-        dood_hosts = ("dood", "playmogo", "ds2play", "d000", "do0od", "dSVplay")
+        dood_hosts = ("dood", "playmogo", "ds2play", "d000", "do0od", "dsvplay", "myvidplay", "doods", "dooood", "cloudatacdn")
         embed_url = ""
         url_low = url.lower()
-        if not page_url and "archivebate.com" in url_low:
+        if not page_url and any(h in url_low for h in ("archivebate.com", "livecamsrip.com")):
             page_url = url
         if any(h in url_low for h in dood_hosts) and ("/e/" in url or "/d/" in url):
             embed_url = url
@@ -1791,12 +1799,21 @@ class LinksProvider(BaseProvider):
         if cookies:
             req_headers["Cookie"] = cookies
 
+        session_cookies: dict[str, str] = {}
+        if cookies:
+            for item in str(cookies).split(";"):
+                if "=" in item:
+                    ck, cv = item.strip().split("=", 1)
+                    if ck.strip():
+                        session_cookies[ck.strip()] = cv.strip()
+
         active_proxy = proxy
         if not embed_url and page_url and page_url.startswith(("http://", "https://")):
             progress.log(f"[doodstream] Fetching canonical page: {page_url[:80]}...")
-            _, page_html, _, active_proxy = await self._fetch_webpage(
-                page_url, req_headers, progress, proxy=active_proxy, auto_proxy=True,
+            _, page_html, canonical_final_url, active_proxy = await self._fetch_webpage(
+                page_url, req_headers, progress, proxy=active_proxy, auto_proxy=True, session_cookies=session_cookies,
             )
+            # 1. Look for player iframe in HTML
             for m_iframe in re.finditer(r'<iframe[^>]+src=[\x22\x27]([^\x22\x27]+)[\x22\x27]', page_html, re.I):
                 iframe_src = m_iframe.group(1).strip()
                 if iframe_src.startswith("//"):
@@ -1805,6 +1822,95 @@ class LinksProvider(BaseProvider):
                     embed_url = iframe_src
                     progress.log(f"[doodstream] Found player iframe: {embed_url}")
                     break
+
+            # 2. Look for direct embed URL in HTML
+            if not embed_url:
+                m_direct = re.search(
+                    r'https?://[^\x22\x27\s<>]*(?:' + '|'.join(dood_hosts) + r')[^\x22\x27\s<>]*/(?:e|d)/[a-zA-Z0-9_-]+',
+                    page_html,
+                    re.I,
+                )
+                if m_direct:
+                    embed_url = m_direct.group(0).strip()
+                    progress.log(f"[doodstream] Found direct embed URL in page HTML: {embed_url}")
+
+            # 3. Livewire 3 component support (e.g. livecamsrip.com)
+            if not embed_url and "wire:snapshot" in page_html:
+                progress.log("[doodstream] Detected Livewire component; querying video stream...")
+                csrf = ""
+                m_csrf = re.search(r'<meta\s+name=[\x22\x27]csrf-token[\x22\x27]\s+content=[\x22\x27]([^\x22\x27]+)[\x22\x27]', page_html, re.I)
+                if m_csrf:
+                    csrf = m_csrf.group(1).strip()
+                if not csrf:
+                    csrf = session_cookies.get("XSRF-TOKEN", "")
+
+                m_snap = re.search(r'wire:snapshot=[\x22\x27]([^\x22\x27]+)[\x22\x27]', page_html)
+                if m_snap:
+                    import html as html_lib
+                    snap_raw = html_lib.unescape(m_snap.group(1))
+                    lw_url = urljoin(canonical_final_url or page_url, "/livewire/update")
+                    lw_payload = {
+                        "_token": csrf,
+                        "components": [
+                            {
+                                "snapshot": snap_raw,
+                                "updates": {},
+                                "calls": [{"path": "", "method": "updateView", "params": []}],
+                            }
+                        ]
+                    }
+                    lw_headers = dict(req_headers)
+                    lw_headers["Accept"] = "application/json"
+                    lw_headers["Content-Type"] = "application/json"
+                    lw_headers["Referer"] = canonical_final_url or page_url
+                    if csrf:
+                        lw_headers["X-CSRF-TOKEN"] = csrf
+                    lw_headers["X-Livewire"] = "true"
+
+                    try:
+                        _, lw_body, _, active_proxy = await self._fetch_webpage(
+                            lw_url,
+                            lw_headers,
+                            progress,
+                            proxy=active_proxy,
+                            auto_proxy=True,
+                            session_cookies=session_cookies,
+                            post_data=json.dumps(lw_payload).encode("utf-8"),
+                        )
+                        # Look for video URL in Livewire JSON response
+                        try:
+                            lw_json = json.loads(lw_body)
+                            for comp in lw_json.get("components", []):
+                                snap_inner = comp.get("snapshot")
+                                if isinstance(snap_inner, str):
+                                    snap_obj = json.loads(snap_inner)
+                                    vid = (snap_obj.get("data") or {}).get("video")
+                                    if vid and isinstance(vid, str) and vid.startswith("http"):
+                                        embed_url = vid
+                                        progress.log(f"[doodstream] Resolved embed URL from Livewire snapshot: {embed_url}")
+                                        break
+                                html_inner = (comp.get("effects") or {}).get("html")
+                                if html_inner:
+                                    m_if = re.search(r'<iframe[^>]+src=[\x22\x27]([^\x22\x27]+)[\x22\x27]', html_inner, re.I)
+                                    if m_if:
+                                        embed_url = m_if.group(1).replace("\\/", "/")
+                                        progress.log(f"[doodstream] Resolved embed iframe from Livewire effects: {embed_url}")
+                                        break
+                        except Exception:
+                            pass
+
+                        if not embed_url:
+                            text_clean = lw_body.replace("\\/", "/").replace("\\\\", "\\")
+                            m_lw_embed = re.search(
+                                r'https?://[^\x22\x27\s<>]+/(?:e|d)/[a-zA-Z0-9_-]+',
+                                text_clean,
+                                re.I,
+                            )
+                            if m_lw_embed:
+                                embed_url = m_lw_embed.group(0)
+                                progress.log(f"[doodstream] Resolved embed URL from Livewire response regex: {embed_url}")
+                    except Exception as lw_err:
+                        progress.log(f"[doodstream] Livewire update failed ({lw_err})")
 
         if not embed_url:
             if "cloudatacdn.com" in url_low:
@@ -1819,12 +1925,15 @@ class LinksProvider(BaseProvider):
             }
             return url, file_ref.get("name"), dl_headers
 
+        if "/d/" in embed_url and any(h in embed_url.lower() for h in dood_hosts):
+            embed_url = embed_url.replace("/d/", "/e/", 1)
+
         embed_headers = dict(req_headers)
         if page_url:
             embed_headers["Referer"] = page_url
         progress.log(f"[doodstream] Fetching embed player: {embed_url}")
         _, embed_html, final_embed_url, active_proxy = await self._fetch_webpage(
-            embed_url, embed_headers, progress, proxy=active_proxy, auto_proxy=True,
+            embed_url, embed_headers, progress, proxy=active_proxy, auto_proxy=True, session_cookies=session_cookies,
         )
 
         m_pass = re.search(r'/pass_md5/([^\x22\x27\s<>]+)', embed_html)
@@ -1840,9 +1949,12 @@ class LinksProvider(BaseProvider):
 
         pass_headers = dict(req_headers)
         pass_headers["Referer"] = final_embed_url
+        if session_cookies:
+            pass_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in session_cookies.items())
+
         # Must use the exact same proxy circuit so the CDN binds the token to the same exit IP
         _, pass_body, _, active_proxy = await self._fetch_webpage(
-            pass_url, pass_headers, progress, proxy=active_proxy, auto_proxy=False,
+            pass_url, pass_headers, progress, proxy=active_proxy, auto_proxy=False, session_cookies=session_cookies,
         )
         cdn_base = pass_body.strip()
         if not cdn_base.startswith("http"):
@@ -1864,6 +1976,8 @@ class LinksProvider(BaseProvider):
             "User-Agent": req_headers["User-Agent"],
             "Referer": f"{embed_domain}/",
         }
+        if session_cookies:
+            dl_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in session_cookies.items())
         if active_proxy:
             dl_headers["_active_proxy"] = active_proxy
         progress.log(f"[doodstream] Successfully generated stream URL: {resolved_url[:80]}...")
@@ -1891,7 +2005,7 @@ class LinksProvider(BaseProvider):
         except Exception as exc:
             # Fail-fast ("tự dừng"): never fall back to downloading a browser-captured cloudatacdn URL
             # because its token is bound to the user's home IP and will always return 14B "error_wrong_ip".
-            if "cloudatacdn.com" in url.lower() or "/e/" in url.lower() or "archivebate.com" in url.lower():
+            if "cloudatacdn.com" in url.lower() or "/e/" in url.lower() or any(h in url.lower() for h in ("archivebate.com", "livecamsrip.com", "myvidplay.com")):
                 raise ProviderFailure(
                     "DOWNLOAD_FAILED",
                     f"[IP-Guard] Stopped direct download of IP-bound DoodStream link because fresh token resolution failed ({exc}).",
@@ -1982,9 +2096,9 @@ class LinksProvider(BaseProvider):
                     if ck.strip():
                         session_cookies[ck.strip()] = cv.strip()
 
-        async def _do_web_fetch(fetch_url: str, fetch_hdrs: dict[str, str], fetch_px: str | None, fetch_ap: bool) -> tuple[int, str, str, str | None]:
+        async def _do_web_fetch(fetch_url: str, fetch_hdrs: dict[str, str], fetch_px: str | None, fetch_ap: bool, post_data: bytes | str | None = None) -> tuple[int, str, str, str | None]:
             try:
-                return await self._fetch_webpage(fetch_url, fetch_hdrs, progress, proxy=fetch_px, auto_proxy=fetch_ap, session_cookies=session_cookies)
+                return await self._fetch_webpage(fetch_url, fetch_hdrs, progress, proxy=fetch_px, auto_proxy=fetch_ap, session_cookies=session_cookies, post_data=post_data)
             except TypeError:
                 return await self._fetch_webpage(fetch_url, fetch_hdrs, progress, proxy=fetch_px, auto_proxy=fetch_ap)
         progress.log(f"[IP-Guard] Resolving fresh stream/file token from page: {target_page[:80]}...")
@@ -2014,6 +2128,83 @@ class LinksProvider(BaseProvider):
                     active_html = iframe_html
                     active_url = final_iframe_url
                     break
+
+        # Livewire 3 lazy component resolution (e.g. livecamsrip.com)
+        if active_html == page_html and "wire:snapshot" in page_html:
+            csrf = ""
+            m_csrf = re.search(r'<meta\s+name=[\x22\x27]csrf-token[\x22\x27]\s+content=[\x22\x27]([^\x22\x27]+)[\x22\x27]', page_html, re.I)
+            if m_csrf:
+                csrf = m_csrf.group(1).strip()
+            if not csrf:
+                csrf = session_cookies.get("XSRF-TOKEN", "")
+
+            m_snap = re.search(r'wire:snapshot=[\x22\x27]([^\x22\x27]+)[\x22\x27]', page_html)
+            if m_snap:
+                import html as html_lib
+                snap_raw = html_lib.unescape(m_snap.group(1))
+                lw_url = urljoin(final_page_url, "/livewire/update")
+                lw_payload = {
+                    "_token": csrf,
+                    "components": [
+                        {
+                            "snapshot": snap_raw,
+                            "updates": {},
+                            "calls": [{"path": "", "method": "updateView", "params": []}],
+                        }
+                    ]
+                }
+                lw_headers = dict(req_headers)
+                lw_headers["Accept"] = "application/json"
+                lw_headers["Content-Type"] = "application/json"
+                lw_headers["Referer"] = final_page_url
+                if csrf:
+                    lw_headers["X-CSRF-TOKEN"] = csrf
+                lw_headers["X-Livewire"] = "true"
+
+                try:
+                    _, lw_body, _, active_proxy = await _do_web_fetch(
+                        lw_url, lw_headers, active_proxy, True, post_data=json.dumps(lw_payload).encode("utf-8")
+                    )
+                    lw_embed = None
+                    try:
+                        lw_json = json.loads(lw_body)
+                        for comp in lw_json.get("components", []):
+                            snap_inner = comp.get("snapshot")
+                            if isinstance(snap_inner, str):
+                                snap_obj = json.loads(snap_inner)
+                                vid = (snap_obj.get("data") or {}).get("video")
+                                if vid and isinstance(vid, str) and vid.startswith("http"):
+                                    lw_embed = vid
+                                    break
+                            html_inner = (comp.get("effects") or {}).get("html")
+                            if html_inner:
+                                m_if = re.search(r'<iframe[^>]+src=[\x22\x27]([^\x22\x27]+)[\x22\x27]', html_inner, re.I)
+                                if m_if:
+                                    lw_embed = m_if.group(1).replace("\\/", "/")
+                                    break
+                    except Exception:
+                        pass
+
+                    if not lw_embed:
+                        text_clean = lw_body.replace("\\/", "/").replace("\\\\", "\\")
+                        m_lw = re.search(r'https?://[^\x22\x27\s<>]+/(?:e|d)/[a-zA-Z0-9_-]+', text_clean, re.I)
+                        if m_lw:
+                            lw_embed = m_lw.group(0)
+
+                    if lw_embed:
+                        progress.log(f"[IP-Guard] Following Livewire player embed: {lw_embed[:80]}...")
+                        embed_hdrs = dict(req_headers)
+                        embed_hdrs["Referer"] = final_page_url
+                        if session_cookies:
+                            embed_hdrs["Cookie"] = "; ".join(f"{k}={v}" for k, v in session_cookies.items())
+                        _, emb_html, emb_url, active_proxy = await _do_web_fetch(
+                            lw_embed, embed_hdrs, active_proxy, True
+                        )
+                        if emb_html.strip():
+                            active_html = emb_html
+                            active_url = emb_url
+                except Exception as lw_err:
+                    progress.log(f"[IP-Guard] Livewire query failed ({lw_err})")
 
         parsed_active = urlparse(active_url)
         active_domain = f"{parsed_active.scheme}://{parsed_active.netloc}"
@@ -2306,7 +2497,7 @@ class LinksProvider(BaseProvider):
         link_type = self._classify_link(url)
         if link_type == "direct":
             check_sources = f"{page_url} {headers.get('Referer', '')} {headers.get('referer', '')}".lower()
-            if any(d in check_sources for d in ("archivebate.com", "playmogo.com", "doods.pro", "dooood.com", "doodstream", "cloudatacdn.com", "dood.")):
+            if any(d in check_sources for d in ("archivebate.com", "playmogo.com", "doods.pro", "dooood.com", "doodstream", "cloudatacdn.com", "myvidplay.com", "livecamsrip.com", "ds2play", "dsvplay", "dood.")):
                 link_type = "doodstream"
 
         progress.log(f"[links] {link_type}: {url[:120]}")
@@ -2411,7 +2602,7 @@ class LinksProvider(BaseProvider):
             # Fallback DoodStream: If not already tried as doodstream and indicators exist
             if not downloaded and link_type != "doodstream":
                 dood_ctx = f"{url} {page_url} {headers.get('Referer', '')} {headers.get('referer', '')}".lower()
-                if any(d in dood_ctx for d in ("archivebate.com", "playmogo.com", "doods.pro", "dooood.com", "cloudatacdn.com", "doodstream", "ds2play", "dood.")):
+                if any(d in dood_ctx for d in ("archivebate.com", "playmogo.com", "doods.pro", "dooood.com", "cloudatacdn.com", "myvidplay.com", "livecamsrip.com", "doodstream", "ds2play", "dsvplay", "dood.")):
                     progress.log("[Fallback] Direct download failed. Retrying with native DoodStream resolver...")
                     try:
                         downloaded = await self._download_doodstream(
@@ -2446,7 +2637,7 @@ class LinksProvider(BaseProvider):
                 and page_url
                 and page_url != url
                 and page_url.startswith(("http://", "https://"))
-                and not any(d in page_url.lower() for d in ("archivebate.com", "playmogo.com", "dooood.com", "doods.pro"))
+                and not any(d in page_url.lower() for d in ("archivebate.com", "playmogo.com", "dooood.com", "doods.pro", "myvidplay.com", "livecamsrip.com"))
             ):
                 clean_page_url = page_url
                 if "pornhub.com" in clean_page_url:

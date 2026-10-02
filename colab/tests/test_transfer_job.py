@@ -4013,6 +4013,74 @@ def test_doodstream_download_flow(tmp_path, monkeypatch):
     assert seen["dl_headers"]["Referer"] == "https://playmogo.com/"
 
 
+def test_livecamsrip_livewire_doodstream_resolution(monkeypatch):
+    from src.providers.links import LinksProvider
+    provider = LinksProvider()
+
+    assert provider._classify_link("https://myvidplay.com/e/v0ga42gila2e") == "doodstream"
+    assert provider._classify_link("https://livecamsrip.com/watch/MTcxODIzODM=") == "doodstream"
+
+    calls = []
+
+    async def fake_fetch(target_url, req_headers, progress, proxy=None, auto_proxy=True, session_cookies=None, post_data=None):
+        calls.append({"url": target_url, "post_data": post_data, "headers": req_headers})
+        if "livecamsrip.com/watch/" in target_url:
+            html_page = """
+            <html>
+            <head><meta name="csrf-token" content="csrf_test_token_123"></head>
+            <body>
+                <section wire:snapshot="{&quot;data&quot;:{&quot;uuid&quot;:17182383,&quot;video&quot;:null},&quot;memo&quot;:{&quot;id&quot;:&quot;snap1&quot;}}"></section>
+            </body>
+            </html>
+            """
+            return 200, html_page, target_url, proxy
+        elif "/livewire/update" in target_url:
+            lw_resp = {
+                "components": [
+                    {
+                        "snapshot": json.dumps({"data": {"uuid": 17182383, "video": "https://myvidplay.com/e/v0ga42gila2e"}}),
+                        "effects": {
+                            "html": '<iframe src="https://myvidplay.com/e/v0ga42gila2e"></iframe>'
+                        }
+                    }
+                ]
+            }
+            return 200, json.dumps(lw_resp), target_url, proxy
+        elif "myvidplay.com/e/" in target_url:
+            embed_page = """
+            <html>
+            <head><title>feel_me_00 - DoodStream</title></head>
+            <body>
+                <script>$.get('/pass_md5/281133911-104-28-1790932875/test_token_abc');</script>
+            </body>
+            </html>
+            """
+            return 200, embed_page, target_url, proxy
+        elif "/pass_md5/" in target_url:
+            return 200, "https://dw120l.cloudatacdn.com/u5kj/test_base~", target_url, proxy
+        return 404, "", target_url, proxy
+
+    monkeypatch.setattr(provider, "_fetch_webpage", fake_fetch)
+
+    file_ref = {
+        "url": "https://dw120l.cloudatacdn.com/u5kj/old_hash~old_token?token=old&expiry=111",
+        "name": "0yhjp4rlae~KbL4B3AadD.mp4",
+        "page_url": "https://livecamsrip.com/watch/MTcxODIzODM=",
+        "headers": {"Referer": "https://playmogo.com/"},
+    }
+
+    resolved_url, resolved_name, resolved_headers = asyncio.run(
+        provider._resolve_doodstream(file_ref["url"], file_ref, JobState("test", {}))
+    )
+
+    assert "cloudatacdn.com" in resolved_url
+    assert "token=test_token_abc" in resolved_url
+    assert resolved_headers["Referer"] == "https://myvidplay.com/"
+    assert len(calls) == 4
+    assert any("/livewire/update" in c["url"] for c in calls)
+
+
+
 def test_stream_download_14b_error_wrong_ip_does_not_pollute_progress_bytes(tmp_path, monkeypatch):
     from src.providers.base import stream_download, ProviderFailure
 
