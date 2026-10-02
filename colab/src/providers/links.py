@@ -158,12 +158,13 @@ class LinksProvider(BaseProvider):
                                 txt = (
                                     txt.rstrip()
                                     + f"\n{high_speed_marker}\n"
+                                    + "ConnLimit 4096\n"
                                     + "SocksPort 127.0.0.1:9050 IsolateSOCKSAuth KeepAliveIsolateSOCKSAuth\n"
                                     + "NumEntryGuards 8\n"
-                                    + "CircuitBuildTimeout 10\n"
+                                    + "CircuitBuildTimeout 15\n"
                                     + "LearnCircuitBuildTimeout 0\n"
                                     + "MaxCircuitDirtiness 7200\n"
-                                    + "CircuitStreamTimeout 30\n"
+                                    + "CircuitStreamTimeout 60\n"
                                 )
                                 needs_restart = True
                             if needs_restart:
@@ -178,6 +179,7 @@ class LinksProvider(BaseProvider):
                         subprocess.run(
                             [
                                 "tor",
+                                "--ConnLimit", "4096",
                                 "--SocksPort", "127.0.0.1:9050 IsolateSOCKSAuth KeepAliveIsolateSOCKSAuth",
                                 "--NumEntryGuards", "8",
                                 "--MaxCircuitDirtiness", "7200",
@@ -609,10 +611,13 @@ class LinksProvider(BaseProvider):
         if num_connections is None:
             num_connections = int(options.get("download_threads") or options.get("threads_per_item") or options.get("downloadThreads") or DOWNLOAD_THREADS)
         num_connections = max(1, min(int(num_connections), 64))
+        if proxy:
+            # Over SOCKS5/Tor, multiplexing 32 streams per file causes SOCKS server saturation and connection drops
+            num_connections = min(num_connections, 4)
 
         limits = httpx.Limits(
-            max_connections=max(24, num_connections + 4),
-            max_keepalive_connections=max(20, num_connections),
+            max_connections=max(12, num_connections * 2),
+            max_keepalive_connections=max(8, num_connections),
         )
         timeout = httpx.Timeout(connect=30.0, read=45.0, write=30.0, pool=60.0)
         client_kwargs: dict[str, Any] = {"follow_redirects": True, "timeout": timeout, "limits": limits}
@@ -792,14 +797,28 @@ class LinksProvider(BaseProvider):
             try:
                 progress.log(f"Starting browser-compatible download ({thread_count} threads): {out_name}")
                 if use_parallel:
-                    downloaded = [await self._download_parallel_ranges(
-                        one,
-                        dest_dir / out_name,
-                        progress,
-                        headers=self._http_headers(headers, cookies=cookies),
-                        proxy=proxy,
-                        num_connections=thread_count,
-                    )]
+                    try:
+                        downloaded = [await self._download_parallel_ranges(
+                            one,
+                            dest_dir / out_name,
+                            progress,
+                            headers=self._http_headers(headers, cookies=cookies),
+                            proxy=proxy,
+                            num_connections=thread_count,
+                        )]
+                    except Exception as range_exc:
+                        if isinstance(range_exc, ProviderFailure) and self._is_ip_bound_token_error(range_exc.message):
+                            raise
+                        progress.log(f"Parallel Range download notice ({range_exc}); falling back to single-stream downloader...")
+                        downloaded = [await stream_download(
+                            one,
+                            dest_dir / out_name,
+                            progress,
+                            headers=self._http_headers(headers, cookies=cookies),
+                            auth_fail_code="DOWNLOAD_FAILED",
+                            auth_fail_message="Direct link rejected Colab; this host likely binds the URL to the original browser/IP",
+                            proxy=proxy,
+                        )]
                 else:
                     downloaded = [await stream_download(
                         one,
