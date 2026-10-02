@@ -200,7 +200,7 @@ class App {
       if (this.mainContentEl) this.mainContentEl.classList.remove("mobile-hidden");
       if (this.serverBannerEl) this.serverBannerEl.style.display = "none";
       if (this.jobContainerEl) this.jobContainerEl.style.display = "none";
-      if (this.terminalContainerEl) this.terminalContainerEl.style.display = "block";
+      if (this.terminalContainerEl) this.terminalContainerEl.style.display = "flex";
     }
   }
 
