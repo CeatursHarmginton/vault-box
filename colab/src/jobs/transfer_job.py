@@ -904,74 +904,93 @@ async def _run_backup_resume_batches(
     pipeline_items = list(file_items) + resume_folder_items
     job.files_to_download = len(pipeline_items)
     job.files_to_upload = len(pipeline_items)
-    job.log(f"[Backup-Resume] Kích hoạt chế độ Sao lưu phân đoạn Resumable ({len(pipeline_items)} mục)")
 
-    for idx, item in enumerate(pipeline_items):
+    parallel_enabled = options.get("parallelDownload", True) if options.get("parallelDownload") is not None else options.get("parallel_download", True)
+    dl_concurrency = int(options.get("download_concurrency") or options.get("downloadConcurrency") or FOLDER_DOWNLOAD_CONCURRENCY) if parallel_enabled else 1
+    dl_concurrency = max(1, dl_concurrency)
+    dl_sem = asyncio.Semaphore(dl_concurrency)
+
+    job.log(f"[Backup-Resume] Kích hoạt chế độ Sao lưu phân đoạn Resumable ({len(pipeline_items)} mục, song song: {dl_concurrency} items)")
+
+    async def process_one_item(idx: int, item: dict[str, Any]) -> None:
         item_name = _item_name(item)
         item_k = _queue_item_key(source, item)
         item_url = str(item.get("path") or item.get("id") or item.get("url") or "")
         is_backup_folder = (item in resume_folder_items) or item_name.endswith("__backup_resume") or options.get("resume_from_backup")
         is_stream = is_backup_folder or any(k in item_url.lower() for k in (".m3u8", ".mpd", "/hls/", "stream")) or str(source.get("provider") or "").lower() == "links"
 
-        if is_stream:
-            job.start_item(item_k, name=item_name)
-            try:
-                final_file = await run_resumable_backup_pipeline(
-                    job, dirs, source, target, options, src, dst, item
-                )
-                if final_file is not None:
-                    # Fully completed: all segments backed up + merged + uploaded
-                    job.files_downloaded += 1
-                    job.files_uploaded += 1
-                    job.finish_item(item_k, status="done", name=item_name)
+        item_safe_id = f"{idx}_{safe_name(item_name)}"
+        item_dirs = {
+            "input": dirs["input"] / f"resume_in_{item_safe_id}",
+            "work": dirs["work"] / f"resume_work_{item_safe_id}",
+            "output": dirs["output"] / f"resume_out_{item_safe_id}",
+        }
+        for d in item_dirs.values():
+            d.mkdir(parents=True, exist_ok=True)
+
+        async with dl_sem:
+            job.check_cancelled()
+            if is_stream:
+                job.start_item(item_k, name=item_name)
+                try:
+                    final_file = await run_resumable_backup_pipeline(
+                        job, item_dirs, source, target, options, src, dst, item
+                    )
+                    if final_file is not None:
+                        # Fully completed: all segments backed up + merged + uploaded
+                        job.files_downloaded += 1
+                        job.files_uploaded += 1
+                        job.finish_item(item_k, status="done", name=item_name)
+                        timing = job.item_timings.get(item_k) or {}
+                        job.completed_items.append({
+                            **_queue_item_ref(source, item),
+                            "startTime": timing.get("startTime"),
+                            "endTime": timing.get("endTime"),
+                            "duration": timing.get("duration"),
+                        })
+                        job.log(f"[Backup-Resume] Hoàn tất truyền tải file: {item_name}")
+                    else:
+                        # Partial session: segments backed up to cloud but not yet fully merged
+                        job.files_downloaded += 1
+                        job.finish_item(item_k, status="done", name=item_name)
+                        timing = job.item_timings.get(item_k) or {}
+                        job.completed_items.append({
+                            **_queue_item_ref(source, item),
+                            "startTime": timing.get("startTime"),
+                            "endTime": timing.get("endTime"),
+                            "duration": timing.get("duration"),
+                        })
+                        job.log(f"[Backup-Resume] Phiên backup chưa hoàn tất, dữ liệu an toàn trên Cloud. Resume lần sau để tiếp tục: {item_name}")
+                except JobCancelled:
+                    raise
+                except Exception as exc:
+                    job.finish_item(item_k, status="failed", name=item_name)
                     timing = job.item_timings.get(item_k) or {}
-                    job.completed_items.append({
+                    job.failed_items.append({
                         **_queue_item_ref(source, item),
+                        "name": item_name,
+                        "reason": str(exc),
                         "startTime": timing.get("startTime"),
                         "endTime": timing.get("endTime"),
                         "duration": timing.get("duration"),
                     })
-                    job.log(f"[Backup-Resume] Hoàn tất truyền tải file: {item_name}")
-                else:
-                    # Partial session: segments backed up to cloud but not yet fully merged
-                    job.files_downloaded += 1
-                    job.finish_item(item_k, status="done", name=item_name)
-                    timing = job.item_timings.get(item_k) or {}
-                    job.completed_items.append({
-                        **_queue_item_ref(source, item),
-                        "startTime": timing.get("startTime"),
-                        "endTime": timing.get("endTime"),
-                        "duration": timing.get("duration"),
-                    })
-                    job.log(f"[Backup-Resume] Phiên backup chưa hoàn tất, dữ liệu an toàn trên Cloud. Resume lần sau để tiếp tục: {item_name}")
-            except Exception as exc:
-                job.finish_item(item_k, status="failed", name=item_name)
-                timing = job.item_timings.get(item_k) or {}
-                job.failed_items.append({
-                    **_queue_item_ref(source, item),
-                    "name": item_name,
-                    "reason": str(exc),
-                    "startTime": timing.get("startTime"),
-                    "endTime": timing.get("endTime"),
-                    "duration": timing.get("duration"),
-                })
-                job.files_skipped += 1
-                job.log(f"[Backup-Resume] [SKIP] Lỗi xử lý luồng cho {item_name}: {exc}. Bỏ qua mục này và tiếp tục xử lý các mục còn lại...")
-                continue
-            finally:
-                for temp_d in (dirs.get("input"), dirs.get("work"), dirs.get("output")):
-                    if temp_d and isinstance(temp_d, Path) and temp_d.is_dir():
-                        for child in list(temp_d.glob("backup_pipe_*")) + list(temp_d.glob("*.tmp")):
-                            try:
-                                if child.is_dir():
-                                    shutil.rmtree(child, ignore_errors=True)
-                                else:
-                                    child.unlink(missing_ok=True)
-                            except Exception:
-                                pass
-        else:
-            # Fallback to standard pipeline batch for regular files
-            await _run_file_pipeline_batches(job, dirs, source, target, options, src, dst, [item])
+                    job.files_skipped += 1
+                    job.log(f"[Backup-Resume] [SKIP] Lỗi xử lý luồng cho {item_name}: {exc}. Bỏ qua mục này và tiếp tục xử lý các mục còn lại...")
+                finally:
+                    for temp_d in item_dirs.values():
+                        if temp_d and temp_d.is_dir():
+                            shutil.rmtree(temp_d, ignore_errors=True)
+            else:
+                # Fallback to standard pipeline batch for regular files
+                try:
+                    await _run_file_pipeline_batches(job, item_dirs, source, target, options, src, dst, [item])
+                finally:
+                    for temp_d in item_dirs.values():
+                        if temp_d and temp_d.is_dir():
+                            shutil.rmtree(temp_d, ignore_errors=True)
+
+    if pipeline_items:
+        await asyncio.gather(*(process_one_item(idx, item) for idx, item in enumerate(pipeline_items)))
 
     if plain_folder_items:
         await _run_smart_folder_batches(job, dirs, source, target, options, src, dst, plain_folder_items)

@@ -4448,5 +4448,60 @@ def test_transfer_strategy_smart_folder(tmp_path, monkeypatch):
     assert job.files_uploaded == 4
 
 
+def test_transfer_strategy_backup_resume_parallel(tmp_path, monkeypatch):
+    dirs = {"input": tmp_path / "input", "work": tmp_path / "work", "output": tmp_path / "output"}
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+
+    max_concurrent = 0
+    current_concurrent = 0
+    lock = asyncio.Lock()
+
+    async def mock_run_resumable_pipeline(job, item_dirs, source, target, options, src, dst, item):
+        nonlocal max_concurrent, current_concurrent
+        async with lock:
+            current_concurrent += 1
+            if current_concurrent > max_concurrent:
+                max_concurrent = current_concurrent
+        await asyncio.sleep(0.05)
+        async with lock:
+            current_concurrent -= 1
+        return tmp_path / "done.mp4"
+
+    monkeypatch.setattr(transfer_job_mod, "job_dirs", lambda job_id: dirs)
+    import src.jobs.hls_backup_pipeline as hls_mod
+    monkeypatch.setattr(hls_mod, "run_resumable_backup_pipeline", mock_run_resumable_pipeline)
+
+    class DummyProv:
+        pass
+
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "links", DummyProv())
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "pikpak", DummyProv())
+
+    payload = {
+        "source": {
+            "provider": "links",
+            "items": [
+                {"id": f"link_{i}", "name": f"video_{i}.mp4", "url": f"https://example.com/stream_{i}.m3u8"}
+                for i in range(4)
+            ],
+        },
+        "target": {"provider": "pikpak", "credentials": {}, "folder": {}},
+        "options": {
+            "transfer_strategy": "backup_resume",
+            "parallelDownload": True,
+            "download_concurrency": 3,
+        },
+    }
+    job = JobState("test-strat-backup-resume-parallel", payload)
+    asyncio.run(run_transfer(job))
+
+    assert job.status == "completed"
+    assert job.files_downloaded == 4
+    assert job.files_uploaded == 4
+    assert max_concurrent == 3
+
+
+
 
 
