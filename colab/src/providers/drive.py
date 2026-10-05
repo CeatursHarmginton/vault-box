@@ -24,6 +24,17 @@ DRIVE_WEB_UPLOAD_API = "https://clients6.google.com/upload/drive/v2internal"
 DRIVE_USERCONTENT = "https://drive.usercontent.google.com"
 DRIVE_WEB_ORIGIN = "https://drive.google.com"
 DRIVE_WEB_API_KEY = "AIzaSyD_InbmSFufIEps5UAt2NmB_3LvBH3Sz_8"
+DRIVE_CLIENT_VERSION = "drive.web-frontend_20260824.12_p0"
+DRIVE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+)
+DRIVE_KEY_HOST_ORDER = (
+    "drivefrontend-pa.clients6.google.com",
+    "workspacevideo-pa.clients6.google.com",
+    "blobcomments-pa.clients6.google.com",
+    "clients6.google.com",
+)
 FOLDER_MIME = "application/vnd.google-apps.folder"
 FIELDS = "id,name,mimeType,size,parents,webContentLink,webViewLink"
 CHUNK = 8 * 1024 * 1024
@@ -144,8 +155,9 @@ class DriveProvider(BaseProvider):
         headers = {
             "origin": DRIVE_WEB_ORIGIN,
             "referer": DRIVE_WEB_ORIGIN + "/",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "user-agent": DRIVE_USER_AGENT,
             "x-goog-authuser": str(c.get("authuser") or "0"),
+            "x-goog-drive-client-version": DRIVE_CLIENT_VERSION,
         }
         cookie = self._cookie_header(c)
         if cookie:
@@ -159,7 +171,7 @@ class DriveProvider(BaseProvider):
 
     def _web_key(self, c: dict[str, Any]) -> str:
         keys = c.get("api_keys") or {}
-        for host in ("drivefrontend-pa.clients6.google.com", "clients6.google.com"):
+        for host in DRIVE_KEY_HOST_ORDER:
             key = keys.get(host)
             if key and key != "AIzaSyBc1bLOZpOtg3-qgMjSQ6pmn6HbE2zjzJg":
                 return str(key)
