@@ -252,6 +252,65 @@ class DriveProvider(BaseProvider):
             raise ProviderFailure("UPLOAD_FAILED" if method != "GET" else "DOWNLOAD_FAILED", resp.text[:500], {"status": resp.status_code})
         return resp
 
+    def _update_cookies_from_response(self, credentials: dict[str, Any], resp: httpx.Response) -> None:
+        if not resp:
+            return
+        set_cookies = resp.headers.get_list("set-cookie") if hasattr(resp.headers, "get_list") else []
+        if not set_cookies and "set-cookie" in resp.headers:
+            set_cookies = [resp.headers["set-cookie"]]
+        if not set_cookies:
+            return
+        cookies = credentials.setdefault("cookies", {})
+        if isinstance(cookies, str):
+            from http.cookies import SimpleCookie
+            sc = SimpleCookie()
+            sc.load(cookies)
+            cookies = {k: v.value for k, v in sc.items()}
+            credentials["cookies"] = cookies
+        if isinstance(cookies, dict):
+            for sc_hdr in set_cookies:
+                for chunk in sc_hdr.split(";"):
+                    chunk = chunk.strip()
+                    if "=" in chunk:
+                        k, v = chunk.split("=", 1)
+                        k = k.strip()
+                        if k and not k.lower().startswith(("domain", "path", "expires", "max-age", "samesite", "httponly", "secure")):
+                            cookies[k] = v.strip()
+
+    async def _refresh_web_session(self, credentials: dict[str, Any]) -> bool:
+        """Self-refreshes Google Drive web session in Colab without modifying VaultBox backend.
+        Pings Drive frontend to obtain rotated SIDCC / session cookies.
+        """
+        try:
+            client = self._client()
+            headers = self._web_headers(credentials)
+            resp = await self._send_request(
+                client,
+                "GET",
+                f"{DRIVE_WEB_ORIGIN}/drive/my-drive",
+                headers=headers,
+                follow_redirects=True,
+                timeout=15.0,
+            )
+            self._update_cookies_from_response(credentials, resp)
+            if resp.status_code in (200, 302, 304):
+                return True
+
+            key = self._web_key(credentials)
+            params = {"key": key, "$unique": "gc"} if key else {}
+            resp2 = await self._send_request(
+                client,
+                "GET",
+                f"{DRIVE_WEB_FILES_API}/about",
+                headers=self._web_headers(credentials),
+                params=params,
+                timeout=15.0,
+            )
+            self._update_cookies_from_response(credentials, resp2)
+            return resp2.status_code < 400
+        except Exception:
+            return False
+
     async def _web_request(self, credentials: dict[str, Any], method: str, url: str, **kwargs: Any) -> httpx.Response:
         client = self._client()
         extra_headers = kwargs.pop("headers", None)
@@ -272,6 +331,8 @@ class DriveProvider(BaseProvider):
                 params.setdefault("$unique", "gc")
 
         resp = await self._send_request(client, method, url, headers=headers, params=params, **kwargs)
+        self._update_cookies_from_response(credentials, resp)
+
         if resp.status_code in (401, 403):
             body_lower = resp.text[:300].lower()
             is_key_error = any(m in body_lower for m in _API_KEY_ERROR_MARKERS)
@@ -281,20 +342,35 @@ class DriveProvider(BaseProvider):
                 params.pop("key", None)
                 params.pop("$unique", None)
                 resp = await self._send_request(client, method, url, headers=headers, params=params, **kwargs)
+                self._update_cookies_from_response(credentials, resp)
                 if resp.status_code < 400:
                     return resp
 
-            # 2. Retry with freshly computed SAPISIDHASH timestamp + key restored
+            # Restore API key if needed
             if key and "key" not in params:
                 params["key"] = key
                 if not is_upload:
                     params.setdefault("$unique", "gc")
-            for attempt in range(2):
-                await asyncio.sleep(0.5 * (attempt + 1))
+
+            # 2. Try Bearer token if available
+            bearer_token = str(credentials.get("web_access_token") or credentials.get("access_token") or credentials.get("token") or "")
+            if bearer_token and not bearer_token.lower().startswith("sapisidhash "):
+                bearer_headers = self._web_headers(credentials, extra_headers)
+                bearer_headers["Authorization"] = f"Bearer {bearer_token}"
+                resp = await self._send_request(client, method, url, headers=bearer_headers, params=params, **kwargs)
+                self._update_cookies_from_response(credentials, resp)
+                if resp.status_code < 400:
+                    return resp
+
+            # 3. Autonomous self-refresh of web session cookies (renews SIDCC and session state)
+            for attempt in range(3):
+                await asyncio.sleep(1.0 * (attempt + 1))
+                await self._refresh_web_session(credentials)
                 fresh_headers = self._web_headers(credentials, extra_headers)
                 fresh_headers.pop("X-Goog-Api-Key", None)
                 fresh_headers.pop("x-goog-api-key", None)
                 resp = await self._send_request(client, method, url, headers=fresh_headers, params=params, **kwargs)
+                self._update_cookies_from_response(credentials, resp)
                 if resp.status_code < 400:
                     return resp
 
@@ -717,15 +793,12 @@ class DriveProvider(BaseProvider):
 
     async def _query_resumable_offset(self, client: Any, credentials: dict[str, Any], session_uri: str, size: int) -> int:
         try:
-            resp = await self._send_request(
-                client,
-                "PUT",
-                session_uri,
-                headers=self._web_headers(credentials, {
-                    "content-length": "0",
-                    "content-range": f"bytes */{size}",
-                }),
-            )
+            headers = self._web_headers(credentials, {
+                "content-length": "0",
+                "content-range": f"bytes */{size}",
+            })
+            resp = await self._send_request(client, "PUT", session_uri, headers=headers)
+            self._update_cookies_from_response(credentials, resp)
             if resp.status_code == 308:
                 rng = resp.headers.get("Range") or resp.headers.get("range") or ""
                 return int(rng.rsplit("-", 1)[1]) + 1 if "-" in rng else 0
@@ -775,6 +848,7 @@ class DriveProvider(BaseProvider):
                             headers=chunk_headers,
                             content=data,
                         )
+                        self._update_cookies_from_response(credentials, resp)
                         if resp.status_code in (200, 201):
                             progress.add_bytes(len(data), size, "upload", str(local_path))
                             result = resp.json()
@@ -787,6 +861,7 @@ class DriveProvider(BaseProvider):
                             break
                         if resp.status_code in (401, 403):
                             if attempt < 4:
+                                await self._refresh_web_session(credentials)
                                 await asyncio.sleep(min(2 ** attempt, 4))
                                 offset = await self._query_resumable_offset(client, credentials, session, size)
                                 continue
