@@ -60,6 +60,12 @@ def _multipart_body(boundary: str, metadata: str, mime: str, raw: bytes, *, as_b
         f"\r\n--{boundary}--\r\n".encode("utf-8"),
     ])
 
+def _clean_id(raw: Any) -> str:
+    s = str(raw or "").strip()
+    if s.startswith("id:"):
+        s = s[3:].strip()
+    return s
+
 def _relative_folder_parts(relative_path: str) -> list[str]:
     rel = str(relative_path or "").replace("\\", "/").strip("/")
     parent = PurePosixPath(rel).parent
@@ -149,6 +155,20 @@ class DriveProvider(BaseProvider):
             return "; ".join(f"{k}={v}" for k, v in cookies.items() if k and v)
         return ""
 
+    def _cookie_jar(self, c: dict[str, Any]) -> httpx.Cookies:
+        jar = httpx.Cookies()
+        cookies = c.get("cookies") or {}
+        if isinstance(cookies, str):
+            from http.cookies import SimpleCookie
+            sc = SimpleCookie()
+            sc.load(cookies)
+            cookies = {k: v.value for k, v in sc.items()}
+        if isinstance(cookies, dict):
+            for name, value in cookies.items():
+                if name and value:
+                    jar.set(str(name), str(value), domain=".google.com", path="/")
+        return jar
+
     def _web_auth(self, c: dict[str, Any]) -> str:
         cookies = c.get("cookies") or {}
         if isinstance(cookies, str):
@@ -206,7 +226,8 @@ class DriveProvider(BaseProvider):
 
     def _api_parent(self, ref: Any) -> str:
         raw = ref if isinstance(ref, str) else (ref.get("id") or ref.get("path") or "root")
-        return "root" if str(raw or "").strip() in {"", "/"} else str(raw)
+        cleaned = _clean_id(raw)
+        return "root" if cleaned in {"", "/"} else cleaned
 
     def _headers(self, c: dict[str, Any], extra: dict[str, str] | None = None) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token(c)}", **(extra or {})}
@@ -328,7 +349,7 @@ class DriveProvider(BaseProvider):
             return dest
         if self._use_mount(credentials) and not (credentials.get("access_token") or credentials.get("token") or credentials.get("web_access_token")):
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Drive source must be a MyDrive path after mounting")
-        fid = str(file_ref.get("id") or "")
+        fid = _clean_id(file_ref.get("id") or file_ref.get("path") or "")
         if not fid:
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Drive file id missing")
         if self._web_session(credentials):
@@ -522,22 +543,22 @@ class DriveProvider(BaseProvider):
         return current
 
     async def _web_download_info(self, credentials: dict[str, Any], file_id: str) -> dict[str, Any]:
+        file_id = _clean_id(file_id)
         params = {"id": file_id, "authuser": str(credentials.get("authuser") or "0"), "export": "download"}
         headers = self._web_headers(credentials, {
             "x-json-requested": "true",
             "x-drive-first-party": "DriveWebUi",
             "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
         }, auth=False)
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True, cookies=self._cookie_jar(credentials)) as client:
             try:
                 await client.get(f"{DRIVE_USERCONTENT}/auth_warmup", headers=self._web_headers(credentials, auth=False))
             except Exception:
                 pass
             resp = await client.post(f"{DRIVE_USERCONTENT}/uc", params=params, headers=headers, content=b"")
-        if resp.status_code in (401, 403):
-            raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked")
-        if resp.status_code >= 400:
-            raise ProviderFailure("DOWNLOAD_FAILED", resp.text[:500], {"status": resp.status_code})
+        if resp.status_code in (401, 403, 400, 404, 500, 502, 503):
+            url = f"{DRIVE_USERCONTENT}/download?id={file_id}&export=download&authuser={credentials.get('authuser') or '0'}&confirm=t"
+            return {"url": url, "name": file_id}
         text = resp.text.lstrip(")]}'\n")
         try:
             payload = json.loads(text)
@@ -801,7 +822,7 @@ class DriveProvider(BaseProvider):
             elif dest.is_dir():
                 shutil.rmtree(dest, ignore_errors=True)
             return {"ok": True}
-        fid = str(file_ref.get("id") or "")
+        fid = _clean_id(file_ref.get("id") or file_ref.get("path") or "")
         if not fid:
             return {"ok": False, "error": "Drive file id missing"}
         if self._web_session(credentials):

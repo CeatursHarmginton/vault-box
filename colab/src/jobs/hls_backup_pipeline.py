@@ -534,6 +534,8 @@ async def run_resumable_backup_pipeline(
 
     if is_backup_folder_input:
         src_folder_id = str(file_item.get("id") or file_item.get("path") or "")
+        if src_folder_id.startswith("id:"):
+            src_folder_id = src_folder_id[3:].strip()
         src_folder_name = PurePosixPath(file_item.get("name") or file_item.get("path") or "").name
         backup_folder_name = src_folder_name if src_folder_name.endswith("__backup_resume") else generate_backup_folder_name(src_folder_name)
         backup_folder_id = src_folder_id
@@ -544,29 +546,30 @@ async def run_resumable_backup_pipeline(
         segs_local_dir.mkdir(parents=True, exist_ok=True)
 
         job.log(f"[Backup-Resume] Nhận diện thư mục nguồn là Backup Folder: {backup_folder_name} (Đang đọc manifest...)")
+        source_creds = file_item.get("credentials") or source.get("credentials") or {}
         try:
-            src_listing = await src_provider.list_files(source.get("credentials") or {}, src_folder_id)
+            src_listing = await src_provider.list_files(source_creds, src_folder_id)
             items_found = src_listing.get("items") or []
             for it in items_found:
                 nm = str(it.get("name") or "")
                 if nm.startswith("part_") and nm.endswith(".ts"):
                     existing_remote_part_names.add(nm)
                     remote_part_map[nm] = it
-            folder_manifest_data = await _find_and_load_best_manifest(src_provider, source.get("credentials") or {}, items_found, job_work_dir, job)
+            folder_manifest_data = await _find_and_load_best_manifest(src_provider, source_creds, items_found, job_work_dir, job)
             if not folder_manifest_data and target_folder and hasattr(src_provider, "list_files"):
                 try:
-                    parent_listing = await src_provider.list_files(source.get("credentials") or {}, target_folder)
+                    parent_listing = await src_provider.list_files(source_creds, target_folder)
                     b_item = next((it for it in (parent_listing.get("items") or []) if it.get("name") == backup_folder_name and (it.get("type") == "folder" or it.get("is_folder"))), None)
                     if b_item:
                         backup_folder_id = b_item.get("id") or b_item.get("path") or backup_folder_id
-                        src_listing = await src_provider.list_files(source.get("credentials") or {}, backup_folder_id)
+                        src_listing = await src_provider.list_files(source_creds, backup_folder_id)
                         items_found = src_listing.get("items") or []
                         for it in items_found:
                             nm = str(it.get("name") or "")
                             if nm.startswith("part_") and nm.endswith(".ts"):
                                 existing_remote_part_names.add(nm)
                                 remote_part_map[nm] = it
-                        folder_manifest_data = await _find_and_load_best_manifest(src_provider, source.get("credentials") or {}, items_found, job_work_dir, job)
+                        folder_manifest_data = await _find_and_load_best_manifest(src_provider, source_creds, items_found, job_work_dir, job)
                 except Exception:
                     pass
         except Exception as scan_err:
