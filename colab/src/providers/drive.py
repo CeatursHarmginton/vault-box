@@ -259,25 +259,36 @@ class DriveProvider(BaseProvider):
         headers.pop("X-Goog-Api-Key", None)
         headers.pop("x-goog-api-key", None)
 
-        is_v2internal = "v2internal" in url or "clients6.google.com/drive" in url or "/upload/" in url
+        is_upload = "/upload/" in url
         params = dict(kwargs.pop("params", None) or {})
 
+        # The Drive web app sends the public browser key= query param on ALL
+        # Drive API hosts (drivefrontend-pa 130/130, clients6 v2internal 77/77,
+        # workspacevideo-pa and blobcomments-pa likewise).  Always include it.
         key = self._web_key(credentials)
-        if key and not is_v2internal and "key" not in params:
+        if key and "key" not in params:
             params["key"] = key
-            params.setdefault("$unique", "gc")
+            if not is_upload:
+                params.setdefault("$unique", "gc")
 
         resp = await self._send_request(client, method, url, headers=headers, params=params, **kwargs)
         if resp.status_code in (401, 403):
-            # 1. If key was present in params, retry immediately without key
-            if "key" in params:
+            body_lower = resp.text[:300].lower()
+            is_key_error = any(m in body_lower for m in _API_KEY_ERROR_MARKERS)
+
+            # 1. If it looks like the API key is the problem, retry without it
+            if is_key_error and "key" in params:
                 params.pop("key", None)
                 params.pop("$unique", None)
                 resp = await self._send_request(client, method, url, headers=headers, params=params, **kwargs)
                 if resp.status_code < 400:
                     return resp
 
-            # 2. Retry with freshly computed timestamp in auth headers
+            # 2. Retry with freshly computed SAPISIDHASH timestamp + key restored
+            if key and "key" not in params:
+                params["key"] = key
+                if not is_upload:
+                    params.setdefault("$unique", "gc")
             for attempt in range(2):
                 await asyncio.sleep(0.5 * (attempt + 1))
                 fresh_headers = self._web_headers(credentials, extra_headers)
