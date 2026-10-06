@@ -523,7 +523,7 @@ class DriveProvider(BaseProvider):
                 raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Drive file id missing")
             name = str(source_ref.get("name") or local_path.name)
             mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
-            return await self._web_replace_file(credentials, local_path, fid, name, mime, progress)
+            return await self._web_replace_file(credentials, local_path, fid, name, mime, progress, source_ref=source_ref)
         if not fid:
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Drive file id missing")
         meta = (await self._request(credentials, "GET", f"{DRIVE_API}/files/{fid}", params={"fields": FIELDS, "supportsAllDrives": "true"})).json()
@@ -805,92 +805,26 @@ class DriveProvider(BaseProvider):
                         raise ProviderFailure("UPLOAD_FAILED", f"Network error during upload: {net_err}")
         raise ProviderFailure("UPLOAD_FAILED", "Drive web resumable upload ended early")
 
-    async def _web_replace_file(self, credentials: dict[str, Any], local_path: Path, fid: str, name: str, mime: str, progress: JobState) -> dict[str, Any]:
-        size = local_path.stat().st_size
-        progress.set(step="uploading", current_file=name)
-        if size <= WEB_MULTIPART_MAX:
-            boundary = f"vaultbox-drive-web-{int(time.time() * 1000)}"
-            metadata = json.dumps({"title": name, "mimeType": mime}, ensure_ascii=False)
-            encoded = base64.b64encode(await asyncio.to_thread(local_path.read_bytes)).decode("ascii")
-            body = (
-                f"--{boundary}\r\ncontent-type: application/json; charset=UTF-8\r\n\r\n"
-                + metadata
-                + f"\r\n--{boundary}\r\ncontent-transfer-encoding: base64\r\ncontent-type: {mime}\r\n\r\n"
-                + encoded
-                + f"\r\n--{boundary}--\r\n"
-            ).encode("utf-8")
-            resp = await self._web_request(
-                credentials,
-                "PATCH",
-                f"{DRIVE_WEB_UPLOAD_API}/files/{fid}",
-                params={"uploadType": "multipart", "supportsTeamDrives": "true"},
-                headers={"content-type": f"multipart/related; boundary={boundary}"},
-                content=body,
-            )
-            progress.add_bytes(size, size, "upload", str(local_path))
-            data = resp.json()
-            return {"id": data.get("id") or fid, "name": data.get("title") or data.get("name") or name}
+    async def _web_replace_file(self, credentials: dict[str, Any], local_path: Path, fid: str, name: str, mime: str, progress: JobState, source_ref: dict[str, Any] | None = None) -> dict[str, Any]:
+        parent = ""
+        if source_ref:
+            parent = str(source_ref.get("parent_id") or source_ref.get("parent") or (source_ref.get("parents") or [""])[0] or "")
+        if not parent:
+            try:
+                meta = (await self._web_request(credentials, "GET", f"{DRIVE_WEB_FILES_API}/files/{fid}", params={"fields": "parents(id)", "supportsTeamDrives": "true"})).json()
+                parent = str(((meta.get("parents") or [{}])[0]).get("id") or "root")
+            except Exception:
+                parent = "root"
 
-        init_headers = {
-            "content-type": "application/json",
-            "x-upload-content-type": mime,
-            "x-upload-content-length": str(size),
-        }
-        init = await self._web_request(
-            credentials,
-            "PATCH",
-            f"{DRIVE_WEB_UPLOAD_API}/files/{fid}",
-            params={"uploadType": "resumable", "supportsTeamDrives": "true"},
-            headers=init_headers,
-            content=json.dumps({"title": name, "mimeType": mime}),
-        )
-        session = init.headers.get("Location") or init.headers.get("location")
-        if not session:
-            raise ProviderFailure("UPLOAD_FAILED", "Drive web resumable replace session missing")
-        offset = 0
-        client = self._client()
-        with local_path.open("rb") as fh:
-            while offset < size:
-                progress.check_cancelled()
-                data = await asyncio.to_thread(_read_at, fh, offset, min(CHUNK, size - offset))
-                end = offset + len(data) - 1
-                for attempt in range(5):
-                    try:
-                        chunk_headers = self._web_headers(credentials, {
-                            "content-length": str(len(data)),
-                            "content-range": f"bytes {offset}-{end}/{size}",
-                            "content-type": mime,
-                        })
-                        resp = await self._send_request(client, "PUT", session, headers=chunk_headers, content=data)
-                        if resp.status_code in (200, 201):
-                            progress.add_bytes(len(data), size, "upload", str(local_path))
-                            result = resp.json()
-                            return {"id": result.get("id") or fid, "name": result.get("title") or result.get("name") or name}
-                        if resp.status_code == 308:
-                            rng = resp.headers.get("Range") or resp.headers.get("range") or ""
-                            next_offset = int(rng.rsplit("-", 1)[1]) + 1 if "-" in rng else end + 1
-                            progress.add_bytes(max(0, next_offset - offset), size, "upload", str(local_path))
-                            offset = next_offset
-                            break
-                        if resp.status_code in (401, 403):
-                            if attempt < 4:
-                                await asyncio.sleep(min(2 ** attempt, 4))
-                                offset = await self._query_resumable_offset(client, credentials, session, size)
-                                continue
-                            raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked")
-                        if resp.status_code >= 500 or resp.status_code in (400, 408, 429):
-                            if attempt < 4:
-                                await asyncio.sleep(min(2 ** attempt, 8))
-                                offset = await self._query_resumable_offset(client, credentials, session, size)
-                                continue
-                        raise ProviderFailure("UPLOAD_FAILED", resp.text[:500], {"status": resp.status_code})
-                    except (httpx.HTTPError, OSError) as net_err:
-                        if attempt < 4:
-                            await asyncio.sleep(min(2 ** attempt, 8))
-                            offset = await self._query_resumable_offset(client, credentials, session, size)
-                            continue
-                        raise ProviderFailure("UPLOAD_FAILED", f"Network error during replace: {net_err}")
-        raise ProviderFailure("UPLOAD_FAILED", "Drive web resumable replace ended early")
+        upload_target = {"id": parent, "name": name, "relative_path": name}
+        res = await self._web_upload_file(credentials, local_path, upload_target, progress)
+
+        if fid and fid != res.get("id"):
+            try:
+                await self.delete_file(credentials, {"id": fid})
+            except Exception:
+                pass
+        return res
 
     async def delete_file(self, credentials: dict[str, Any], file_ref: dict[str, Any]) -> dict[str, Any]:
         if self._use_mount(credentials) and self._mount_ref(file_ref):
