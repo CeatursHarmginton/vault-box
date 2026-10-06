@@ -4502,6 +4502,113 @@ def test_transfer_strategy_backup_resume_parallel(tmp_path, monkeypatch):
     assert job.files_uploaded == 4
     assert max_concurrent == 3
 
+def test_drive_web_request_refreshes_cookie_and_retries(monkeypatch):
+    provider = DriveProvider()
+    creds = {"auth_mode": "web_session", "access_token": "SAPISIDHASH old", "cookies": {"SAPISID": "old"}}
+    calls = []
+
+    class Response:
+        headers = {}
+
+        def __init__(self, status_code, text=""):
+            self.status_code = status_code
+            self.text = text
+
+        def json(self):
+            return {"ok": True}
+
+    class Client:
+        async def get(self, url, **kwargs):
+            calls.append((url, kwargs["headers"].get("cookie", "")))
+            return Response(200 if "new" in calls[-1][1] else 401)
+
+    async def refresh(credentials):
+        credentials["cookies"]["SAPISID"] = "new"
+        return True
+
+    monkeypatch.setattr(provider, "_client", lambda: Client())
+    monkeypatch.setattr(provider, "_refresh_web_session", refresh)
+
+    resp = asyncio.run(provider._web_request(creds, "GET", drive_mod.DRIVE_WEB_FILES_API + "/about"))
+
+    assert resp.status_code == 200
+    assert [c[1] for c in calls] == ["SAPISID=old", "SAPISID=new"]
+
+def test_drive_web_download_info_refreshes_usercontent_cookie(monkeypatch):
+    provider = DriveProvider()
+    creds = {"auth_mode": "web_session", "access_token": "SAPISIDHASH", "cookies": {"SAPISID": "old"}}
+    posts = []
+
+    class Response:
+        headers = {}
+
+        def __init__(self, status_code, text="{}"):
+            self.status_code = status_code
+            self.text = text
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, **kwargs):
+            return Response(200)
+
+        async def post(self, url, **kwargs):
+            posts.append(kwargs["headers"].get("cookie", ""))
+            if len(posts) == 1:
+                return Response(403, "expired")
+            return Response(200, '{"downloadUrl":"https://drive.usercontent.google.com/download?id=f1","fileName":"f.bin"}')
+
+    async def refresh(credentials):
+        credentials["cookies"]["SAPISID"] = "new"
+        return True
+
+    monkeypatch.setattr(drive_mod.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(provider, "_refresh_web_session", refresh)
+
+    info = asyncio.run(provider._web_download_info(creds, "f1"))
+
+    assert info["name"] == "f.bin"
+    assert posts == ["SAPISID=old", "SAPISID=new"]
+
+def test_drive_web_download_retries_stream_after_refresh(monkeypatch, tmp_path):
+    provider = DriveProvider()
+    creds = {"auth_mode": "web_session", "access_token": "SAPISIDHASH", "cookies": {"SAPISID": "old"}}
+    downloads = []
+
+    async def download_info(credentials, file_id):
+        return {"url": f"https://drive.usercontent.google.com/download?id={file_id}&cookie={credentials['cookies']['SAPISID']}", "name": "f.bin"}
+
+    async def refresh(credentials):
+        credentials["cookies"]["SAPISID"] = "new"
+        return True
+
+    async def fake_stream(url, dest, progress, *, headers=None, cookies=None, **kwargs):
+        downloads.append(url)
+        if len(downloads) == 1:
+            raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "expired", {"status": 403})
+        dest.write_text("ok")
+        return dest
+
+    monkeypatch.setattr(provider, "_web_download_info", download_info)
+    monkeypatch.setattr(provider, "_refresh_web_session", refresh)
+    monkeypatch.setattr(drive_mod, "stream_download", fake_stream)
+
+    dest = tmp_path / "f.bin"
+    out = asyncio.run(provider.download_file(creds, {"id": "f1"}, dest, JobState("drive-download-refresh", {})))
+
+    assert out == dest
+    assert downloads == [
+        "https://drive.usercontent.google.com/download?id=f1&cookie=old",
+        "https://drive.usercontent.google.com/download?id=f1&cookie=new",
+    ]
+
 
 
 

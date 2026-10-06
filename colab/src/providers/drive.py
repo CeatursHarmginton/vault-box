@@ -255,9 +255,10 @@ class DriveProvider(BaseProvider):
     def _update_cookies_from_response(self, credentials: dict[str, Any], resp: httpx.Response) -> None:
         if not resp:
             return
-        set_cookies = resp.headers.get_list("set-cookie") if hasattr(resp.headers, "get_list") else []
-        if not set_cookies and "set-cookie" in resp.headers:
-            set_cookies = [resp.headers["set-cookie"]]
+        headers = getattr(resp, "headers", {}) or {}
+        set_cookies = headers.get_list("set-cookie") if hasattr(headers, "get_list") else []
+        if not set_cookies and "set-cookie" in headers:
+            set_cookies = [headers["set-cookie"]]
         if not set_cookies:
             return
         cookies = credentials.setdefault("cookies", {})
@@ -278,36 +279,40 @@ class DriveProvider(BaseProvider):
                             cookies[k] = v.strip()
 
     async def _refresh_web_session(self, credentials: dict[str, Any]) -> bool:
-        """Self-refreshes Google Drive web session in Colab without modifying VaultBox backend.
-        Pings Drive frontend to obtain rotated SIDCC / session cookies.
-        """
+        """Refresh browser-session cookies inside the Colab job only."""
+        ok = False
         try:
             client = self._client()
-            headers = self._web_headers(credentials)
-            resp = await self._send_request(
-                client,
-                "GET",
-                f"{DRIVE_WEB_ORIGIN}/drive/my-drive",
-                headers=headers,
-                follow_redirects=True,
-                timeout=15.0,
-            )
-            self._update_cookies_from_response(credentials, resp)
-            if resp.status_code in (200, 302, 304):
+            for url, auth in (
+                (f"{DRIVE_WEB_ORIGIN}/drive/my-drive", True),
+                (f"{DRIVE_USERCONTENT}/auth_warmup", False),
+            ):
+                try:
+                    resp = await self._send_request(
+                        client,
+                        "GET",
+                        url,
+                        headers=self._web_headers(credentials, auth=auth),
+                        follow_redirects=True,
+                        timeout=15.0,
+                    )
+                    self._update_cookies_from_response(credentials, resp)
+                    ok = ok or resp.status_code < 400
+                except Exception:
+                    pass
+            if ok:
                 return True
-
             key = self._web_key(credentials)
-            params = {"key": key, "$unique": "gc"} if key else {}
-            resp2 = await self._send_request(
+            resp = await self._send_request(
                 client,
                 "GET",
                 f"{DRIVE_WEB_FILES_API}/about",
                 headers=self._web_headers(credentials),
-                params=params,
+                params={"key": key, "$unique": "gc"} if key else {},
                 timeout=15.0,
             )
-            self._update_cookies_from_response(credentials, resp2)
-            return resp2.status_code < 400
+            self._update_cookies_from_response(credentials, resp)
+            return resp.status_code < 400
         except Exception:
             return False
 
@@ -321,11 +326,11 @@ class DriveProvider(BaseProvider):
         is_upload = "/upload/" in url
         params = dict(kwargs.pop("params", None) or {})
 
-        # The Drive web app sends the public browser key= query param on ALL
-        # Drive API hosts (drivefrontend-pa 130/130, clients6 v2internal 77/77,
-        # workspacevideo-pa and blobcomments-pa likewise).  Always include it.
+        # Colab's v2internal/upload calls work cookie-bound; do not leak a
+        # captured frontend key there because older captures may be referrer-bound.
         key = self._web_key(credentials)
-        if key and "key" not in params:
+        host = str(httpx.URL(url).host or "")
+        if key and host != "clients6.google.com" and "key" not in params:
             params["key"] = key
             if not is_upload:
                 params.setdefault("$unique", "gc")
@@ -364,7 +369,8 @@ class DriveProvider(BaseProvider):
 
             # 3. Autonomous self-refresh of web session cookies (renews SIDCC and session state)
             for attempt in range(3):
-                await asyncio.sleep(1.0 * (attempt + 1))
+                if attempt:
+                    await asyncio.sleep(1.0 * attempt)
                 await self._refresh_web_session(credentials)
                 fresh_headers = self._web_headers(credentials, extra_headers)
                 fresh_headers.pop("X-Goog-Api-Key", None)
@@ -495,13 +501,26 @@ class DriveProvider(BaseProvider):
             name = file_ref.get("name") or info.get("name") or fid
             local_path = local_path if local_path.suffix else local_path / safe_name(name)
             progress.set(step="downloading", current_file=local_path.name)
-            return await stream_download(
-                info["url"],
-                local_path,
-                progress,
-                headers=self._web_headers(credentials, auth=False),
-                cookies=self._cookie_jar(credentials),
-            )
+            try:
+                return await stream_download(
+                    info["url"],
+                    local_path,
+                    progress,
+                    headers=self._web_headers(credentials, auth=False),
+                    cookies=self._cookie_jar(credentials),
+                )
+            except ProviderFailure as exc:
+                if exc.code != "INVALID_PROVIDER_CREDENTIALS" and int((exc.details or {}).get("status") or 0) not in (401, 403):
+                    raise
+                await self._refresh_web_session(credentials)
+                info = await self._web_download_info(credentials, fid)
+                return await stream_download(
+                    info["url"],
+                    local_path,
+                    progress,
+                    headers=self._web_headers(credentials, auth=False),
+                    cookies=self._cookie_jar(credentials),
+                )
         meta = (await self._request(credentials, "GET", f"{DRIVE_API}/files/{fid}", params={"fields": FIELDS, "supportsAllDrives": "true"})).json()
         name = file_ref.get("name") or meta.get("name") or fid
         local_path = local_path if local_path.suffix else local_path / safe_name(name)
@@ -689,18 +708,28 @@ class DriveProvider(BaseProvider):
     async def _web_download_info(self, credentials: dict[str, Any], file_id: str) -> dict[str, Any]:
         file_id = _clean_id(file_id)
         params = {"id": file_id, "authuser": str(credentials.get("authuser") or "0"), "export": "download"}
-        headers = self._web_headers(credentials, {
-            "x-json-requested": "true",
-            "x-drive-first-party": "DriveWebUi",
-            "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
-        }, auth=False)
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True, cookies=self._cookie_jar(credentials)) as client:
-            try:
-                await client.get(f"{DRIVE_USERCONTENT}/auth_warmup", headers=self._web_headers(credentials, auth=False))
-            except Exception:
-                pass
-            resp = await client.post(f"{DRIVE_USERCONTENT}/uc", params=params, headers=headers, content=b"")
-        if resp.status_code in (401, 403, 400, 404, 500, 502, 503):
+        resp = None
+        for attempt in range(2):
+            headers = self._web_headers(credentials, {
+                "x-json-requested": "true",
+                "x-drive-first-party": "DriveWebUi",
+                "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+            }, auth=False)
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True, cookies=self._cookie_jar(credentials)) as client:
+                try:
+                    warmup = await client.get(f"{DRIVE_USERCONTENT}/auth_warmup", headers=self._web_headers(credentials, auth=False))
+                    self._update_cookies_from_response(credentials, warmup)
+                except Exception:
+                    pass
+                resp = await client.post(f"{DRIVE_USERCONTENT}/uc", params=params, headers=headers, content=b"")
+                self._update_cookies_from_response(credentials, resp)
+            if resp.status_code not in (401, 403):
+                break
+            if attempt == 0:
+                await self._refresh_web_session(credentials)
+        if resp is None or resp.status_code in (401, 403):
+            raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked", {"status": getattr(resp, "status_code", 0)})
+        if resp.status_code in (400, 404, 500, 502, 503):
             url = f"{DRIVE_USERCONTENT}/download?id={file_id}&export=download&authuser={credentials.get('authuser') or '0'}&confirm=t"
             return {"url": url, "name": file_id}
         text = resp.text.lstrip(")]}'\n")
@@ -816,13 +845,14 @@ class DriveProvider(BaseProvider):
             "x-upload-content-length": str(size),
         }
         progress.set(step="uploading", current_file=name)
+        init_payload = json.dumps({"title": name, "mimeType": mime, "parents": [{"id": parent}]})
         init = await self._web_request(
             credentials,
             "POST",
             f"{DRIVE_WEB_UPLOAD_API}/files",
             params={"uploadType": "resumable", "supportsTeamDrives": "true"},
             headers=init_headers,
-            content=json.dumps({"title": name, "mimeType": mime, "parents": [{"id": parent}]}),
+            content=init_payload,
         )
         session = init.headers.get("Location") or init.headers.get("location")
         if not session:
@@ -893,6 +923,8 @@ class DriveProvider(BaseProvider):
 
         upload_target = {"id": parent, "name": name, "relative_path": name}
         res = await self._web_upload_file(credentials, local_path, upload_target, progress)
+        if fid and not res.get("id"):
+            res["id"] = fid
 
         if fid and fid != res.get("id"):
             try:
