@@ -505,6 +505,8 @@ async def run_resumable_backup_pipeline(
             job.log(f"[Backup-Resume] Lưu ý khi đọc file sniffer JSON: {j_err}")
 
     target_folder = str((target.get("folder") or {}).get("id") or (target.get("folder") or {}).get("path") or "/")
+    if target_folder.startswith("id:"):
+        target_folder = target_folder[3:].strip()
     target_creds = target.get("credentials") or {}
 
     chunk_segments = int(options.get("backup_chunk_segments") or DEFAULT_CHUNK_SEGMENTS)

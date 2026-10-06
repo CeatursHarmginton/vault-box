@@ -167,6 +167,9 @@ class DriveProvider(BaseProvider):
             for name, value in cookies.items():
                 if name and value:
                     jar.set(str(name), str(value), domain=".google.com", path="/")
+                    jar.set(str(name), str(value), domain=".googleusercontent.com", path="/")
+                    jar.set(str(name), str(value), domain="drive.google.com", path="/")
+                    jar.set(str(name), str(value), domain="drive.usercontent.google.com", path="/")
         return jar
 
     def _web_auth(self, c: dict[str, Any]) -> str:
@@ -309,22 +312,70 @@ class DriveProvider(BaseProvider):
             return {"items": [{"id": p.relative_to(DRIVE_MOUNT).as_posix(), "path": p.relative_to(DRIVE_MOUNT).as_posix(), "name": p.name, "type": "folder" if p.is_dir() else "file", "size": p.stat().st_size if p.is_file() else 0} for p in sorted(folder.iterdir())]}
         parent = self._api_parent(path_or_id)
         if self._web_session(credentials):
-            params = {
-                "q": f"'{_q_escape(parent)}' in parents and trashed = false",
-                "maxResults": "1000",
-                "supportsTeamDrives": "true",
-            }
-            resp = await self._web_request(credentials, "GET", f"{DRIVE_WEB_FILES_API}/files", params=params)
-            items = resp.json().get("items") or []
-            return {"items": [{
-                "id": it.get("id"),
-                "name": it.get("title") or it.get("name"),
-                "type": "folder" if it.get("mimeType") == FOLDER_MIME else "file",
-                "mimeType": it.get("mimeType"),
-                "size": int(it.get("fileSize") or 0) if it.get("fileSize") else 0,
-                "modifiedTime": it.get("modifiedDate") or it.get("modified_date_millis"),
-                "createdTime": it.get("createdDate") or it.get("create_date_millis"),
-            } for it in items]}
+            # 1. Primary: POST drivefrontend-pa.clients6.google.com/v1/items:list
+            page_size = 1000
+            body = [[None] * 44, [page_size, "", [2, 5]]]
+            body[0][4] = 0
+            body[0][21] = 0
+            body[0][24] = [4, 1, 1]
+            body[0][35] = [[1]]
+            body[0][43] = [[parent, 0]]
+            try:
+                resp = await self._web_request(
+                    credentials,
+                    "POST",
+                    "https://drivefrontend-pa.clients6.google.com/v1/items:list",
+                    json=body,
+                    headers={
+                        "content-type": "application/json+protobuf",
+                        "x-goog-fieldmask": "items(id,title,mime_type,file_size,modified_date_millis,create_date_millis,thumbnail_version,alternate_link,explicitly_trashed,trashed,parent),continuation_token",
+                    },
+                )
+                data = resp.json()
+                raw_items = data[0] if isinstance(data, list) and data and isinstance(data[0], list) else []
+                items = []
+                for it in raw_items:
+                    if not isinstance(it, list) or not it:
+                        continue
+                    fid = str(it[0] if len(it) > 0 and it[0] else "")
+                    if not fid:
+                        continue
+                    name = str(it[2] if len(it) > 2 and it[2] else "")
+                    mime = str(it[3] if len(it) > 3 and it[3] else "")
+                    created_ms = it[9] if len(it) > 9 else None
+                    modified_ms = it[10] if len(it) > 10 else None
+                    size = int(it[13] if len(it) > 13 and it[13] else 0)
+                    trashed = bool((len(it) > 25 and it[25]) or (len(it) > 87 and it[87]))
+                    if trashed:
+                        continue
+                    items.append({
+                        "id": fid,
+                        "name": name,
+                        "type": "folder" if mime == FOLDER_MIME else "file",
+                        "mimeType": mime,
+                        "size": size,
+                        "modifiedTime": modified_ms,
+                        "createdTime": created_ms,
+                    })
+                return {"items": items}
+            except Exception:
+                # 2. Fallback: GET clients6.google.com/drive/v2internal/files
+                params = {
+                    "q": f"'{_q_escape(parent)}' in parents and trashed = false",
+                    "maxResults": "1000",
+                    "supportsTeamDrives": "true",
+                }
+                resp = await self._web_request(credentials, "GET", f"{DRIVE_WEB_FILES_API}/files", params=params)
+                v2_items = resp.json().get("items") or []
+                return {"items": [{
+                    "id": it.get("id"),
+                    "name": it.get("title") or it.get("name"),
+                    "type": "folder" if it.get("mimeType") == FOLDER_MIME else "file",
+                    "mimeType": it.get("mimeType"),
+                    "size": int(it.get("fileSize") or 0) if it.get("fileSize") else 0,
+                    "modifiedTime": it.get("modifiedDate") or it.get("modified_date_millis"),
+                    "createdTime": it.get("createdDate") or it.get("create_date_millis"),
+                } for it in v2_items]}
         resp = await self._request(credentials, "GET", f"{DRIVE_API}/files", params={
             "q": f"'{parent}' in parents and trashed=false",
             "fields": f"files({FIELDS})",
@@ -357,7 +408,13 @@ class DriveProvider(BaseProvider):
             name = file_ref.get("name") or info.get("name") or fid
             local_path = local_path if local_path.suffix else local_path / safe_name(name)
             progress.set(step="downloading", current_file=local_path.name)
-            return await stream_download(info["url"], local_path, progress, headers=self._web_headers(credentials, auth=False))
+            return await stream_download(
+                info["url"],
+                local_path,
+                progress,
+                headers=self._web_headers(credentials, auth=False),
+                cookies=self._cookie_jar(credentials),
+            )
         meta = (await self._request(credentials, "GET", f"{DRIVE_API}/files/{fid}", params={"fields": FIELDS, "supportsAllDrives": "true"})).json()
         name = file_ref.get("name") or meta.get("name") or fid
         local_path = local_path if local_path.suffix else local_path / safe_name(name)
@@ -614,16 +671,27 @@ class DriveProvider(BaseProvider):
                 known = cache.get(cache_key)
                 if not known:
                     query = f"'{_q_escape(current)}' in parents and title='{_q_escape(part)}' and mimeType='{FOLDER_MIME}' and trashed = false"
-                    resp = await self._web_request(
-                        credentials,
-                        "GET",
-                        f"{DRIVE_WEB_FILES_API}/files",
-                        params={"supportsTeamDrives": "true", "q": query, "fields": "items(id,title,mimeType)"},
-                    )
-                    match = next(iter(resp.json().get("items") or []), None)
-                    if match:
-                        known = str(match.get("id") or "")
-                    else:
+                    try:
+                        resp = await self._web_request(
+                            credentials,
+                            "GET",
+                            f"{DRIVE_WEB_FILES_API}/files",
+                            params={"supportsTeamDrives": "true", "q": query, "fields": "items(id,title,mimeType)"},
+                        )
+                        match = next(iter(resp.json().get("items") or []), None)
+                        if match:
+                            known = str(match.get("id") or "")
+                    except Exception:
+                        pass
+                    if not known:
+                        try:
+                            listing = await self.list_files(credentials, current)
+                            match = next((it for it in (listing.get("items") or []) if it.get("name") == part and it.get("type") == "folder"), None)
+                            if match and match.get("id"):
+                                known = str(match["id"])
+                        except Exception:
+                            pass
+                    if not known:
                         resp = await self._web_request(
                             credentials,
                             "POST",

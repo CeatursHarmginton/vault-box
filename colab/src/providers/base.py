@@ -276,6 +276,7 @@ async def stream_download(
     progress: JobState,
     *,
     headers: dict[str, str] | None = None,
+    cookies: httpx.Cookies | dict[str, str] | None = None,
     phase: str = "download",
     on_verify: Any = None,
     auth_fail_code: str = "INVALID_PROVIDER_CREDENTIALS",
@@ -310,8 +311,8 @@ async def stream_download(
                     b"access denied", b"ip not allowed", b"invalid token", b"link expired",
                     b"url expired", b'"errmsg"', b"<html", b"<!doctype html"
                 )
-                if proxy:
-                    async with httpx.AsyncClient(proxy=proxy, timeout=httpx.Timeout(None, connect=30.0, read=DOWNLOAD_READ_TIMEOUT, write=60.0, pool=30.0), follow_redirects=True) as client:
+                if proxy or cookies:
+                    async with httpx.AsyncClient(cookies=cookies, proxy=proxy, timeout=httpx.Timeout(None, connect=30.0, read=DOWNLOAD_READ_TIMEOUT, write=60.0, pool=30.0), follow_redirects=True) as client:
                         async with client.stream("GET", url, headers=req_headers) as resp:
                             if resp.status_code in (401, 403):
                                 raise ProviderFailure(auth_fail_code, f"{auth_fail_message} (HTTP {resp.status_code})", {"status": resp.status_code})
