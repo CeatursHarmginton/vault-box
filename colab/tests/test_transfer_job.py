@@ -642,6 +642,7 @@ def test_extract_missing_7z_falls_back_to_original_files(tmp_path, monkeypatch):
     input_dir.mkdir()
     (input_dir / "a.zip").write_text("zip")
 
+    monkeypatch.setattr(extractor_mod, "_find_7z", lambda: "7z_missing_bin")
     monkeypatch.setattr(extractor_mod.shutil, "which", lambda name: None)
     out = asyncio.run(extractor_mod.extract_archives(input_dir, output_dir, JobState("no-7z", {}), ["pw"]))
 
