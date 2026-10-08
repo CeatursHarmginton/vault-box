@@ -192,7 +192,7 @@ def test_resolve_universal_page_extracts_striptube_escaped_json(tmp_path, monkey
     }
     raw_api_body = json.dumps(api_json)
 
-    async def fake_fetch_webpage(url, headers, progress, proxy=None, auto_proxy=True, session_cookies=None):
+    async def fake_fetch_webpage(url, headers, progress, proxy=None, auto_proxy=True, session_cookies=None, post_data=None):
         if "/api/video/200021180" in url:
             return 200, raw_api_body, url, None
         return 200, html_page, url, None
@@ -203,6 +203,42 @@ def test_resolve_universal_page_extracts_striptube_escaped_json(tmp_path, monkey
     res = asyncio.run(provider._resolve_universal_page("https://striptube.cc/video/200021180/play", file_ref, job))
 
     assert "https://dc.mediastrmx.com/hl/bejeni-sweet/2026-09-27,09-31/index.m3u8" in res[0]
+
+
+def test_resolve_universal_page_ignores_bunny_shield_and_extracts_striptube(tmp_path, monkeypatch):
+    provider = LinksProvider()
+    job = JobState("test-job", {})
+
+    # Mock page with BunnyCDN shield iframe + data-token on button / recentVideos
+    html_page = """
+    <html>
+        <iframe src="https://shield-templates-prod.b-cdn.net/151725/challenge.html"></iframe>
+        <div id="recentVideos" data-url="/api/video/200696612/related/older?token=tok_abc123456789_long"></div>
+        <button id="play_button" data-video-id="200696612" data-token="tok_abc123456789_long"></button>
+    </html>
+    """
+
+    api_html_response = """
+    <video controls class="video-player">
+        <source src="https://da.mediastrmx.com/hl/bejeni-sweet/2026-10-06,05-16/index.m3u8?resolution=1920x1080&amp;expires=1791471640&amp;secret=v2" type="application/x-mpegURL" />
+    </video>
+    """
+
+    async def fake_fetch_webpage(url, headers, progress, proxy=None, auto_proxy=True, session_cookies=None, post_data=None):
+        if "/api/video/200696612" in url:
+            if "token=tok_abc123456789_long" in url:
+                return 200, api_html_response, url, None
+            return 200, "wrong_token", url, None
+        return 200, html_page, url, None
+
+    monkeypatch.setattr(provider, "_fetch_webpage", fake_fetch_webpage)
+
+    file_ref = {"page_url": "https://striptube.cc/video/200696612/play"}
+    res = asyncio.run(provider._resolve_universal_page("https://striptube.cc/video/200696612/play", file_ref, job))
+
+    assert "https://da.mediastrmx.com/hl/bejeni-sweet/2026-10-06,05-16/index.m3u8" in res[0]
+    assert "expires=1791471640" in res[0]
+    assert "&amp;" not in res[0]
 
 
 def test_backup_resume_cross_provider_assembly(tmp_path, monkeypatch):

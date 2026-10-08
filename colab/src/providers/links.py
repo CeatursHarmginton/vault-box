@@ -293,9 +293,12 @@ class LinksProvider(BaseProvider):
             if code in (401, 403, 429, 451, 503):
                 return True
             low = (body or "").lower()
-            if len(low) < 25000 and any(m in low for m in (
+            if len(low) < 35000 and any(m in low for m in (
                 "captcha-player", "cf-challenge", "cf-turnstile", "just a moment...",
                 "attention required! | cloudflare", "ddos-guard", "verify you are human",
+                "shield-templates", "bunny-shield", "challenge.html", "b-cdn.net",
+                "shield.bunny.net", "shield-challenge", "hcaptcha", "recaptcha",
+                "access denied", "bot detection", "security check", "cf-mitigated",
             )):
                 return True
             return False
@@ -2128,28 +2131,38 @@ class LinksProvider(BaseProvider):
         # Follow player iframe if the canonical page embeds an external video host
         active_html = page_html
         active_url = final_page_url
+        found_iframe = False
         for m_iframe in re.finditer(r'<iframe[^>]+src=[\x22\x27]([^\x22\x27]+)[\x22\x27]', page_html, re.I):
             iframe_src = m_iframe.group(1).strip()
             if iframe_src.startswith("//"):
                 iframe_src = "https:" + iframe_src
             if iframe_src.startswith(("http://", "https://")) and not any(
-                ad in iframe_src.lower() for ad in ("google", "doubleclick", "exoclick", "juicyads", "magsrv", "recaptcha", "turnstile")
+                ad in iframe_src.lower() for ad in (
+                    "google", "doubleclick", "exoclick", "juicyads", "magsrv",
+                    "recaptcha", "turnstile", "bunny", "b-cdn", "shield",
+                    "challenge", "captcha", "adserver", "ads", "track", "analytics",
+                    "cloudflare", "traffic", "popunder", "banner",
+                )
             ):
                 iframe_headers = dict(req_headers)
                 iframe_headers["Referer"] = final_page_url
                 if session_cookies:
                     iframe_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in session_cookies.items())
                 progress.log(f"[IP-Guard] Following embedded player iframe: {iframe_src[:80]}...")
-                _, iframe_html, final_iframe_url, active_proxy = await _do_web_fetch(
-                    iframe_src, iframe_headers, active_proxy, True,
-                )
-                if iframe_html.strip():
-                    active_html = iframe_html
-                    active_url = final_iframe_url
-                    break
+                try:
+                    _, iframe_html, final_iframe_url, active_proxy = await _do_web_fetch(
+                        iframe_src, iframe_headers, active_proxy, True,
+                    )
+                    if iframe_html.strip() and not _is_page_challenged(200, iframe_html):
+                        active_html = iframe_html
+                        active_url = final_iframe_url
+                        found_iframe = True
+                        break
+                except Exception as if_err:
+                    progress.log(f"[IP-Guard] Embedded iframe fetch notice: {if_err}")
 
         # Livewire 3 lazy component resolution (e.g. livecamsrip.com)
-        if active_html == page_html and "wire:snapshot" in page_html:
+        if not found_iframe and "wire:snapshot" in page_html:
             csrf = ""
             m_csrf = re.search(r'<meta\s+name=[\x22\x27]csrf-token[\x22\x27]\s+content=[\x22\x27]([^\x22\x27]+)[\x22\x27]', page_html, re.I)
             if m_csrf:
@@ -2219,7 +2232,7 @@ class LinksProvider(BaseProvider):
                         _, emb_html, emb_url, active_proxy = await _do_web_fetch(
                             lw_embed, embed_hdrs, active_proxy, True
                         )
-                        if emb_html.strip():
+                        if emb_html.strip() and not _is_page_challenged(200, emb_html):
                             active_html = emb_html
                             active_url = emb_url
                 except Exception as lw_err:
@@ -2227,8 +2240,10 @@ class LinksProvider(BaseProvider):
 
         parsed_active = urlparse(active_url)
         active_domain = f"{parsed_active.scheme}://{parsed_active.netloc}"
+        parsed_target = urlparse(target_page)
+        target_domain = f"{parsed_target.scheme}://{parsed_target.netloc}"
         unpacked = self._unpack_dean_edwards(active_html)
-        combined_text = f"{unpacked}\n{active_html}" if unpacked else active_html
+        combined_text = f"{unpacked}\n{page_html}\n{active_html}" if unpacked else f"{page_html}\n{active_html}"
 
         dl_headers: dict[str, str] = {
             "User-Agent": req_headers["User-Agent"],
@@ -2313,72 +2328,94 @@ class LinksProvider(BaseProvider):
             re.search(r'data-video-id=[\x22\x27](\d+)[\x22\x27]', clean_combined_text)
             or re.search(r'["\'](?:video_id|videoId|vid)["\']\s*:\s*["\']?(\d+)', clean_combined_text)
             or re.search(r'/video/(\d+)', active_url)
+            or re.search(r'/video/(\d+)', target_page)
         )
-        m_tok = (
-            re.search(r'data-token=[\x22\x27]([^\x22\x27]+)[\x22\x27]', clean_combined_text)
-            or re.search(r'["\'](?:token|stream_token|video_token)["\']\s*:\s*["\']([a-zA-Z0-9_\-\.]+)["\']', clean_combined_text)
-        )
+        tokens_found: list[str] = []
+        for m_t in re.finditer(r'data-token=[\x22\x27]([^\x22\x27]+)[\x22\x27]', clean_combined_text):
+            tok_cand = m_t.group(1).strip()
+            if tok_cand and tok_cand not in tokens_found:
+                tokens_found.append(tok_cand)
+        for m_t in re.finditer(r'data-url=[\x22\x27][^\x22\x27]*?[?&]token=([^&\x22\x27\s]+)', clean_combined_text):
+            tok_cand = m_t.group(1).strip()
+            if tok_cand and tok_cand not in tokens_found:
+                tokens_found.append(tok_cand)
+        for m_t in re.finditer(r'["\'](?:token|stream_token|video_token)["\']\s*:\s*["\']([a-zA-Z0-9_\-\.]+)["\']', clean_combined_text):
+            tok_cand = m_t.group(1).strip()
+            if tok_cand and tok_cand not in tokens_found:
+                tokens_found.append(tok_cand)
+        for m_t in re.finditer(r'[?&]token=([a-zA-Z0-9_\-\.]{12,})', clean_combined_text):
+            tok_cand = m_t.group(1).strip()
+            if tok_cand and tok_cand not in tokens_found:
+                tokens_found.append(tok_cand)
+
         if m_vid:
             vid_id = m_vid.group(1)
-            vid_tok = m_tok.group(1) if m_tok else ""
-            api_url = f"{active_domain}/api/video/{vid_id}" + (f"?token={vid_tok}" if vid_tok else "")
-            api_headers = dict(req_headers)
-            api_headers["Referer"] = active_url
-            if session_cookies:
-                api_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in session_cookies.items())
-            progress.log(f"[IP-Guard] Fetching fresh stream token from API: /api/video/{vid_id}...")
-            try:
-                _, api_body, _, active_proxy = await _do_web_fetch(
-                    api_url, api_headers, active_proxy, False,
-                )
-                clean_api_body = html.unescape(api_body.replace(r"\/", "/"))
-                api_cands: list[str] = []
+            api_base = target_domain if ("striptube" in target_domain or "/api/video" in page_html) else active_domain
+            test_tokens = tokens_found if tokens_found else [""]
 
-                # Attempt A: Parse JSON and inspect all string values
+            for tok_attempt in test_tokens:
+                api_url = f"{api_base}/api/video/{vid_id}" + (f"?token={tok_attempt}" if tok_attempt else "")
+                api_headers = dict(req_headers)
+                api_headers["Referer"] = target_page
+                api_headers["Origin"] = api_base
+                api_headers["X-Requested-With"] = "XMLHttpRequest"
+                api_headers["Accept"] = "*/*"
+                if session_cookies:
+                    api_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in session_cookies.items())
+                tok_hint = f"?token={tok_attempt[:16]}..." if tok_attempt else ""
+                progress.log(f"[IP-Guard] Fetching fresh stream token from API: /api/video/{vid_id}{tok_hint}...")
                 try:
-                    import json
-                    api_json = json.loads(api_body)
-                    def _collect_json_urls(val: Any) -> None:
-                        if isinstance(val, str):
-                            s = html.unescape(val.replace("\\/", "/").replace(r"\/", "/")).strip()
-                            if s.startswith("http") and any(ext in s.lower() for ext in (".m3u8", ".mpd", ".mp4", ".mkv", "/hl/")):
-                                if "preview" not in s.lower() and s not in api_cands:
-                                    api_cands.append(s)
-                        elif isinstance(val, dict):
-                            for v in val.values():
-                                _collect_json_urls(v)
-                        elif isinstance(val, list):
-                            for item in val:
-                                _collect_json_urls(item)
-                    _collect_json_urls(api_json)
-                except Exception:
-                    pass
+                    _, api_body, _, active_proxy = await _do_web_fetch(
+                        api_url, api_headers, active_proxy, False,
+                    )
+                    clean_api_body = html.unescape(api_body.replace(r"\/", "/"))
+                    api_cands: list[str] = []
 
-                # Attempt B: Regex on unescaped API body
-                for m_media in re.finditer(r'https?://[^\x22\x27\s<>]+\.(?:m3u8|mpd|mp4|mkv|webm)[^\x22\x27\s<>]*', clean_api_body):
-                    cand = html.unescape(m_media.group(0).replace("\\/", "/")).strip()
-                    if "preview" not in cand.lower() and cand not in api_cands:
-                        api_cands.append(cand)
+                    # Attempt A: Parse JSON and inspect all string values
+                    try:
+                        import json
+                        api_json = json.loads(api_body)
+                        def _collect_json_urls(val: Any) -> None:
+                            if isinstance(val, str):
+                                s = html.unescape(val.replace("\\/", "/").replace(r"\/", "/")).strip()
+                                if s.startswith("http") and any(ext in s.lower() for ext in (".m3u8", ".mpd", ".mp4", ".mkv", "/hl/")):
+                                    if "preview" not in s.lower() and s not in api_cands:
+                                        api_cands.append(s)
+                            elif isinstance(val, dict):
+                                for v in val.values():
+                                    _collect_json_urls(v)
+                            elif isinstance(val, list):
+                                for item in val:
+                                    _collect_json_urls(item)
+                        _collect_json_urls(api_json)
+                    except Exception:
+                        pass
 
-                # Attempt C: URLs containing mediastrmx or /hl/ or index.m3u8
-                for m_media in re.finditer(r'https?://[^\x22\x27\s<>]+', clean_api_body):
-                    cand = html.unescape(m_media.group(0).replace("\\/", "/")).strip()
-                    if any(frag in cand.lower() for frag in ("/hl/", "index.m3u8", "master.m3u8")) and cand not in api_cands:
-                        api_cands.append(cand)
+                    # Attempt B: Regex on unescaped API body
+                    for m_media in re.finditer(r'https?://[^\x22\x27\s<>]+\.(?:m3u8|mpd|mp4|mkv|webm)[^\x22\x27\s<>]*', clean_api_body):
+                        cand = html.unescape(m_media.group(0).replace("\\/", "/")).strip()
+                        if "preview" not in cand.lower() and cand not in api_cands:
+                            api_cands.append(cand)
 
-                if api_cands:
-                    api_cands.sort(key=_score_stream_candidate)
-                    best_cand = html.unescape(api_cands[0].replace("\\/", "/"))
-                    progress.log(f"[IP-Guard] Extracted fresh stream URL from video API: {best_cand[:80]}...")
-                    if active_proxy:
-                        dl_headers["_active_proxy"] = active_proxy
-                    if session_cookies:
-                        dl_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in session_cookies.items())
-                    return best_cand, file_ref.get("name"), dl_headers
-                else:
-                    progress.log(f"[IP-Guard] Video API response returned no media stream: {api_body[:200]}")
-            except Exception as api_err:
-                progress.log(f"[IP-Guard] Video API fetch notice: {api_err}")
+                    # Attempt C: URLs containing mediastrmx or /hl/ or index.m3u8
+                    for m_media in re.finditer(r'https?://[^\x22\x27\s<>]+', clean_api_body):
+                        cand = html.unescape(m_media.group(0).replace("\\/", "/")).strip()
+                        if any(frag in cand.lower() for frag in ("/hl/", "index.m3u8", "master.m3u8")) and cand not in api_cands:
+                            api_cands.append(cand)
+
+                    if api_cands:
+                        api_cands.sort(key=_score_stream_candidate)
+                        best_cand = html.unescape(api_cands[0].replace("\\/", "/"))
+                        progress.log(f"[IP-Guard] Extracted fresh stream URL from video API: {best_cand[:80]}...")
+                        if active_proxy:
+                            dl_headers["_active_proxy"] = active_proxy
+                        if session_cookies:
+                            dl_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in session_cookies.items())
+                        return best_cand, file_ref.get("name"), dl_headers
+                    else:
+                        progress.log(f"[IP-Guard] Video API response returned no media stream: {api_body[:200]}")
+                except Exception as api_err:
+                    progress.log(f"[IP-Guard] Video API fetch notice: {api_err}")
 
         raise ProviderFailure("DOWNLOAD_FAILED", f"Could not extract fresh media stream from {active_url}")
 
