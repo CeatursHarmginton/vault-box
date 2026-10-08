@@ -1083,7 +1083,12 @@ async def run_resumable_backup_pipeline(
             pass
 
     async def _upload_part_worker(part_file: Path, p_meta: dict[str, Any]) -> None:
-        """Upload a single part to remote destination, update manifest, and track local part."""
+        """Upload a single part to remote destination, update manifest, and track local part.
+
+        Includes retry-with-session-refresh logic: when the upload fails due to
+        an expired/revoked Drive web session (401/403), the provider's session is
+        refreshed and the upload retried up to 3 times before giving up.
+        """
         p_name = part_file.name
         size_mb = p_meta['bytes'] / (1024 * 1024)
 
@@ -1101,7 +1106,51 @@ async def run_resumable_backup_pipeline(
             "path": target_folder,
             "relative_path": f"{backup_folder_name}/{p_name}",
         }
-        res = await dst_provider.upload_file(target_creds, part_file, target_ref, job)
+
+        max_upload_retries = 3
+        last_upload_err: Exception | None = None
+        for upload_attempt in range(max_upload_retries):
+            try:
+                res = await dst_provider.upload_file(target_creds, part_file, target_ref, job)
+                break  # success
+            except ProviderFailure as up_err:
+                last_upload_err = up_err
+                is_auth = up_err.code == "INVALID_PROVIDER_CREDENTIALS" or "session expired" in str(up_err).lower() or "revoked" in str(up_err).lower()
+                is_retryable = is_auth or up_err.code == "UPLOAD_FAILED" and int((up_err.details or {}).get("status") or 0) in (401, 403, 429, 500, 502, 503)
+
+                if not is_retryable or upload_attempt >= max_upload_retries - 1:
+                    raise
+
+                job.log(
+                    f"[Upload-Retry] Upload {p_name} thất bại (lần {upload_attempt + 1}/{max_upload_retries}): {up_err}. "
+                    f"Đang refresh web session và thử lại..."
+                )
+
+                # Attempt to refresh the Drive web session on the dst_provider
+                if hasattr(dst_provider, "_refresh_web_session"):
+                    try:
+                        await dst_provider._refresh_web_session(target_creds)
+                        job.log(f"[Upload-Retry] Đã refresh Drive web session thành công.")
+                    except Exception as ref_err:
+                        job.log(f"[Upload-Retry] Refresh web session thất bại: {ref_err}")
+                elif hasattr(dst_provider, "_web_request"):
+                    # Force a lightweight probe to trigger internal retry/refresh inside _web_request
+                    try:
+                        await dst_provider.validate_credentials(target_creds)
+                        job.log(f"[Upload-Retry] Đã validate lại credentials thành công.")
+                    except Exception:
+                        pass
+
+                await asyncio.sleep(min(2 ** upload_attempt, 8))
+            except (httpx.HTTPError, OSError) as net_err:
+                last_upload_err = net_err
+                if upload_attempt >= max_upload_retries - 1:
+                    raise ProviderFailure("UPLOAD_FAILED", f"Network error uploading {p_name}: {net_err}")
+                job.log(f"[Upload-Retry] Lỗi mạng upload {p_name} (lần {upload_attempt + 1}/{max_upload_retries}): {net_err}. Thử lại...")
+                await asyncio.sleep(min(2 ** upload_attempt, 8))
+        else:
+            raise ProviderFailure("UPLOAD_FAILED", f"Upload {p_name} thất bại sau {max_upload_retries} lần thử: {last_upload_err}")
+
         job.log(f"[Trace] Upload thành công: {p_name}")
         completed_parts.append(p_meta)
         existing_remote_part_names.add(p_name)

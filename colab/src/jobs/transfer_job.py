@@ -964,18 +964,71 @@ async def _run_backup_resume_batches(
                 except JobCancelled:
                     raise
                 except Exception as exc:
-                    job.finish_item(item_k, status="failed", name=item_name)
-                    timing = job.item_timings.get(item_k) or {}
-                    job.failed_items.append({
-                        **_queue_item_ref(source, item),
-                        "name": item_name,
-                        "reason": str(exc),
-                        "startTime": timing.get("startTime"),
-                        "endTime": timing.get("endTime"),
-                        "duration": timing.get("duration"),
-                    })
-                    job.files_skipped += 1
-                    job.log(f"[Backup-Resume] [SKIP] Lỗi xử lý luồng cho {item_name}: {exc}. Bỏ qua mục này và tiếp tục xử lý các mục còn lại...")
+                    # For recoverable auth/session errors, retry the pipeline once
+                    # (it resumes from the manifest, so no work is lost)
+                    exc_str = str(exc).lower()
+                    is_auth_error = (
+                        isinstance(exc, ProviderFailure) and exc.code == "INVALID_PROVIDER_CREDENTIALS"
+                    ) or "session expired" in exc_str or "revoked" in exc_str or "relogin" in exc_str
+                    retried = False
+                    if is_auth_error:
+                        job.log(f"[Backup-Resume] Upload bị lỗi xác thực ({exc}). Đang refresh session và thử lại pipeline...")
+                        # Try to refresh dst provider session before retry
+                        if hasattr(dst, "_refresh_web_session"):
+                            try:
+                                await dst._refresh_web_session(target.get("credentials") or {})
+                            except Exception:
+                                pass
+                        try:
+                            # Re-create temp dirs (they were cleaned in finally on first pass)
+                            for d in item_dirs.values():
+                                d.mkdir(parents=True, exist_ok=True)
+                            final_file = await run_resumable_backup_pipeline(
+                                job, item_dirs, source, target, options, src, dst, item
+                            )
+                            retried = True
+                            if final_file is not None:
+                                job.files_downloaded += 1
+                                job.files_uploaded += 1
+                                job.finish_item(item_k, status="done", name=item_name)
+                                timing = job.item_timings.get(item_k) or {}
+                                job.completed_items.append({
+                                    **_queue_item_ref(source, item),
+                                    "startTime": timing.get("startTime"),
+                                    "endTime": timing.get("endTime"),
+                                    "duration": timing.get("duration"),
+                                })
+                                job.log(f"[Backup-Resume] Hoàn tất truyền tải file sau retry: {item_name}")
+                            else:
+                                job.files_downloaded += 1
+                                job.finish_item(item_k, status="done", name=item_name)
+                                timing = job.item_timings.get(item_k) or {}
+                                job.completed_items.append({
+                                    **_queue_item_ref(source, item),
+                                    "startTime": timing.get("startTime"),
+                                    "endTime": timing.get("endTime"),
+                                    "duration": timing.get("duration"),
+                                })
+                                job.log(f"[Backup-Resume] Phiên backup chưa hoàn tất sau retry, dữ liệu an toàn trên Cloud: {item_name}")
+                        except JobCancelled:
+                            raise
+                        except Exception as retry_exc:
+                            job.log(f"[Backup-Resume] Retry cũng thất bại: {retry_exc}")
+                            exc = retry_exc  # use the latest error for the skip log
+
+                    if not retried:
+                        job.finish_item(item_k, status="failed", name=item_name)
+                        timing = job.item_timings.get(item_k) or {}
+                        job.failed_items.append({
+                            **_queue_item_ref(source, item),
+                            "name": item_name,
+                            "reason": str(exc),
+                            "startTime": timing.get("startTime"),
+                            "endTime": timing.get("endTime"),
+                            "duration": timing.get("duration"),
+                        })
+                        job.files_skipped += 1
+                        job.log(f"[Backup-Resume] [SKIP] Lỗi xử lý luồng cho {item_name}: {exc}. Bỏ qua mục này và tiếp tục xử lý các mục còn lại...")
                 finally:
                     for temp_d in item_dirs.values():
                         if temp_d and temp_d.is_dir():
