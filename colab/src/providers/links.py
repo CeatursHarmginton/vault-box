@@ -240,14 +240,15 @@ class LinksProvider(BaseProvider):
         if status_code in (401, 403, 429, 451, 503):
             return True
         low = str(text_or_msg or "").lower()
-        if len(low) < 35000 and any(k in low for k in (
+        if len(low) < 25000 and any(k in low for k in (
             "captcha-player", "cf-challenge", "cf-turnstile", "just a moment...",
             "attention required! | cloudflare", "ddos-guard", "verify you are human",
-            "shield-templates", "bunny-shield", "challenge.html", "b-cdn.net",
-            "shield.bunny.net", "shield-challenge", "hcaptcha", "recaptcha",
-            "access denied", "bot detection", "security check", "cf-mitigated",
+            "challenge.html", "shield-challenge", "cf-mitigated",
+        )):
+            return True
+        if any(k in low for k in (
             "error_wrong_ip", "wrong_ip", "ip not allowed", "ip blocked", "403 forbidden",
-            "http error 403", "forbidden", "429 too many", "http error 429",
+            "http error 403", "429 too many", "http error 429", "too many requests",
         )):
             return True
         return False
