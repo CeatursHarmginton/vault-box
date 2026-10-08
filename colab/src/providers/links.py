@@ -240,12 +240,17 @@ class LinksProvider(BaseProvider):
         if status_code in (401, 403, 429, 451, 503):
             return True
         low = str(text_or_msg or "").lower()
-        return any(k in low for k in (
-            "error_wrong_ip", "wrong_ip", "ip not allowed", "ip blocked", "403 forbidden", "http error 403", "forbidden",
-            "429 too many", "http error 429", "too many requests", "captcha-player",
-            "cf-challenge", "cf-turnstile", "turnstile", "just a moment",
-            "attention required", "ddos-guard", "security check", "cloudflare",
-        ))
+        if len(low) < 35000 and any(k in low for k in (
+            "captcha-player", "cf-challenge", "cf-turnstile", "just a moment...",
+            "attention required! | cloudflare", "ddos-guard", "verify you are human",
+            "shield-templates", "bunny-shield", "challenge.html", "b-cdn.net",
+            "shield.bunny.net", "shield-challenge", "hcaptcha", "recaptcha",
+            "access denied", "bot detection", "security check", "cf-mitigated",
+            "error_wrong_ip", "wrong_ip", "ip not allowed", "ip blocked", "403 forbidden",
+            "http error 403", "forbidden", "429 too many", "http error 429",
+        )):
+            return True
+        return False
 
     async def _fetch_webpage(
         self,
@@ -292,27 +297,13 @@ class LinksProvider(BaseProvider):
                 except Exception:
                     raise cffi_exc
 
-        def _is_page_challenged(code: int, body: str) -> bool:
-            if code in (401, 403, 429, 451, 503):
-                return True
-            low = (body or "").lower()
-            if len(low) < 35000 and any(m in low for m in (
-                "captcha-player", "cf-challenge", "cf-turnstile", "just a moment...",
-                "attention required! | cloudflare", "ddos-guard", "verify you are human",
-                "shield-templates", "bunny-shield", "challenge.html", "b-cdn.net",
-                "shield.bunny.net", "shield-challenge", "hcaptcha", "recaptcha",
-                "access denied", "bot detection", "security check", "cf-mitigated",
-            )):
-                return True
-            return False
-
         target_host = urlparse(target_url).netloc.lower()
         code, body, final_url = 0, "", target_url
 
         # 1. Try direct fetch with browser TLS first (fastest and often bypasses WAF if datacenter IP is not hard-banned)
         try:
             code, body, final_url = await asyncio.to_thread(_do_fetch, proxy)
-            if not _is_page_challenged(code, body) and body.strip():
+            if not self._is_ip_or_captcha_blocked(body, code) and body.strip():
                 return code, body, final_url, proxy
         except Exception as exc:
             if not auto_proxy:
@@ -330,7 +321,7 @@ class LinksProvider(BaseProvider):
         if proxy and "vb_" in proxy:
             try:
                 c_code, c_body, c_url = await asyncio.to_thread(_do_fetch, proxy)
-                if not _is_page_challenged(c_code, c_body) and c_body.strip():
+                if not self._is_ip_or_captcha_blocked(c_body, c_code) and c_body.strip():
                     return c_code, c_body, c_url, proxy
             except Exception:
                 pass
@@ -340,7 +331,7 @@ class LinksProvider(BaseProvider):
 
         async def _race_circuit(circuit_px: str) -> tuple[int, str, str, str]:
             r_code, r_body, r_url = await asyncio.to_thread(_do_fetch, circuit_px)
-            if _is_page_challenged(r_code, r_body) or not r_body.strip():
+            if self._is_ip_or_captcha_blocked(r_body, r_code) or not r_body.strip():
                 raise RuntimeError(f"circuit challenged (HTTP {r_code})")
             return r_code, r_body, r_url, circuit_px
 
@@ -355,7 +346,7 @@ class LinksProvider(BaseProvider):
                         w_code, w_body, w_url, w_px = d.result()
                         for p_task in pending:
                             p_task.cancel()
-                        if not _is_page_challenged(w_code, w_body) and w_body.strip():
+                        if not self._is_ip_or_captcha_blocked(w_body, w_code) and w_body.strip():
                             return w_code, w_body, w_url, w_px
                     except Exception:
                         pass
@@ -367,7 +358,7 @@ class LinksProvider(BaseProvider):
         # Fallback to direct fetch attempt if proxy circuits were all challenged
         try:
             fb_code, fb_body, fb_url = await asyncio.to_thread(_do_fetch, None)
-            if not _is_page_challenged(fb_code, fb_body) and fb_body.strip():
+            if not self._is_ip_or_captcha_blocked(fb_body, fb_code) and fb_body.strip():
                 return fb_code, fb_body, fb_url, None
         except Exception:
             pass
@@ -2161,7 +2152,7 @@ class LinksProvider(BaseProvider):
                     _, iframe_html, final_iframe_url, active_proxy = await _do_web_fetch(
                         iframe_src, iframe_headers, active_proxy, True,
                     )
-                    if iframe_html.strip() and not _is_page_challenged(200, iframe_html):
+                    if iframe_html.strip() and not self._is_ip_or_captcha_blocked(iframe_html, 200):
                         active_html = iframe_html
                         active_url = final_iframe_url
                         found_iframe = True
@@ -2240,7 +2231,7 @@ class LinksProvider(BaseProvider):
                         _, emb_html, emb_url, active_proxy = await _do_web_fetch(
                             lw_embed, embed_hdrs, active_proxy, True
                         )
-                        if emb_html.strip() and not _is_page_challenged(200, emb_html):
+                        if emb_html.strip() and not self._is_ip_or_captcha_blocked(emb_html, 200):
                             active_html = emb_html
                             active_url = emb_url
                 except Exception as lw_err:
