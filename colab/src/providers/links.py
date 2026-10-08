@@ -264,16 +264,28 @@ class LinksProvider(BaseProvider):
         post_data: bytes | str | None = None,
     ) -> tuple[int, str, str, str | None]:
         """Universal webpage fetcher with browser TLS impersonation, domain proxy memory, and parallel 3-circuit racing."""
-        def _do_fetch(active_px: str | None) -> tuple[int, str, str]:
+        def _do_fetch(active_px: str | None, use_cookies: bool = True) -> tuple[int, str, str]:
+            hdrs = dict(req_headers)
+            if not use_cookies:
+                hdrs.pop("Cookie", None)
+                hdrs.pop("cookie", None)
             try:
                 from curl_cffi import requests as cffi_requests
-                s = cffi_requests.Session(impersonate="chrome120")
-                if session_cookies:
+                s = None
+                for target in ("chrome120", "chrome110", "chrome"):
+                    try:
+                        s = cffi_requests.Session(impersonate=target)
+                        break
+                    except Exception:
+                        pass
+                if s is None:
+                    s = cffi_requests.Session()
+                if use_cookies and session_cookies:
                     s.cookies.update(session_cookies)
                 if post_data is not None:
-                    r = s.post(target_url, data=post_data, headers=req_headers, proxy=active_px, timeout=25)
+                    r = s.post(target_url, data=post_data, headers=hdrs, proxy=active_px, timeout=25)
                 else:
-                    r = s.get(target_url, headers=req_headers, proxy=active_px, timeout=25)
+                    r = s.get(target_url, headers=hdrs, proxy=active_px, timeout=25)
                 if session_cookies is not None:
                     try:
                         for k, v in s.cookies.items():
@@ -283,11 +295,12 @@ class LinksProvider(BaseProvider):
                 return r.status_code, r.text, str(r.url)
             except Exception as cffi_exc:
                 try:
-                    with httpx.Client(follow_redirects=True, timeout=25.0, proxy=active_px, cookies=session_cookies) as client:
+                    cks = session_cookies if use_cookies else None
+                    with httpx.Client(follow_redirects=True, timeout=25.0, proxy=active_px, cookies=cks) as client:
                         if post_data is not None:
-                            r = client.post(target_url, content=post_data if isinstance(post_data, (bytes, str)) else json.dumps(post_data), headers=req_headers)
+                            r = client.post(target_url, content=post_data if isinstance(post_data, (bytes, str)) else json.dumps(post_data), headers=hdrs)
                         else:
-                            r = client.get(target_url, headers=req_headers)
+                            r = client.get(target_url, headers=hdrs)
                         if session_cookies is not None:
                             try:
                                 for k, v in client.cookies.items():
@@ -303,9 +316,14 @@ class LinksProvider(BaseProvider):
 
         # 1. Try direct fetch with browser TLS first (fastest and often bypasses WAF if datacenter IP is not hard-banned)
         try:
-            code, body, final_url = await asyncio.to_thread(_do_fetch, proxy)
+            code, body, final_url = await asyncio.to_thread(_do_fetch, proxy, True)
             if not self._is_ip_or_captcha_blocked(body, code) and body.strip():
                 return code, body, final_url, proxy
+            # If fetch with stale cookies was rejected (401/403), retry direct with clean session
+            if session_cookies and code in (401, 403):
+                c_code, c_body, c_url = await asyncio.to_thread(_do_fetch, proxy, False)
+                if not self._is_ip_or_captcha_blocked(c_body, c_code) and c_body.strip():
+                    return c_code, c_body, c_url, proxy
         except Exception as exc:
             if not auto_proxy:
                 raise
