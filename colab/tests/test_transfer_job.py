@@ -1338,6 +1338,57 @@ def test_drive_web_session_large_upload_uses_resumable(monkeypatch, tmp_path):
     assert calls[1] == ("PUT", "https://upload.test/session", f"bytes 0-{path.stat().st_size - 1}/{path.stat().st_size}")
 
 
+def test_drive_web_session_large_upload_reopens_session_after_403(monkeypatch, tmp_path):
+    calls = []
+
+    class Response:
+        headers = {}
+        text = ""
+
+        def __init__(self, status_code=200, data=None, headers=None, text=""):
+            self.status_code = status_code
+            self._data = data or {}
+            self.headers = headers or {}
+            self.text = text
+
+        def json(self):
+            return self._data
+
+    class Client:
+        async def post(self, url, **kwargs):
+            idx = sum(1 for c in calls if c[0] == "POST") + 1
+            calls.append(("POST", idx, kwargs["headers"].get("cookie", "")))
+            return Response(200, headers={"Location": f"https://upload.test/session-{idx}"})
+
+        async def put(self, url, **kwargs):
+            calls.append(("PUT", url, kwargs["headers"].get("cookie", "")))
+            if "session-1" in url:
+                return Response(403, text="expired")
+            return Response(200, {"id": "file1", "title": "big.bin"})
+
+    async def refresh(self, credentials):
+        credentials["cookies"]["SAPISID"] = "new"
+        return True
+
+    monkeypatch.setattr(DriveProvider, "_client", lambda self: Client())
+    monkeypatch.setattr(DriveProvider, "_refresh_web_session", refresh)
+    path = tmp_path / "big.bin"
+    path.write_bytes(b"x" * (drive_mod.WEB_MULTIPART_MAX + 1))
+
+    out = asyncio.run(DriveProvider().upload_file({
+        "access_token": "SAPISIDHASH old",
+        "cookies": {"SAPISID": "old"},
+    }, path, {"id": "root"}, JobState("drive-web-reopen", {})))
+
+    assert out["id"] == "file1"
+    assert calls == [
+        ("POST", 1, "SAPISID=old"),
+        ("PUT", "https://upload.test/session-1", "SAPISID=old"),
+        ("PUT", "https://upload.test/session-1", "SAPISID=new"),
+        ("POST", 2, "SAPISID=new"),
+        ("PUT", "https://upload.test/session-2", "SAPISID=new"),
+    ]
+
 def test_drive_web_session_upload_maps_slash_to_root(monkeypatch, tmp_path):
     seen = {}
 

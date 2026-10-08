@@ -846,17 +846,21 @@ class DriveProvider(BaseProvider):
         }
         progress.set(step="uploading", current_file=name)
         init_payload = json.dumps({"title": name, "mimeType": mime, "parents": [{"id": parent}]})
-        init = await self._web_request(
-            credentials,
-            "POST",
-            f"{DRIVE_WEB_UPLOAD_API}/files",
-            params={"uploadType": "resumable", "supportsTeamDrives": "true"},
-            headers=init_headers,
-            content=init_payload,
-        )
-        session = init.headers.get("Location") or init.headers.get("location")
-        if not session:
-            raise ProviderFailure("UPLOAD_FAILED", "Drive web resumable session missing")
+        async def new_session() -> str:
+            init = await self._web_request(
+                credentials,
+                "POST",
+                f"{DRIVE_WEB_UPLOAD_API}/files",
+                params={"uploadType": "resumable", "supportsTeamDrives": "true"},
+                headers=init_headers,
+                content=init_payload,
+            )
+            session_uri = init.headers.get("Location") or init.headers.get("location")
+            if not session_uri:
+                raise ProviderFailure("UPLOAD_FAILED", "Drive web resumable session missing")
+            return str(session_uri)
+
+        session = await new_session()
         offset = 0
         client = self._client()
         with local_path.open("rb") as fh:
@@ -894,6 +898,8 @@ class DriveProvider(BaseProvider):
                                 await self._refresh_web_session(credentials)
                                 await asyncio.sleep(min(2 ** attempt, 4))
                                 offset = await self._query_resumable_offset(client, credentials, session, size)
+                                if offset == 0:
+                                    session = await new_session()
                                 continue
                             raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked")
                         if resp.status_code >= 500 or resp.status_code in (400, 408, 429):
