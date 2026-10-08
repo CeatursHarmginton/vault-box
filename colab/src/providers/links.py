@@ -261,13 +261,13 @@ class LinksProvider(BaseProvider):
         def _do_fetch(active_px: str | None) -> tuple[int, str, str]:
             try:
                 from curl_cffi import requests as cffi_requests
-                s = cffi_requests.Session(impersonate="chrome")
+                s = cffi_requests.Session(impersonate="chrome120")
                 if session_cookies:
                     s.cookies.update(session_cookies)
                 if post_data is not None:
-                    r = s.post(target_url, data=post_data, headers=req_headers, proxy=active_px, timeout=20)
+                    r = s.post(target_url, data=post_data, headers=req_headers, proxy=active_px, timeout=25)
                 else:
-                    r = s.get(target_url, headers=req_headers, proxy=active_px, timeout=20)
+                    r = s.get(target_url, headers=req_headers, proxy=active_px, timeout=25)
                 if session_cookies is not None:
                     try:
                         for k, v in s.cookies.items():
@@ -275,19 +275,22 @@ class LinksProvider(BaseProvider):
                     except Exception:
                         pass
                 return r.status_code, r.text, str(r.url)
-            except Exception:
-                with httpx.Client(follow_redirects=True, timeout=20.0, proxy=active_px, cookies=session_cookies) as client:
-                    if post_data is not None:
-                        r = client.post(target_url, content=post_data if isinstance(post_data, (bytes, str)) else json.dumps(post_data), headers=req_headers)
-                    else:
-                        r = client.get(target_url, headers=req_headers)
-                    if session_cookies is not None:
-                        try:
-                            for k, v in client.cookies.items():
-                                session_cookies[str(k)] = str(v)
-                        except Exception:
-                            pass
-                    return r.status_code, r.text, str(r.url)
+            except Exception as cffi_exc:
+                try:
+                    with httpx.Client(follow_redirects=True, timeout=25.0, proxy=active_px, cookies=session_cookies) as client:
+                        if post_data is not None:
+                            r = client.post(target_url, content=post_data if isinstance(post_data, (bytes, str)) else json.dumps(post_data), headers=req_headers)
+                        else:
+                            r = client.get(target_url, headers=req_headers)
+                        if session_cookies is not None:
+                            try:
+                                for k, v in client.cookies.items():
+                                    session_cookies[str(k)] = str(v)
+                            except Exception:
+                                pass
+                        return r.status_code, r.text, str(r.url)
+                except Exception:
+                    raise cffi_exc
 
         def _is_page_challenged(code: int, body: str) -> bool:
             if code in (401, 403, 429, 451, 503):
@@ -306,21 +309,15 @@ class LinksProvider(BaseProvider):
         target_host = urlparse(target_url).netloc.lower()
         code, body, final_url = 0, "", target_url
 
-        # Skip wasted direct attempt if this domain is already known to challenge datacenter IPs
-        if proxy or not (auto_proxy and target_host in _PROXY_REQUIRED_DOMAINS):
-            try:
-                code, body, final_url = await asyncio.to_thread(_do_fetch, proxy)
-                if not _is_page_challenged(code, body) and body.strip():
-                    return code, body, final_url, proxy
-                if not proxy and auto_proxy:
-                    _PROXY_REQUIRED_DOMAINS.add(target_host)
-                    final_host = urlparse(final_url).netloc.lower()
-                    if final_host:
-                        _PROXY_REQUIRED_DOMAINS.add(final_host)
-            except Exception as exc:
-                if not auto_proxy:
-                    raise
-                progress.log(f"[IP-Guard] Direct fetch failed on {target_host} ({exc}); activating proxy...")
+        # 1. Try direct fetch with browser TLS first (fastest and often bypasses WAF if datacenter IP is not hard-banned)
+        try:
+            code, body, final_url = await asyncio.to_thread(_do_fetch, proxy)
+            if not _is_page_challenged(code, body) and body.strip():
+                return code, body, final_url, proxy
+        except Exception as exc:
+            if not auto_proxy:
+                raise
+            progress.log(f"[IP-Guard] Direct fetch failed on {target_host} ({exc}); activating proxy...")
 
         if not auto_proxy:
             return code, body, final_url, proxy
@@ -358,13 +355,22 @@ class LinksProvider(BaseProvider):
                         w_code, w_body, w_url, w_px = d.result()
                         for p_task in pending:
                             p_task.cancel()
-                        return w_code, w_body, w_url, w_px
+                        if not _is_page_challenged(w_code, w_body) and w_body.strip():
+                            return w_code, w_body, w_url, w_px
                     except Exception:
                         pass
         finally:
             for t in tasks:
                 if not t.done():
                     t.cancel()
+
+        # Fallback to direct fetch attempt if proxy circuits were all challenged
+        try:
+            fb_code, fb_body, fb_url = await asyncio.to_thread(_do_fetch, None)
+            if not _is_page_challenged(fb_code, fb_body) and fb_body.strip():
+                return fb_code, fb_body, fb_url, None
+        except Exception:
+            pass
 
         return code, body, final_url, proxy or base_proxy
 
@@ -2127,6 +2133,8 @@ class LinksProvider(BaseProvider):
         _, page_html, final_page_url, active_proxy = await _do_web_fetch(
             target_page, req_headers, proxy, True,
         )
+        if not page_html or not page_html.strip():
+            raise ProviderFailure("DOWNLOAD_FAILED", f"Could not load webpage content from {target_page}")
 
         # Follow player iframe if the canonical page embeds an external video host
         active_html = page_html
