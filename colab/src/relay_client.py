@@ -97,6 +97,7 @@ async def _relay_loop(manager: JobManager) -> None:
                     "colabReady": True,
                     "environment": ENV_NAME,
                 }))
+                print(f"[✓] Successfully connected to Cloudflare Relay room '{COLAB_RELAY_ROOM_ID}' as {ENV_NAME} Worker!", flush=True)
 
                 # Send initial snapshot of all existing jobs
                 for job in list(manager.jobs.values()):
