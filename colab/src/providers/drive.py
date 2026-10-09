@@ -280,7 +280,6 @@ class DriveProvider(BaseProvider):
 
     async def _refresh_web_session(self, credentials: dict[str, Any]) -> bool:
         """Refresh browser-session cookies inside the Colab job only."""
-        ok = False
         try:
             client = self._client()
             for url, auth in (
@@ -297,11 +296,9 @@ class DriveProvider(BaseProvider):
                         timeout=15.0,
                     )
                     self._update_cookies_from_response(credentials, resp)
-                    ok = ok or resp.status_code < 400
                 except Exception:
                     pass
-            if ok:
-                return True
+
             key = self._web_key(credentials)
             resp = await self._send_request(
                 client,

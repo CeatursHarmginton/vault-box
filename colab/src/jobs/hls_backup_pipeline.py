@@ -1111,6 +1111,7 @@ async def run_resumable_backup_pipeline(
         last_upload_err: Exception | None = None
         for upload_attempt in range(max_upload_retries):
             try:
+                target_creds = target.get("credentials") or {}
                 res = await dst_provider.upload_file(target_creds, part_file, target_ref, job)
                 break  # success
             except ProviderFailure as up_err:
@@ -1123,23 +1124,39 @@ async def run_resumable_backup_pipeline(
 
                 job.log(
                     f"[Upload-Retry] Upload {p_name} thất bại (lần {upload_attempt + 1}/{max_upload_retries}): {up_err}. "
-                    f"Đang refresh web session và thử lại..."
+                    f"Đang kiểm tra và làm mới web session..."
                 )
 
+                refreshed = False
                 # Attempt to refresh the Drive web session on the dst_provider
                 if hasattr(dst_provider, "_refresh_web_session"):
                     try:
-                        await dst_provider._refresh_web_session(target_creds)
-                        job.log(f"[Upload-Retry] Đã refresh Drive web session thành công.")
+                        refreshed = await dst_provider._refresh_web_session(target_creds)
+                        if refreshed:
+                            job.log(f"[Upload-Retry] Đã refresh Drive web session thành công.")
+                        else:
+                            job.log(f"[Upload-Retry] Drive web session đã hết hạn hoặc bị thu hồi trên Google.")
                     except Exception as ref_err:
                         job.log(f"[Upload-Retry] Refresh web session thất bại: {ref_err}")
                 elif hasattr(dst_provider, "_web_request"):
-                    # Force a lightweight probe to trigger internal retry/refresh inside _web_request
                     try:
-                        await dst_provider.validate_credentials(target_creds)
-                        job.log(f"[Upload-Retry] Đã validate lại credentials thành công.")
+                        val = await dst_provider.validate_credentials(target_creds)
+                        refreshed = bool(val and val.get("ok"))
+                        if refreshed:
+                            job.log(f"[Upload-Retry] Đã validate lại credentials thành công.")
                     except Exception:
-                        pass
+                        refreshed = False
+
+                # If the session is truly revoked/expired and local probe failed, request fresh credentials from Relay/App
+                if is_auth and not refreshed:
+                    try:
+                        from .transfer_job import _wait_for_retry_account
+                        await _wait_for_retry_account(job, target, up_err)
+                        target_creds = target.get("credentials") or {}
+                        job.log(f"[Upload-Retry] Đã nhận thông tin xác thực mới từ hệ thống. Tiếp tục upload {p_name}...")
+                        continue
+                    except Exception:
+                        raise
 
                 await asyncio.sleep(min(2 ** upload_attempt, 8))
             except (httpx.HTTPError, OSError) as net_err:

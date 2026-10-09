@@ -963,24 +963,41 @@ async def _run_backup_resume_batches(
                         job.log(f"[Backup-Resume] Phiên backup chưa hoàn tất, dữ liệu an toàn trên Cloud. Resume lần sau để tiếp tục: {item_name}")
                 except JobCancelled:
                     raise
+                except _ItemSkippedFailure as exc:
+                    job.finish_item(item_k, status="failed", name=item_name)
+                    timing = job.item_timings.get(item_k) or {}
+                    job.failed_items.append({
+                        **_queue_item_ref(source, item),
+                        "name": item_name,
+                        "reason": str(exc),
+                        "startTime": timing.get("startTime"),
+                        "endTime": timing.get("endTime"),
+                        "duration": timing.get("duration"),
+                    })
+                    job.files_skipped += 1
+                    job.log(f"[Backup-Resume] [SKIP] {item_name}: {exc.message}")
                 except Exception as exc:
-                    # For recoverable auth/session errors, retry the pipeline once
-                    # (it resumes from the manifest, so no work is lost)
                     exc_str = str(exc).lower()
                     is_auth_error = (
                         isinstance(exc, ProviderFailure) and exc.code == "INVALID_PROVIDER_CREDENTIALS"
                     ) or "session expired" in exc_str or "revoked" in exc_str or "relogin" in exc_str
                     retried = False
                     if is_auth_error:
-                        job.log(f"[Backup-Resume] Upload bị lỗi xác thực ({exc}). Đang refresh session và thử lại pipeline...")
+                        job.log(f"[Backup-Resume] Upload bị lỗi xác thực ({exc}). Đang yêu cầu làm mới session/tài khoản đích...")
                         # Try to refresh dst provider session before retry
+                        refreshed = False
                         if hasattr(dst, "_refresh_web_session"):
                             try:
-                                await dst._refresh_web_session(target.get("credentials") or {})
+                                refreshed = await dst._refresh_web_session(target.get("credentials") or {})
                             except Exception:
-                                pass
+                                refreshed = False
+
                         try:
-                            # Re-create temp dirs (they were cleaned in finally on first pass)
+                            if not refreshed:
+                                auth_fail = exc if isinstance(exc, ProviderFailure) else ProviderFailure("INVALID_PROVIDER_CREDENTIALS", str(exc))
+                                await _wait_for_retry_account(job, target, auth_fail)
+
+                            # Re-create temp dirs
                             for d in item_dirs.values():
                                 d.mkdir(parents=True, exist_ok=True)
                             final_file = await run_resumable_backup_pipeline(
@@ -1010,11 +1027,13 @@ async def _run_backup_resume_batches(
                                     "duration": timing.get("duration"),
                                 })
                                 job.log(f"[Backup-Resume] Phiên backup chưa hoàn tất sau retry, dữ liệu an toàn trên Cloud: {item_name}")
+                        except _ItemSkippedFailure as skip_err:
+                            job.log(f"[Backup-Resume] Bỏ qua mục sau khi chờ tài khoản mới: {skip_err.message}")
                         except JobCancelled:
                             raise
                         except Exception as retry_exc:
                             job.log(f"[Backup-Resume] Retry cũng thất bại: {retry_exc}")
-                            exc = retry_exc  # use the latest error for the skip log
+                            exc = retry_exc
 
                     if not retried:
                         job.finish_item(item_k, status="failed", name=item_name)
