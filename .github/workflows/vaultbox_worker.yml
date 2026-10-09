@@ -21,7 +21,7 @@ jobs:
     env:
       # URL Cloudflare Relay mặc định của VaultBox
       COLAB_RELAY_URL: "https://vaultbox-colab-relay.lefantasusdelimei.workers.dev"
-      AUTO_STOP_IDLE_MINUTES: "15" # Tự động ngắt runner sau 15 phút idle (0 task)
+      AUTO_STOP_IDLE_MINUTES: "5" # Tự động ngắt runner sau 5 phút idle (0 task)
       COLAB_AUTO_STOP: "1"
 
     steps:

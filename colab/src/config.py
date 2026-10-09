@@ -61,6 +61,6 @@ AUTO_STOP_ENABLED = (
     or IS_GITHUB_ACTIONS
     or (os.environ.get("COLAB_AUTO_STOP", "").lower() in {"1", "true", "yes"})
 )
-AUTO_STOP_IDLE_MINUTES = KAGGLE_AUTO_STOP_MINUTES if IS_KAGGLE else int(os.environ.get("AUTO_STOP_IDLE_MINUTES", "15" if IS_GITHUB_ACTIONS else "10"))
+AUTO_STOP_IDLE_MINUTES = KAGGLE_AUTO_STOP_MINUTES if IS_KAGGLE else int(os.environ.get("AUTO_STOP_IDLE_MINUTES", "5" if IS_GITHUB_ACTIONS else "10"))
 
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
