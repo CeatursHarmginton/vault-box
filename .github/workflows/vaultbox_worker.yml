@@ -1,0 +1,122 @@
+name: VaultBox Transfer Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      room_id:
+        description: 'Tùy chọn: Nhập Room ID tùy chỉnh (nếu để trống, sẽ TỰ ĐỘNG TẠO theo tên tài khoản GitHub này)'
+        required: false
+        default: ''
+      token:
+        description: 'Tùy chọn: Nhập Token tùy chỉnh (nếu để trống, sẽ TỰ ĐỘNG TẠO token bảo mật riêng cho repo này)'
+        required: false
+        default: ''
+
+jobs:
+  run-worker:
+    name: VaultBox Worker Runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # Tối đa 6 tiếng mỗi phiên chạy
+
+    env:
+      # URL Cloudflare Relay mặc định của VaultBox
+      COLAB_RELAY_URL: "https://vaultbox-colab-relay.lefantasusdelimei.workers.dev"
+      AUTO_STOP_IDLE_MINUTES: "15" # Tự động ngắt runner sau 15 phút idle (0 task)
+      COLAB_AUTO_STOP: "1"
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Free Disk Space (Tăng dung lượng ổ đĩa lên ~60-70GB)
+        run: |
+          echo "Dọn dẹp các packages mặc định để mở rộng bộ nhớ..."
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r colab/requirements.txt
+
+      - name: Resolve Auto Credentials (Tự động sinh Room ID & Token theo từng tài khoản)
+        id: creds
+        env:
+          INPUT_ROOM_ID: ${{ github.event.inputs.room_id }}
+          INPUT_TOKEN: ${{ github.event.inputs.token }}
+          SECRET_RELAY_URL: ${{ secrets.COLAB_RELAY_URL }}
+          SECRET_ROOM_ID: ${{ secrets.COLAB_RELAY_ROOM_ID }}
+          SECRET_TOKEN: ${{ secrets.COLAB_RELAY_TOKEN }}
+          REPO_NAME: ${{ github.repository }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_ID: ${{ github.repository_id }}
+        run: |
+          python - << 'EOF'
+          import os, hashlib, json
+
+          repo_owner = os.environ.get("REPO_OWNER", "user").replace("-", "_").lower()
+          repo_name = os.environ.get("REPO_NAME", "user/vaultbox")
+          repo_id = os.environ.get("REPO_ID", "0")
+
+          # 1. Tự động tạo Room ID theo tài khoản GitHub (ví dụ: gh_myaccount)
+          auto_room_id = f"gh_{repo_owner}"
+          room_id = os.environ.get("INPUT_ROOM_ID") or os.environ.get("SECRET_ROOM_ID") or auto_room_id
+
+          # 2. Tự động sinh Token bảo mật 32 ký tự cố định duy nhất theo repo này
+          salt = "vaultbox_auto_token_salt_2026"
+          auto_token = hashlib.sha256(f"{repo_name}:{repo_id}:{salt}".encode()).hexdigest()[:32]
+          token = os.environ.get("INPUT_TOKEN") or os.environ.get("SECRET_TOKEN") or auto_token
+
+          # 3. URL Relay
+          relay_url = os.environ.get("SECRET_RELAY_URL") or os.environ.get("COLAB_RELAY_URL") or "https://vaultbox-colab-relay.lefantasusdelimei.workers.dev"
+
+          # Chuỗi kết nối 1 chạm cho VaultBox
+          connect_payload = {
+              "mode": "server",
+              "serverUrl": relay_url,
+              "roomId": room_id,
+              "serverToken": token
+          }
+          connect_string = f"VAULTBOX_COLAB_CONNECT:{json.dumps(connect_payload)}"
+
+          # Ghi vào outputs cho các step sau
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"room_id={room_id}\n")
+              f.write(f"token={token}\n")
+              f.write(f"relay_url={relay_url}\n")
+              f.write(f"connect_string={connect_string}\n")
+
+          # In bảng thông tin kết nối lên GitHub Step Summary
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_file:
+              with open(summary_file, "a", encoding="utf-8") as f:
+                  f.write("### 🚀 VaultBox Worker đã sẵn sàng!\n\n")
+                  f.write(f"- **Relay URL:** `{relay_url}`\n")
+                  f.write(f"- **Room ID (Tự động):** `{room_id}`\n")
+                  f.write(f"- **Token (Tự động):** `{token}`\n\n")
+                  f.write("#### 📋 Chuỗi kết nối nhanh (Copy vào ô Connect của VaultBox):\n")
+                  f.write(f"```text\n{connect_string}\n```\n")
+
+          print("=========================================================")
+          print(f" Room ID: {room_id}")
+          print(f" Token:   {token}")
+          print(f" Connect: {connect_string}")
+          print("=========================================================")
+          EOF
+
+      - name: Start VaultBox Worker Server
+        env:
+          COLAB_RELAY_URL: ${{ steps.creds.outputs.relay_url }}
+          COLAB_RELAY_ROOM_ID: ${{ steps.creds.outputs.room_id }}
+          COLAB_RELAY_TOKEN: ${{ steps.creds.outputs.token }}
+        run: |
+          python -m uvicorn colab.src.server:app --host 0.0.0.0 --port 8000
