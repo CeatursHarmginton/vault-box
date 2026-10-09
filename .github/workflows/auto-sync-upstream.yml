@@ -1,0 +1,44 @@
+name: Auto Sync Upstream (Tự động cập nhật bản gốc)
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # Tự động chạy mỗi 6 tiếng để kiểm tra cập nhật mới từ bản gốc
+  workflow_dispatch:     # Cho phép bấm nút chạy thủ công bất cứ lúc nào
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync Fork with Upstream
+    runs-on: ubuntu-latest
+    # Chỉ chạy trên các repo Fork hoặc account phụ (không chạy trên repo chính)
+    if: github.repository != 'CeatursHarmginton/vault-box' && github.repository != 'CeatursHarmginton/pikpak-manager-premium'
+
+    steps:
+      - name: Checkout Fork Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Sync from Upstream Repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          echo "========================================================="
+          echo " Kiểm tra cập nhật từ repo gốc CeatursHarmginton/vault-box..."
+          echo "========================================================="
+
+          git remote add upstream https://github.com/CeatursHarmginton/vault-box.git || true
+          git fetch upstream main
+
+          git checkout main
+          if git merge upstream/main -m "chore(sync): auto sync with upstream CeatursHarmginton/vault-box" --no-edit; then
+            echo "[✓] Đã merge thành công các cập nhật mới nhất từ bản gốc!"
+            git push origin main
+          else
+            echo "[!] Xung đột phát sinh khi merge. Hủy bỏ merge để bảo toàn repo."
+            git merge --abort
+          fi
