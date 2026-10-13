@@ -394,13 +394,14 @@ def _download_error_payload(path: Path, content_type: str, strict: bool) -> dict
     video_exts = (".mp4", ".mkv", ".ts", ".webm", ".avi", ".mov", ".flv", ".mp3", ".m4a")
     clean_ext = path.name.lower().replace(".part", "")
     is_video = any(clean_ext.endswith(ext) for ext in video_exts)
-    if is_video or not raw.startswith((b"{", b"[")):
+    if is_video:
         raw_lower = raw.lower()
         text_errors = (
-            b"file not found", b"404 not found", b"not found", b"403 forbidden", b"forbidden",
+            b"error_wrong_ip", b"wrong_ip",
+            b"file not found", b"404 not found", b"403 forbidden", b"forbidden",
             b"access denied", b"link expired", b"url expired", b"invalid token", b"video deleted",
             b"ip not allowed", b"bad request", b"not authorized", b"unauthorized",
-            b"<html", b"<!doctype html", b"error"
+            b"<html", b"<!doctype html"
         )
         if any(err in raw_lower for err in text_errors):
             msg = raw.decode("utf-8", errors="replace").strip() or f"{path.stat().st_size} bytes error payload"

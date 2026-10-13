@@ -979,11 +979,12 @@ class LinksProvider(BaseProvider):
 
     @staticmethod
     def _validate_downloaded_files(files: list[Path]) -> None:
+        video_exts = (".mp4", ".mkv", ".ts", ".webm", ".avi", ".mov", ".flv", ".mp3", ".m4a")
         text_errors = (
-            b"file not found", b"404 not found", b"not found", b"403 forbidden", b"forbidden",
+            b"file not found", b"404 not found", b"403 forbidden", b"forbidden",
             b"access denied", b"link expired", b"url expired", b"invalid token", b"video deleted",
             b"ip not allowed", b"bad request", b"not authorized", b"unauthorized",
-            b"<html", b"<!doctype html", b"error"
+            b"<html", b"<!doctype html"
         )
         for f in files:
             if not f.is_file():
@@ -992,7 +993,9 @@ class LinksProvider(BaseProvider):
             if sz == 0:
                 f.unlink(missing_ok=True)
                 raise ProviderFailure("DOWNLOAD_FAILED", f"Downloaded file {f.name} is empty (0 bytes)")
-            if sz <= 4096:
+            clean_name = f.name.lower()
+            is_media = any(clean_name.endswith(ext) for ext in video_exts)
+            if sz <= 4096 and is_media:
                 content = f.read_bytes()
                 raw_low = content.lower()
                 if any(err in raw_low for err in text_errors):
