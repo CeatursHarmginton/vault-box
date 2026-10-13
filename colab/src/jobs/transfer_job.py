@@ -17,6 +17,17 @@ from .progress import JobCancelled, JobState
 
 CONFIRM_TIMEOUT_SECONDS = 120
 COLAB_DEFAULT_FREE_BYTES = 80 * 1024 ** 3
+MIN_FREE_DISK_BYTES = 5 * 1024 ** 3  # 5 GB safety reserve
+
+def _get_free_disk_bytes(path: Path) -> int:
+    try:
+        return shutil.disk_usage(path).free
+    except Exception:
+        return COLAB_DEFAULT_FREE_BYTES
+
+def _is_disk_low(path: Path, needed_bytes: int = 0, min_reserve: int = MIN_FREE_DISK_BYTES) -> bool:
+    free = _get_free_disk_bytes(path)
+    return free < (min_reserve + max(0, needed_bytes))
 
 def _should_process_video_thumbnails(options: dict[str, Any], payload: dict[str, Any] | None = None) -> bool:
     payload = payload or {}
@@ -100,7 +111,7 @@ async def run_transfer(job: JobState) -> None:
                 job.set(status="completed", step="completed")
                 return
 
-            if strategy in ("file_by_file", "file", "streaming", "pipeline") and len(items) > 1:
+            if strategy in ("file_by_file", "file", "streaming", "pipeline"):
                 await _run_file_pipeline_batches(job, dirs, source, target, options, src, dst, items)
                 job.log(f"Done: Downloaded {job.files_downloaded}/{job.files_to_download} file(s), Uploaded {job.files_uploaded}/{job.files_to_upload} file(s) (skipped {job.files_skipped} file(s))")
                 _log_skip_summary(job)
@@ -109,7 +120,7 @@ async def run_transfer(job: JobState) -> None:
                 job.set(status="completed", step="completed")
                 return
 
-            if strategy in ("smart_folder", "folder") and (has_folder_batch or len(items) > 1):
+            if strategy in ("smart_folder", "folder"):
                 await _run_smart_folder_batches(job, dirs, source, target, options, src, dst, items)
                 job.log(f"Done: Downloaded {job.files_downloaded}/{job.files_to_download} file(s), Uploaded {job.files_uploaded}/{job.files_to_upload} file(s) (skipped {job.files_skipped} file(s))")
                 _log_skip_summary(job)
@@ -646,6 +657,132 @@ async def _run_plain_file_batches(job: JobState, dirs: dict[str, Path], source: 
         shutil.rmtree(batch_output, ignore_errors=True)
         _finish_items(job, source, [item for item in batch_items if not _item_is_failed(job, source, item)])
 
+async def _expand_folder_files(
+    provider: Any,
+    credentials: dict[str, Any],
+    folder_item: dict[str, Any],
+    current_rel_prefix: str = "",
+    job: JobState | None = None,
+) -> list[dict[str, Any]]:
+    """Recursively list all files in folder_item with their relative paths."""
+    folder_id = str(folder_item.get("id") or folder_item.get("path") or "/")
+    try:
+        if not hasattr(provider, "list_files"):
+            return []
+        listing = await provider.list_files(credentials, folder_id)
+    except Exception as exc:
+        if job:
+            job.log(f"[Warning] Không thể liệt kê nội dung thư mục '{folder_item.get('name') or folder_id}': {exc}")
+        return []
+
+    items = listing.get("items") or listing.get("files") or []
+    files_result: list[dict[str, Any]] = []
+
+    for child in items:
+        child_type = child.get("type") or ("folder" if (child.get("is_folder") or child.get("isdir")) else "file")
+        raw_name = str(child.get("name") or child.get("server_filename") or child.get("id") or "item").replace("\\", "/")
+        child_name = safe_name(PurePosixPath(raw_name).name or raw_name)
+        child_rel = f"{current_rel_prefix}/{child_name}" if current_rel_prefix else child_name
+
+        if child_type == "folder":
+            sub_files = await _expand_folder_files(provider, credentials, child, child_rel, job)
+            files_result.extend(sub_files)
+        else:
+            child_copy = dict(child)
+            child_copy["_relative_path"] = child_rel
+            child_copy["_parent_folder"] = folder_item
+            files_result.append(child_copy)
+
+    return files_result
+
+
+async def _expand_all_items_to_files(
+    source: dict[str, Any],
+    items: list[dict[str, Any]],
+    src: Any,
+    job: JobState | None = None,
+) -> list[dict[str, Any]]:
+    all_files: list[dict[str, Any]] = []
+    for item in items:
+        item_type = item.get("type") or ("folder" if (item.get("is_folder") or item.get("isdir")) else "file")
+        item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
+        item_src = PROVIDERS.get(item_prov, src)
+        item_creds = item.get("credentials") or source.get("credentials") or {}
+
+        if item_type == "folder":
+            raw_name = str(item.get("name") or item.get("path") or item.get("id") or "folder").replace("\\", "/")
+            folder_name = safe_name(PurePosixPath(raw_name).name or raw_name)
+            folder_files = await _expand_folder_files(item_src, item_creds, item, folder_name, job)
+            all_files.extend(folder_files)
+        else:
+            file_copy = dict(item)
+            if "_relative_path" not in file_copy:
+                file_copy["_relative_path"] = _item_name(item)
+            all_files.append(file_copy)
+    return all_files
+
+
+async def _resolve_smart_folder_units(
+    source: dict[str, Any],
+    items: list[dict[str, Any]],
+    src: Any,
+    job: JobState | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    If any folder item contains subfolders, expand it into individual subfolders
+    so each subfolder is processed, uploaded, and cleaned up independently.
+    """
+    resolved_folders: list[dict[str, Any]] = []
+    resolved_files: list[dict[str, Any]] = []
+
+    for item in items:
+        item_type = item.get("type") or ("folder" if (item.get("is_folder") or item.get("isdir")) else "file")
+        if item_type != "folder":
+            resolved_files.append(item)
+            continue
+
+        item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
+        item_src = PROVIDERS.get(item_prov, src)
+        item_creds = item.get("credentials") or source.get("credentials") or {}
+        raw_name = str(item.get("name") or item.get("path") or item.get("id") or "folder").replace("\\", "/")
+        f_name = safe_name(PurePosixPath(raw_name).name or raw_name)
+        folder_id = str(item.get("id") or item.get("path") or "/")
+
+        if not hasattr(item_src, "list_files"):
+            resolved_folders.append(item)
+            continue
+
+        try:
+            listing = await item_src.list_files(item_creds, folder_id)
+            children = listing.get("items") or listing.get("files") or []
+        except Exception:
+            resolved_folders.append(item)
+            continue
+
+        subfolders = [c for c in children if (c.get("type") == "folder" or c.get("is_folder") or c.get("isdir"))]
+        child_files = [c for c in children if not (c.get("type") == "folder" or c.get("is_folder") or c.get("isdir"))]
+
+        if subfolders:
+            if job:
+                job.log(f"[Smart Folder] Phát hiện thư mục '{f_name}' chứa {len(subfolders)} thư mục con -> Tự động tách thành từng thư mục con để tải & dọn dẹp độc lập.")
+            for sf in subfolders:
+                sf_copy = dict(sf)
+                sf_copy["_parent_prefix"] = f_name
+                sf_copy["credentials"] = item_creds
+                sf_copy["provider"] = item_prov
+                resolved_folders.append(sf_copy)
+            for cf in child_files:
+                cf_copy = dict(cf)
+                cf_copy["_parent_prefix"] = f_name
+                cf_copy["credentials"] = item_creds
+                cf_copy["provider"] = item_prov
+                resolved_files.append(cf_copy)
+        else:
+            resolved_folders.append(item)
+
+    return resolved_folders, resolved_files
+
+
 async def _run_smart_folder_batches(
     job: JobState,
     dirs: dict[str, Path],
@@ -656,8 +793,7 @@ async def _run_smart_folder_batches(
     dst: Any,
     items: list[dict[str, Any]],
 ) -> None:
-    folder_items = [it for it in items if (it.get("type") == "folder" or it.get("is_folder"))]
-    file_items = [it for it in items if not (it.get("type") == "folder" or it.get("is_folder"))]
+    folder_items, file_items = await _resolve_smart_folder_units(source, items, src, job)
     total_groups = len(folder_items) + (1 if file_items else 0)
 
     job.log(f"[Smart Folder] Bắt đầu truyền tải theo từng thư mục ({len(folder_items)} folder, {len(file_items)} file)")
@@ -682,64 +818,162 @@ async def _run_smart_folder_batches(
         f_creds = f_item.get("credentials") or source.get("credentials") or {}
         failed_before = job.files_failed
 
-        try:
-            downloaded = await f_src.download_folder(f_creds, f_item, folder_dir, job)
-        except ProviderFailure as exc:
-            if not is_skippable_download_failure(exc):
-                raise
-            _mark_item_skipped(job, source, f_item, exc.message)
-            shutil.rmtree(batch_input, ignore_errors=True)
-            shutil.rmtree(batch_output, ignore_errors=True)
-            continue
+        sub_options = dict(options)
+        parent_pfx = str(f_item.get("_parent_prefix") or "").strip("/")
+        if parent_pfx:
+            existing_pfx = str(options.get("upload_prefix") or "").strip("/")
+            sub_options["upload_prefix"] = f"{existing_pfx}/{parent_pfx}".strip("/") if existing_pfx else parent_pfx
 
-        if job.files_failed > failed_before:
-            _mark_item_skipped(job, source, f_item, f"{job.files_failed - failed_before} file(s) unavailable after retries")
-
-        if not downloaded:
-            job.log(f"[Smart Folder {idx}/{total_groups}] Thư mục trống hoặc không có file: {f_name}")
-            shutil.rmtree(batch_input, ignore_errors=True)
-            shutil.rmtree(batch_output, ignore_errors=True)
-            if not (job.files_failed > failed_before):
-                _finish_items(job, source, [f_item])
-            continue
-
-        upload_root = batch_input
-        outputs = downloaded
-        if options.get("extract"):
-            job.log(f"[Smart Folder {idx}/{total_groups}] Giải nén các file nén trong thư mục {f_name}...")
-            extract_root = batch_output / "extracted"
-            outputs = await extract_archives(batch_input, extract_root, job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
-            upload_root = extract_root
-            job.log(f"Extract stage output files: {len(outputs)}")
-
-        if _should_process_video_thumbnails(options, job.payload):
+        folder_files: list[dict[str, Any]] = []
+        if hasattr(f_src, "list_files"):
             try:
-                from ..utils.video_thumbnail import process_video_thumbnails
-                outputs = await asyncio.to_thread(
-                    process_video_thumbnails,
-                    outputs,
-                    options,
-                    job,
-                )
-            except Exception as exc:
-                job.log(f"[Thumbnail] Warning during video thumbnailing: {exc}")
+                folder_files = await _expand_folder_files(f_src, f_creds, f_item, f_name, job)
+            except Exception:
+                folder_files = []
 
-        job.set(status="running", step="uploading")
-        job.log(f"[Smart Folder {idx}/{total_groups}] Đang upload thư mục {f_name} ({len(outputs)} files) lên đích...")
-        await _upload_outputs_with_retry(job, target, options, dst, upload_root, f_item)
+        if folder_files:
+            needs_batches = _needs_download_batches(folder_files, dirs["input"], options)
+            file_batches = _download_batches(folder_files, dirs["input"], options, job) if needs_batches else [folder_files]
+            if len(file_batches) > 1:
+                total_sz = sum(_item_size(it) for it in folder_files)
+                job.log(f"[Smart Folder {idx}/{total_groups}] [Disk Guard] Thư mục {f_name} có {len(folder_files)} file ({_gb(total_sz)}GB) vượt ngân sách đĩa Colab -> Tự động chia thành {len(file_batches)} đợt tải & upload để giải phóng đĩa liên tục.")
 
-        if options.get("cleanupAfterFinish", True):
+            for b_idx, b_files in enumerate(file_batches, 1):
+                job.check_cancelled()
+                if len(file_batches) > 1:
+                    job.log(f"[Smart Folder {idx}/{total_groups}] Đợt {b_idx}/{len(file_batches)}: Đang tải {len(b_files)} file của thư mục {f_name}...")
+
+                conc = int(options.get("download_concurrency") or FOLDER_DOWNLOAD_CONCURRENCY)
+                dl_sem = asyncio.Semaphore(max(1, conc))
+
+                async def dl_sub(it: dict[str, Any]) -> list[Path]:
+                    async with dl_sem:
+                        job.check_cancelled()
+                        it_name = _item_name(it)
+                        it_rel = it.get("_relative_path") or f"{f_name}/{it_name}"
+                        it_size = _item_size(it)
+                        it_k = _queue_item_key(source, it)
+                        target_dir = batch_input / PurePosixPath(it_rel).parent
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        job.start_file(it_name, phase="download", size=it_size, key=it_k)
+                        try:
+                            p = await download_with_retry(
+                                lambda: f_src.download_file(f_creds, it, target_dir, job),
+                                progress=job, label=it_name,
+                            )
+                            act_sz = p.stat().st_size if (p and p.exists()) else it_size
+                            job.finish_file(it_name, phase="download", size=act_sz, key=it_k)
+                            job.files_downloaded += 1
+                            job.log(f"[{job.files_downloaded}/{job.files_to_download or job.files_downloaded}] Downloaded: {it_name}")
+                            _remember_source_ref(job, p, it)
+                            return [p]
+                        except ProviderFailure as exc:
+                            job.finish_file(it_name, phase="download", key=it_k)
+                            if not is_skippable_download_failure(exc):
+                                raise
+                            _mark_item_skipped(job, source, it, exc.message)
+                            return []
+
+                batch_downloaded = [p for batch in await asyncio.gather(*(dl_sub(it) for it in b_files)) for p in batch if p.is_file()]
+                if not batch_downloaded:
+                    continue
+
+                upload_root = batch_input
+                outputs = batch_downloaded
+                if options.get("extract"):
+                    extract_root = batch_output / "extracted"
+                    outputs = await extract_archives(batch_input, extract_root, job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
+                    upload_root = extract_root
+
+                if _should_process_video_thumbnails(options, job.payload):
+                    try:
+                        from ..utils.video_thumbnail import process_video_thumbnails
+                        outputs = await asyncio.to_thread(process_video_thumbnails, outputs, options, job)
+                    except Exception as exc:
+                        job.log(f"[Thumbnail] Warning during video thumbnailing: {exc}")
+
+                job.set(status="running", step="uploading")
+                if len(file_batches) > 1:
+                    job.log(f"[Smart Folder {idx}/{total_groups}] [Disk Guard] Đang upload đợt {b_idx}/{len(file_batches)} ({len(outputs)} files) của thư mục {f_name}...")
+                else:
+                    job.log(f"[Smart Folder {idx}/{total_groups}] Đang upload thư mục {f_name} ({len(outputs)} files) lên đích...")
+
+                job._upload_log_total = len(folder_files)
+                await _upload_outputs_with_retry(job, target, sub_options, dst, upload_root, f_item)
+
+                if options.get("cleanupAfterFinish", True) or len(file_batches) > 1:
+                    shutil.rmtree(batch_input, ignore_errors=True)
+                    shutil.rmtree(batch_output, ignore_errors=True)
+                    batch_input.mkdir(parents=True, exist_ok=True)
+                    batch_output.mkdir(parents=True, exist_ok=True)
+                    if len(file_batches) > 1:
+                        job.log(f"[Smart Folder {idx}/{total_groups}] [Disk Guard] Đã dọn dẹp đĩa đợt {b_idx}/{len(file_batches)}, giải phóng không gian Colab ({_gb(_get_free_disk_bytes(dirs['input']))}GB trống) để tải đợt tiếp.")
+
+            _finish_items(job, source, [f_item])
+            job.log(f"[Smart Folder {idx}/{total_groups}] ✓ Hoàn tất thư mục: {f_name}")
             shutil.rmtree(batch_input, ignore_errors=True)
             shutil.rmtree(batch_output, ignore_errors=True)
-            job.log(f"[Smart Folder {idx}/{total_groups}] Đã dọn dẹp đĩa tạm Colab cho thư mục {f_name}.")
+        else:
+            try:
+                downloaded = await f_src.download_folder(f_creds, f_item, folder_dir, job)
+            except ProviderFailure as exc:
+                if not is_skippable_download_failure(exc):
+                    raise
+                _mark_item_skipped(job, source, f_item, exc.message)
+                shutil.rmtree(batch_input, ignore_errors=True)
+                shutil.rmtree(batch_output, ignore_errors=True)
+                continue
 
-        _finish_items(job, source, [f_item])
-        job.log(f"[Smart Folder {idx}/{total_groups}] ✓ Hoàn tất thư mục: {f_name}")
+            if job.files_failed > failed_before:
+                _mark_item_skipped(job, source, f_item, f"{job.files_failed - failed_before} file(s) unavailable after retries")
+
+            if not downloaded:
+                job.log(f"[Smart Folder {idx}/{total_groups}] Thư mục trống hoặc không có file: {f_name}")
+                shutil.rmtree(batch_input, ignore_errors=True)
+                shutil.rmtree(batch_output, ignore_errors=True)
+                if not (job.files_failed > failed_before):
+                    _finish_items(job, source, [f_item])
+                continue
+
+            upload_root = batch_input
+            outputs = downloaded
+            if options.get("extract"):
+                job.log(f"[Smart Folder {idx}/{total_groups}] Giải nén các file nén trong thư mục {f_name}...")
+                extract_root = batch_output / "extracted"
+                outputs = await extract_archives(batch_input, extract_root, job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
+                upload_root = extract_root
+                job.log(f"Extract stage output files: {len(outputs)}")
+
+            if _should_process_video_thumbnails(options, job.payload):
+                try:
+                    from ..utils.video_thumbnail import process_video_thumbnails
+                    outputs = await asyncio.to_thread(
+                        process_video_thumbnails,
+                        outputs,
+                        options,
+                        job,
+                    )
+                except Exception as exc:
+                    job.log(f"[Thumbnail] Warning during video thumbnailing: {exc}")
+
+            job.set(status="running", step="uploading")
+            job.log(f"[Smart Folder {idx}/{total_groups}] Đang upload thư mục {f_name} ({len(outputs)} files) lên đích...")
+            job._upload_log_total = len(outputs)
+            await _upload_outputs_with_retry(job, target, sub_options, dst, upload_root, f_item)
+
+            if options.get("cleanupAfterFinish", True):
+                shutil.rmtree(batch_input, ignore_errors=True)
+                shutil.rmtree(batch_output, ignore_errors=True)
+                job.log(f"[Smart Folder {idx}/{total_groups}] Đã dọn dẹp đĩa tạm Colab cho thư mục {f_name}.")
+
+            _finish_items(job, source, [f_item])
+            job.log(f"[Smart Folder {idx}/{total_groups}] ✓ Hoàn tất thư mục: {f_name}")
 
     if file_items:
         file_grp = len(folder_items) + 1
         job.log(f"[Smart Folder {file_grp}/{total_groups}] >>> Bắt đầu xử lý {len(file_items)} file riêng lẻ...")
         await _run_plain_file_batches(job, dirs, source, target, options, src, dst, file_items)
+
 
 async def _run_file_pipeline_batches(
     job: JobState,
@@ -751,26 +985,33 @@ async def _run_file_pipeline_batches(
     dst: Any,
     items: list[dict[str, Any]],
 ) -> None:
-    file_items = [it for it in items if not (it.get("type") == "folder" or it.get("is_folder"))]
-    folder_items = [it for it in items if (it.get("type") == "folder" or it.get("is_folder"))]
-    if not job.files_to_download or job.files_to_download < len(file_items):
-        job.files_to_download = len(file_items)
-    if not options.get("extract") and (not job.files_to_upload or not getattr(job, "_pipeline_preallocated", False)):
-        job.files_to_upload = max(job.files_to_upload, len(file_items))
-        job._pipeline_preallocated = True
+    job.log("[Pipeline] Đang kiểm tra và quét danh sách file...")
+    file_items = await _expand_all_items_to_files(source, items, src, job)
+
+    if not file_items:
+        file_items = [it for it in items if not (it.get("type") == "folder" or it.get("is_folder"))]
+        folder_items = [it for it in items if (it.get("type") == "folder" or it.get("is_folder"))]
+        if folder_items:
+            job.log(f"[Pipeline] Xử lý {len(folder_items)} thư mục theo smart folder...")
+            await _run_smart_folder_batches(job, dirs, source, target, options, src, dst, folder_items)
+            if not file_items:
+                return
+
+    if not file_items:
+        return
+
+    job.files_to_download = len(file_items)
+    job.files_to_upload = len(file_items)
+    job._pipeline_preallocated = True
+    job._upload_log_total = len(file_items)
+    job._upload_log_done = 0
+
     dl_concurrency = int(options.get("download_concurrency") or options.get("downloadConcurrency") or FOLDER_DOWNLOAD_CONCURRENCY)
     ul_concurrency = int(options.get("upload_concurrency") or options.get("uploadConcurrency") or options.get("upload_parallel") or UPLOAD_FILE_CONCURRENCY)
     dl_sem = asyncio.Semaphore(max(1, dl_concurrency))
     ul_sem = asyncio.Semaphore(max(1, ul_concurrency))
 
-    job.log(f"[Pipeline] Bắt đầu truyền tải File-by-File (download: {max(1, dl_concurrency)} items song song, upload: {max(1, ul_concurrency)} items song song)")
-
-    if folder_items:
-        job.log(f"[Pipeline] Phát hiện {len(folder_items)} thư mục, xử lý thư mục theo smart folder...")
-        await _run_smart_folder_batches(job, dirs, source, target, options, src, dst, folder_items)
-
-    if not file_items:
-        return
+    job.log(f"[Pipeline] Bắt đầu truyền tải File-by-File ({len(file_items)} file, download: {max(1, dl_concurrency)} items song song, upload: {max(1, ul_concurrency)} items song song)")
 
     async def process_one_file(idx: int, item: dict[str, Any]) -> None:
         item_name = _item_name(item)
@@ -779,10 +1020,25 @@ async def _run_file_pipeline_batches(
         item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
         item_src = PROVIDERS.get(item_prov, src)
         item_creds = item.get("credentials") or source.get("credentials") or {}
+        rel_path = item.get("_relative_path") or item_name
 
         pipe_in = dirs["input"] / f"pipe-{idx}"
         pipe_out = dirs["output"] / f"pipe-{idx}"
         pipe_in.mkdir(parents=True, exist_ok=True)
+
+        if "/" in rel_path:
+            save_parent = pipe_in / PurePosixPath(rel_path).parent
+            save_parent.mkdir(parents=True, exist_ok=True)
+            dl_dest = save_parent
+        else:
+            dl_dest = pipe_in
+
+        wait_attempts = 0
+        while _is_disk_low(dirs["input"], needed_bytes=item_size, min_reserve=MIN_FREE_DISK_BYTES) and wait_attempts < 60:
+            job.log(f"[Disk Guard] Dung lượng đĩa còn thấp ({_gb(_get_free_disk_bytes(dirs['input']))}GB). Chờ upload hoàn tất để giải phóng đĩa trước khi tải {item_name}...")
+            await asyncio.sleep(2.0)
+            wait_attempts += 1
+            job.check_cancelled()
 
         async with dl_sem:
             job.check_cancelled()
@@ -790,7 +1046,7 @@ async def _run_file_pipeline_batches(
             job.start_item(item_k, name=item_name)
             try:
                 path = await download_with_retry(
-                    lambda: item_src.download_file(item_creds, item, pipe_in, job),
+                    lambda: item_src.download_file(item_creds, item, dl_dest, job),
                     progress=job, label=item_name,
                 )
                 actual_size = path.stat().st_size if (path and path.exists()) else item_size
@@ -830,7 +1086,7 @@ async def _run_file_pipeline_batches(
             async with ul_sem:
                 if job.files_downloaded >= job.files_to_download:
                     job.set(status="running", step="uploading")
-                job.log(f"[Pipeline] Upload ngay file vừa tải: {item_name}")
+                job.log(f"[Pipeline] Upload ngay file vừa tải: {rel_path}")
                 await _upload_outputs_with_retry(job, target, options, dst, upload_root, item)
             _finish_items(job, source, [item])
         except Exception as exc:
@@ -1251,19 +1507,20 @@ async def _upload_outputs(job: JobState, target: dict[str, Any], options: dict[s
         raise ProviderFailure("UPLOAD_FAILED", "No files staged for upload", {"root": str(upload_root)})
     item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
     if len(files) == 1 and item_type != "folder":
-        if not getattr(job, "_pipeline_preallocated", False):
+        if not getattr(job, "_pipeline_preallocated", False) or job.files_to_upload == 0:
             job.files_to_upload += 1
         f0_sz = files[0].stat().st_size if files[0].exists() else 0
         job.start_file(files[0].name, phase="upload", size=f0_sz)
         try:
-            await _upload_path_with_retry(job, target, options, dst, files[0], files[0].name, item)
+            rel0 = files[0].relative_to(upload_root).as_posix() if upload_root != files[0] else files[0].name
+            await _upload_path_with_retry(job, target, options, dst, files[0], rel0, item)
             job.finish_file(files[0].name, phase="upload", size=f0_sz)
             job.finish_item(files[0].name, status="done", name=files[0].name)
         except Exception:
             job.finish_file(files[0].name, phase="upload")
             raise
         return
-    if not getattr(job, "_pipeline_preallocated", False):
+    if not getattr(job, "_pipeline_preallocated", False) or job.files_to_upload == 0:
         job.files_to_upload += len(files)
     upload_concurrency = int(options.get("upload_concurrency") or options.get("uploadConcurrency") or options.get("upload_parallel") or UPLOAD_FILE_CONCURRENCY)
     workers = max(1, min(upload_concurrency, len(files)))

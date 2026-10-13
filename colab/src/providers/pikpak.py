@@ -161,16 +161,37 @@ class PikPakProvider(BaseProvider):
 
     async def list_files(self, credentials: dict[str, Any], path_or_id: str) -> dict[str, Any]:
         s = PikPakSession(credentials)
-        params = {"parent_id": path_or_id or None, "thumbnail_size": "SIZE_SMALL", "limit": "1000", "filters": json.dumps({"trashed": {"eq": False}, "phase": {"eq": "PHASE_TYPE_COMPLETE"}})}
-        try:
-            data = await s.req("GET", f"{API}/drive/v1/files", params=params)
-        except ProviderFailure:
-            s.captcha = await s.captcha_init("GET:/drive/v1/files")
+        items: list[dict[str, Any]] = []
+        page_token: str | None = None
+        while True:
+            params: dict[str, Any] = {
+                "parent_id": path_or_id or None,
+                "thumbnail_size": "SIZE_SMALL",
+                "limit": "1000",
+                "filters": json.dumps({"trashed": {"eq": False}, "phase": {"eq": "PHASE_TYPE_COMPLETE"}}),
+            }
+            if page_token:
+                params["page_token"] = page_token
             try:
                 data = await s.req("GET", f"{API}/drive/v1/files", params=params)
-            finally:
-                s.captcha = ""
-        return {"items": [{"id": f.get("id"), "name": f.get("name"), "type": "folder" if f.get("kind") == "drive#folder" else "file", "size": f.get("size")} for f in data.get("files") or []]}
+            except ProviderFailure:
+                s.captcha = await s.captcha_init("GET:/drive/v1/files")
+                try:
+                    data = await s.req("GET", f"{API}/drive/v1/files", params=params)
+                finally:
+                    s.captcha = ""
+            for f in data.get("files") or []:
+                items.append({
+                    "id": f.get("id"),
+                    "name": f.get("name"),
+                    "type": "folder" if f.get("kind") == "drive#folder" else "file",
+                    "size": f.get("size"),
+                })
+            next_token = str(data.get("next_page_token") or "")
+            if not next_token or next_token == page_token:
+                break
+            page_token = next_token
+        return {"items": items}
 
     async def download_file(self, credentials: dict[str, Any], file_ref: dict[str, Any], local_path: Path, progress: JobState) -> Path:
         s = PikPakSession(credentials)

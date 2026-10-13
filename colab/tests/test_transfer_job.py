@@ -4661,6 +4661,281 @@ def test_drive_web_download_retries_stream_after_refresh(monkeypatch, tmp_path):
     ]
 
 
+def test_transfer_strategy_file_by_file_with_subfolders(tmp_path, monkeypatch):
+    dirs = {"input": tmp_path / "input", "output": tmp_path / "output"}
+    dirs["input"].mkdir()
+    dirs["output"].mkdir()
+    events = []
+    uploaded_targets = []
+
+    class MockFolderSource:
+        async def list_files(self, credentials, folder_id):
+            if folder_id == "mod1":
+                return {
+                    "items": [
+                        {"id": "v1", "name": "vid1.mp4", "type": "file", "size": 100},
+                        {"id": "v2", "name": "vid2.mp4", "type": "file", "size": 200},
+                    ]
+                }
+            return {"items": []}
+
+        async def download_file(self, credentials, item, local_path, progress):
+            events.append(f"dl_{item['name']}")
+            dest = local_path / item["name"] if local_path.is_dir() else local_path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text("dummy video")
+            return dest
+
+    class MockTarget:
+        async def upload_file(self, credentials, local_path, target_ref, progress):
+            events.append(f"up_{local_path.name}")
+            uploaded_targets.append(target_ref.get("relative_path"))
+            return {"ok": True}
+
+    monkeypatch.setattr(transfer_job_mod, "job_dirs", lambda job_id: dirs)
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "drive", MockFolderSource())
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "pikpak", MockTarget())
+
+    payload = {
+        "source": {
+            "provider": "drive",
+            "items": [
+                {"id": "mod1", "name": "Module 1", "type": "folder", "is_folder": True},
+            ],
+        },
+        "target": {"provider": "pikpak", "credentials": {}, "folder": {}},
+        "options": {"transfer_strategy": "file_by_file", "download_concurrency": 1, "upload_concurrency": 1, "cleanupAfterFinish": True},
+    }
+    job = JobState("test-strat-file-subfolders", payload)
+    asyncio.run(run_transfer(job))
+
+    assert job.status == "completed"
+    assert job.files_uploaded == 2
+    assert job.files_to_upload == 2
+    assert any("[1/2] Uploaded: vid1.mp4" in line for line in job.logs)
+    assert any("[2/2] Uploaded: vid2.mp4" in line for line in job.logs)
+    assert "Module 1/vid1.mp4" in uploaded_targets
+    assert "Module 1/vid2.mp4" in uploaded_targets
+
+
+def test_transfer_strategy_smart_folder_subfolder_expansion(tmp_path, monkeypatch):
+    dirs = {"input": tmp_path / "input", "output": tmp_path / "output"}
+    dirs["input"].mkdir()
+    dirs["output"].mkdir()
+    events = []
+    uploaded_targets = []
+
+    class MockTreeSource:
+        async def list_files(self, credentials, folder_id):
+            if folder_id == "main_root":
+                return {
+                    "items": [
+                        {"id": "sub1", "name": "Module 1", "type": "folder", "is_folder": True},
+                        {"id": "sub2", "name": "Module 2", "type": "folder", "is_folder": True},
+                    ]
+                }
+            elif folder_id == "sub1":
+                return {
+                    "items": [
+                        {"id": "m1_f1", "name": "m1_lesson.mp4", "type": "file", "size": 100},
+                    ]
+                }
+            elif folder_id == "sub2":
+                return {
+                    "items": [
+                        {"id": "m2_f1", "name": "m2_lesson.mp4", "type": "file", "size": 100},
+                    ]
+                }
+            return {"items": []}
+
+        async def download_file(self, credentials, item, local_path, progress):
+            events.append(f"dl_{item['name']}")
+            dest = local_path / item["name"] if local_path.is_dir() else local_path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text("data")
+            return dest
+
+    class MockTarget:
+        async def upload_file(self, credentials, local_path, target_ref, progress):
+            events.append(f"up_{local_path.name}")
+            uploaded_targets.append(target_ref.get("relative_path"))
+            return {"ok": True}
+
+    monkeypatch.setattr(transfer_job_mod, "job_dirs", lambda job_id: dirs)
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "drive", MockTreeSource())
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "pikpak", MockTarget())
+
+    payload = {
+        "source": {
+            "provider": "drive",
+            "items": [
+                {"id": "main_root", "name": "MainCourse", "type": "folder", "is_folder": True},
+            ],
+        },
+        "target": {"provider": "pikpak", "credentials": {}, "folder": {}},
+        "options": {"transfer_strategy": "smart_folder", "cleanupAfterFinish": True},
+    }
+    job = JobState("test-strat-smart-subfolder-expansion", payload)
+    asyncio.run(run_transfer(job))
+
+    assert job.status == "completed"
+    assert "dl_m1_lesson.mp4" in events
+    assert "up_m1_lesson.mp4" in events
+    assert "dl_m2_lesson.mp4" in events
+    assert "up_m2_lesson.mp4" in events
+    m1_up_idx = events.index("up_m1_lesson.mp4")
+    m2_dl_idx = events.index("dl_m2_lesson.mp4")
+    assert m1_up_idx < m2_dl_idx
+    assert "MainCourse/Module 1/m1_lesson.mp4" in uploaded_targets
+    assert "MainCourse/Module 2/m2_lesson.mp4" in uploaded_targets
+
+
+def test_transfer_strategy_smart_folder_disk_guard_batching(tmp_path, monkeypatch):
+    dirs = {"input": tmp_path / "input", "output": tmp_path / "output"}
+    dirs["input"].mkdir()
+    dirs["output"].mkdir()
+    events = []
+
+    class MockLargeFolderSource:
+        async def list_files(self, credentials, folder_id):
+            return {
+                "items": [
+                    {"id": f"f{i}", "name": f"vid_{i}.mp4", "type": "file", "size": 1000}
+                    for i in range(1, 5)
+                ]
+            }
+
+        async def download_file(self, credentials, item, local_path, progress):
+            events.append(f"dl_{item['name']}")
+            dest = local_path / item["name"] if local_path.is_dir() else local_path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text("data")
+            return dest
+
+    class MockTarget:
+        async def upload_file(self, credentials, local_path, target_ref, progress):
+            events.append(f"up_{local_path.name}")
+            return {"ok": True}
+
+    monkeypatch.setattr(transfer_job_mod, "_download_budget", lambda root, options: 2500)
+    monkeypatch.setattr(transfer_job_mod, "job_dirs", lambda job_id: dirs)
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "drive", MockLargeFolderSource())
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "pikpak", MockTarget())
+
+    payload = {
+        "source": {
+            "provider": "drive",
+            "items": [
+                {"id": "big_folder", "name": "BigFolder", "type": "folder", "is_folder": True},
+            ],
+        },
+        "target": {"provider": "pikpak", "credentials": {}, "folder": {}},
+        "options": {"transfer_strategy": "smart_folder", "cleanupAfterFinish": True},
+    }
+    job = JobState("test-strat-disk-guard-batching", payload)
+    asyncio.run(run_transfer(job))
+
+    assert job.status == "completed"
+    assert job.files_uploaded == 4
+    b1_up_idx = max(events.index("up_vid_1.mp4"), events.index("up_vid_2.mp4"))
+    b2_dl_idx = events.index("dl_vid_3.mp4")
+    assert b1_up_idx < b2_dl_idx
+    assert any("[Disk Guard]" in line for line in job.logs)
 
 
 
+
+
+
+
+def test_drive_provider_list_files_pagination(monkeypatch):
+    from src.providers.drive import DriveProvider
+    import asyncio
+
+    provider = DriveProvider()
+    pages_called = []
+
+    async def fake_request(credentials, method, url, params=None, json=None, headers=None):
+        class FakeResponse:
+            def json(self):
+                token = (params or {}).get("pageToken") or ""
+                pages_called.append(token)
+                if not token:
+                    return {
+                        "files": [{"id": f"id_{i}", "name": f"file_{i}.jpg", "mimeType": "image/jpeg", "size": 100} for i in range(1000)],
+                        "nextPageToken": "page_2_token",
+                    }
+                else:
+                    return {
+                        "files": [{"id": f"id_{i}", "name": f"file_{i}.jpg", "mimeType": "image/jpeg", "size": 100} for i in range(1000, 1500)],
+                        "nextPageToken": "",
+                    }
+
+        return FakeResponse()
+
+    monkeypatch.setattr(provider, "_web_session", lambda creds: False)
+    monkeypatch.setattr(provider, "_use_mount", lambda creds: False)
+    monkeypatch.setattr(provider, "_request", fake_request)
+
+    res = asyncio.run(provider.list_files({}, "root"))
+    assert len(res["items"]) == 1500
+    assert pages_called == ["", "page_2_token"]
+
+
+def test_terabox_provider_list_files_pagination(monkeypatch):
+    from src.providers.terabox import TeraBoxProvider
+    import asyncio
+
+    provider = TeraBoxProvider()
+    pages_requested = []
+
+    class MockSession:
+        base = "https://www.terabox.com"
+        async def ready(self): pass
+        async def aclose(self): pass
+        def params(self, **kwargs): return kwargs
+        def headers(self): return {}
+        async def request_json(self, method, url, context="", params=None, headers=None):
+            page = (params or {}).get("page", 1)
+            pages_requested.append(page)
+            if page == 1:
+                return {"list": [{"path": f"/dir/f_{i}.txt", "server_filename": f"f_{i}.txt", "isdir": 0, "size": 10} for i in range(1000)]}
+            elif page == 2:
+                return {"list": [{"path": f"/dir/f_{i}.txt", "server_filename": f"f_{i}.txt", "isdir": 0, "size": 10} for i in range(1000, 1250)]}
+            return {"list": []}
+
+    monkeypatch.setattr("src.providers.terabox.TeraBoxSession", lambda creds: MockSession())
+
+    res = asyncio.run(provider.list_files({}, "/dir"))
+    assert len(res["items"]) == 1250
+    assert pages_requested == [1, 2]
+
+
+def test_pikpak_provider_list_files_pagination(monkeypatch):
+    from src.providers.pikpak import PikPakProvider
+    import asyncio
+
+    provider = PikPakProvider()
+    pages_requested = []
+
+    class MockSession:
+        captcha = ""
+        async def req(self, method, url, params=None):
+            token = (params or {}).get("page_token") or ""
+            pages_requested.append(token)
+            if not token:
+                return {
+                    "files": [{"id": f"p_{i}", "name": f"pik_{i}.bin", "kind": "drive#file", "size": 50} for i in range(1000)],
+                    "next_page_token": "next_tok_1",
+                }
+            else:
+                return {
+                    "files": [{"id": f"p_{i}", "name": f"pik_{i}.bin", "kind": "drive#file", "size": 50} for i in range(1000, 1050)],
+                    "next_page_token": "",
+                }
+
+    monkeypatch.setattr("src.providers.pikpak.PikPakSession", lambda creds: MockSession())
+
+    res = asyncio.run(provider.list_files({}, "folder_id"))
+    assert len(res["items"]) == 1050
+    assert pages_requested == ["", "next_tok_1"]

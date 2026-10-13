@@ -234,8 +234,24 @@ class TeraBoxProvider(BaseProvider):
         s = TeraBoxSession(credentials)
         try:
             await s.ready()
-            data = await s.request_json("GET", f"{s.base}/api/list", context=f"list {path_or_id}", params=s.params(order="time", desc=1, dir=path_or_id or "/", num=1000, page=1, showempty=0), headers=s.headers())
-            return {"items": [{"id": i.get("path"), "path": i.get("path"), "name": i.get("server_filename"), "type": "folder" if i.get("isdir") else "file", "size": i.get("size", 0)} for i in data.get("list") or []]}
+            items: list[dict[str, Any]] = []
+            page = 1
+            page_size = 1000
+            while True:
+                data = await s.request_json("GET", f"{s.base}/api/list", context=f"list {path_or_id} page={page}", params=s.params(order="time", desc=1, dir=path_or_id or "/", num=page_size, page=page, showempty=0), headers=s.headers())
+                page_items = data.get("list") or []
+                for i in page_items:
+                    items.append({
+                        "id": i.get("path"),
+                        "path": i.get("path"),
+                        "name": i.get("server_filename"),
+                        "type": "folder" if i.get("isdir") else "file",
+                        "size": i.get("size", 0),
+                    })
+                if len(page_items) < page_size:
+                    break
+                page += 1
+            return {"items": items}
         finally:
             await s.aclose()
 
