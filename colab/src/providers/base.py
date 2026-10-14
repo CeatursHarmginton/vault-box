@@ -384,6 +384,8 @@ async def stream_download(
         url = str(fresh["url"])
         if fresh.get("headers"):
             headers = dict(fresh["headers"])
+    if dest.is_dir():
+        dest = dest / part.stem
     part.replace(dest)
     return dest
 

@@ -206,7 +206,7 @@ class PikPakProvider(BaseProvider):
         url = info.get("web_content_link") or ((info.get("medias") or [{}])[0].get("link") or {}).get("url")
         if not url:
             raise ProviderFailure("DOWNLOAD_FAILED", "PikPak did not return download url")
-        dest = local_path if local_path.suffix else local_path / safe_name(file_ref.get("name") or info.get("name") or fid)
+        dest = (local_path / safe_name(file_ref.get("name") or info.get("name") or fid)) if (local_path.is_dir() or not local_path.suffix) else local_path
         progress.set(step="downloading", current_file=dest.name)
         return await stream_download(str(url), dest, progress)
 

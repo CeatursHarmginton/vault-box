@@ -311,7 +311,7 @@ class TeraBoxProvider(BaseProvider):
         file_ref["path"] = path
         meta = await self._dlink(s, path)
         name = file_ref.get("name") or meta.get("server_filename") or PurePosixPath(path).name
-        dest = local_path if local_path.suffix else local_path / safe_name(name)
+        dest = (local_path / safe_name(name)) if (local_path.is_dir() or not local_path.suffix) else local_path
         progress.set(step="downloading", current_file=dest.name)
 
         def dl_headers() -> dict[str, str]:

@@ -444,6 +444,7 @@ class DriveProvider(BaseProvider):
                             "id": fid,
                             "name": name,
                             "type": "folder" if mime == FOLDER_MIME else "file",
+                            "is_folder": mime == FOLDER_MIME,
                             "mimeType": mime,
                             "size": size,
                             "modifiedTime": modified_ms,
@@ -473,6 +474,7 @@ class DriveProvider(BaseProvider):
                             "id": it.get("id"),
                             "name": it.get("title") or it.get("name"),
                             "type": "folder" if it.get("mimeType") == FOLDER_MIME else "file",
+                            "is_folder": it.get("mimeType") == FOLDER_MIME,
                             "mimeType": it.get("mimeType"),
                             "size": int(it.get("fileSize") or 0) if it.get("fileSize") else 0,
                             "modifiedTime": it.get("modifiedDate") or it.get("modified_date_millis"),
@@ -503,6 +505,7 @@ class DriveProvider(BaseProvider):
                     "id": f["id"],
                     "name": f["name"],
                     "type": "folder" if f.get("mimeType") == FOLDER_MIME else "file",
+                    "is_folder": f.get("mimeType") == FOLDER_MIME,
                     "mimeType": f.get("mimeType"),
                     "size": f.get("size"),
                 })
@@ -518,7 +521,7 @@ class DriveProvider(BaseProvider):
             src = self._mount_path(file_ref)
             if not src.is_file():
                 raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Drive mounted file path not found")
-            dest = local_path if local_path.suffix else local_path / safe_name(file_ref.get("name") or src.name)
+            dest = (local_path / safe_name(file_ref.get("name") or src.name)) if (local_path.is_dir() or not local_path.suffix) else local_path
             dest.parent.mkdir(parents=True, exist_ok=True)
             progress.set(step="downloading", current_file=dest.name)
             await asyncio.to_thread(shutil.copy2, src, dest)
@@ -532,12 +535,12 @@ class DriveProvider(BaseProvider):
         if self._web_session(credentials):
             info = await self._web_download_info(credentials, fid)
             name = file_ref.get("name") or info.get("name") or fid
-            local_path = local_path if local_path.suffix else local_path / safe_name(name)
-            progress.set(step="downloading", current_file=local_path.name)
+            dest = (local_path / safe_name(name)) if (local_path.is_dir() or not local_path.suffix) else local_path
+            progress.set(step="downloading", current_file=dest.name)
             try:
                 return await stream_download(
                     info["url"],
-                    local_path,
+                    dest,
                     progress,
                     headers=self._web_headers(credentials, auth=False),
                     cookies=self._cookie_jar(credentials),
@@ -549,23 +552,23 @@ class DriveProvider(BaseProvider):
                 info = await self._web_download_info(credentials, fid)
                 return await stream_download(
                     info["url"],
-                    local_path,
+                    dest,
                     progress,
                     headers=self._web_headers(credentials, auth=False),
                     cookies=self._cookie_jar(credentials),
                 )
         meta = (await self._request(credentials, "GET", f"{DRIVE_API}/files/{fid}", params={"fields": FIELDS, "supportsAllDrives": "true"})).json()
         name = file_ref.get("name") or meta.get("name") or fid
-        local_path = local_path if local_path.suffix else local_path / safe_name(name)
+        dest = (local_path / safe_name(name)) if (local_path.is_dir() or not local_path.suffix) else local_path
         if str(meta.get("mimeType") or "").startswith("application/vnd.google-apps."):
             export_mime, ext = ("application/pdf", ".pdf")
             url = f"{DRIVE_API}/files/{fid}/export?{urlencode({'mimeType': export_mime})}"
-            if not local_path.name.endswith(ext):
-                local_path = local_path.with_name(local_path.name + ext)
+            if not dest.name.endswith(ext):
+                dest = dest.with_name(dest.name + ext)
         else:
             url = f"{DRIVE_API}/files/{fid}?alt=media&supportsAllDrives=true"
-        progress.set(step="downloading", current_file=local_path.name)
-        return await stream_download(url, local_path, progress, headers=self._headers(credentials))
+        progress.set(step="downloading", current_file=dest.name)
+        return await stream_download(url, dest, progress, headers=self._headers(credentials))
 
     async def upload_file(self, credentials: dict[str, Any], local_path: Path, target_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:
         if self._use_mount(credentials):
