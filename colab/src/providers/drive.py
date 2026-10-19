@@ -269,47 +269,49 @@ class DriveProvider(BaseProvider):
             cookies = {k: v.value for k, v in sc.items()}
             credentials["cookies"] = cookies
         if isinstance(cookies, dict):
+            skip_attrs = {"domain", "path", "expires", "max-age", "samesite", "httponly", "secure", "priority", "partitioned"}
             for sc_hdr in set_cookies:
                 for chunk in sc_hdr.split(";"):
                     chunk = chunk.strip()
                     if "=" in chunk:
                         k, v = chunk.split("=", 1)
                         k = k.strip()
-                        if k and not k.lower().startswith(("domain", "path", "expires", "max-age", "samesite", "httponly", "secure")):
+                        if k and k.lower() not in skip_attrs and not k.lower().startswith(("domain", "path", "expires", "max-age")):
                             cookies[k] = v.strip()
 
     async def _refresh_web_session(self, credentials: dict[str, Any]) -> bool:
         """Refresh browser-session cookies inside the Colab job only."""
         try:
-            client = self._client()
-            for url, auth in (
-                (f"{DRIVE_WEB_ORIGIN}/drive/my-drive", True),
-                (f"{DRIVE_USERCONTENT}/auth_warmup", False),
-            ):
-                try:
-                    resp = await self._send_request(
-                        client,
-                        "GET",
-                        url,
-                        headers=self._web_headers(credentials, auth=auth),
-                        follow_redirects=True,
-                        timeout=15.0,
-                    )
-                    self._update_cookies_from_response(credentials, resp)
-                except Exception:
-                    pass
+            # Use isolated client so cookies from account A don't bleed into account B
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                for url, auth in (
+                    (f"{DRIVE_WEB_ORIGIN}/drive/my-drive", True),
+                    (f"{DRIVE_USERCONTENT}/auth_warmup", False),
+                ):
+                    try:
+                        resp = await self._send_request(
+                            client,
+                            "GET",
+                            url,
+                            headers=self._web_headers(credentials, auth=auth),
+                            follow_redirects=True,
+                            timeout=15.0,
+                        )
+                        self._update_cookies_from_response(credentials, resp)
+                    except Exception:
+                        pass
 
-            key = self._web_key(credentials)
-            resp = await self._send_request(
-                client,
-                "GET",
-                f"{DRIVE_WEB_FILES_API}/about",
-                headers=self._web_headers(credentials),
-                params={"key": key, "$unique": "gc"} if key else {},
-                timeout=15.0,
-            )
-            self._update_cookies_from_response(credentials, resp)
-            return resp.status_code < 400
+                key = self._web_key(credentials)
+                resp = await self._send_request(
+                    client,
+                    "GET",
+                    f"{DRIVE_WEB_FILES_API}/about",
+                    headers=self._web_headers(credentials),
+                    params={"key": key, "$unique": "gc"} if key else {},
+                    timeout=15.0,
+                )
+                self._update_cookies_from_response(credentials, resp)
+                return resp.status_code < 400
         except Exception:
             return False
 
