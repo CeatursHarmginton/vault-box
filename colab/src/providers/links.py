@@ -1373,7 +1373,10 @@ class LinksProvider(BaseProvider):
         is_direct_stream = any(k in url.lower() for k in (".m3u8", ".mpd", "m3u8"))
         if is_direct_stream:
             cmd.extend(["--downloader", "dash,m3u8:native"])
-            cmd.append("--abort-on-unavailable-fragment")
+            if options.get("skip_broken_segments") or options.get("skipBrokenSegments") or options.get("skip_failed_segments"):
+                cmd.append("--skip-unavailable-fragments")
+            else:
+                cmd.append("--abort-on-unavailable-fragment")
 
         # Clean any 0-byte or corrupted fragment files left from interrupted downloads
         for stray_frag in stage_dir.glob("*.part-Frag*"):

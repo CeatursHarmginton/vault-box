@@ -20,10 +20,20 @@ try:
     from ..config import IS_KAGGLE
 except Exception:
     IS_KAGGLE = bool(
-        os.environ.get("KAGGLE_KERNEL_RUN_TYPE")
-        or os.environ.get("KAGGLE_CONTAINER_NAME")
-        or os.environ.get("KAGGLE_URL_BASE")
-        or Path("/kaggle").exists()
+        os.environ.get("VAULTBOX_ENV", "").strip().lower() == "kaggle"
+        or (
+            (
+                os.environ.get("KAGGLE_KERNEL_RUN_TYPE")
+                or os.environ.get("KAGGLE_CONTAINER_NAME")
+                or os.environ.get("KAGGLE_URL_BASE")
+                or (Path("/kaggle/working").is_dir() and not Path("/content").is_dir())
+            )
+            and not (
+                "google.colab" in sys.modules
+                or os.environ.get("COLAB_RELEASE_TAG")
+                or Path("/content").is_dir()
+            )
+        )
     )
 
 DEFAULT_CHUNK_SEGMENTS = 150
@@ -609,14 +619,37 @@ async def run_resumable_backup_pipeline(
         parts_local_dir.mkdir(parents=True, exist_ok=True)
         segs_local_dir.mkdir(parents=True, exist_ok=True)
 
+    skip_broken_segments = bool(
+        options.get("skip_broken_segments")
+        or options.get("skipBrokenSegments")
+        or options.get("skip_failed_segments")
+        or options.get("skipFailedSegments")
+    )
+    raw_max_skipped = (
+        options.get("max_skipped_segments")
+        if options.get("max_skipped_segments") is not None
+        else options.get("maxSkippedSegments")
+    )
+    try:
+        max_skipped_segments = int(raw_max_skipped) if raw_max_skipped is not None and str(raw_max_skipped).strip() != "" else 0
+    except (ValueError, TypeError):
+        max_skipped_segments = 0
+
+    skipped_segment_indices: list[int] = []
+    skipped_segments_count = 0
+
     if folder_manifest_data:
         completed_parts = folder_manifest_data.get("completed_parts") or []
         last_synced_seg = max((cp.get("end_seg", -1) for cp in completed_parts), default=-1)
         existing_remote_part_names.update(cp.get("file_name") for cp in completed_parts if cp.get("file_name"))
+        for sk in folder_manifest_data.get("skipped_segments") or []:
+            if sk not in skipped_segment_indices:
+                skipped_segment_indices.append(sk)
+        skipped_segments_count = len(skipped_segment_indices)
         total_segments_expected = int(folder_manifest_data.get("total_segments_expected") or 0)
         is_already_complete = (
             folder_manifest_data.get("is_complete") is True
-            or (total_segments_expected > 0 and sum(cp.get("segment_count", 0) for cp in completed_parts) >= total_segments_expected)
+            or (total_segments_expected > 0 and (sum(cp.get("segment_count", 0) for cp in completed_parts) + skipped_segments_count) >= total_segments_expected)
         )
     else:
         is_already_complete = False
@@ -874,8 +907,13 @@ async def run_resumable_backup_pipeline(
                                 if p_name in existing_remote_part_names:
                                     completed_parts.append(cp)
                                     last_synced_seg = max(last_synced_seg, cp.get("end_seg", -1))
+                            for sk in manifest_data.get("skipped_segments") or []:
+                                if sk not in skipped_segment_indices:
+                                    skipped_segment_indices.append(sk)
+                            skipped_segments_count = len(skipped_segment_indices)
                             manifest_loaded = True
-                            job.log(f"[Resume-Manifest] Đọc manifest thành công: {len(completed_parts)} part xác nhận.")
+                            skip_txt = f", {skipped_segments_count} segment đã bỏ qua" if skipped_segments_count > 0 else ""
+                            job.log(f"[Resume-Manifest] Đọc manifest thành công: {len(completed_parts)} part xác nhận{skip_txt}.")
                     except Exception as exc:
                         job.log(f"[Resume-Manifest] Không thể đọc manifest, dùng file listing thay thế: {exc}")
 
@@ -989,7 +1027,7 @@ async def run_resumable_backup_pipeline(
 
     async def _upload_manifest() -> None:
         """Build and upload _resume_manifest.json to remote backup folder (with replace)."""
-        is_done = (sum(cp.get("segment_count", 0) for cp in completed_parts) >= total_segments) if total_segments else False
+        is_done = ((sum(cp.get("segment_count", 0) for cp in completed_parts) + len(skipped_segment_indices)) >= total_segments) if total_segments else False
         manifest = {
             "version": 1,
             "transfer_strategy": "backup_resume",
@@ -1006,6 +1044,8 @@ async def run_resumable_backup_pipeline(
             "total_segments_expected": total_segments,
             "completed_parts": sorted(completed_parts, key=lambda x: x["part_index"]),
             "last_synced_segment": max((cp["end_seg"] for cp in completed_parts), default=-1),
+            "skipped_segments": list(skipped_segment_indices),
+            "skipped_segments_count": len(skipped_segment_indices),
             "is_complete": is_done,
             "all_parts_uploaded": is_done,
             "final_assembly_skipped": bool(skip_final_assembly),
@@ -1262,23 +1302,48 @@ async def run_resumable_backup_pipeline(
                         await asyncio.sleep(2.0 * (recovery_round + 1))
 
                 if seg_sz is None:
-                    raise ProviderFailure("DOWNLOAD_FAILED", f"Failed to download segment {seg['index']} after all recovery rounds: {last_seg_err}") from last_seg_err
-                accumulated_bytes += seg_sz
-                cur_batch_segments.append(seg)
-                cur_batch_paths.append(seg_file)
-                total_downloaded_segs += 1
+                    can_skip = False
+                    if skip_broken_segments:
+                        if max_skipped_segments <= 0 or (skipped_segments_count < max_skipped_segments):
+                            can_skip = True
+
+                    if can_skip:
+                        skipped_segments_count += 1
+                        skipped_segment_indices.append(seg["index"])
+                        seg_file.unlink(missing_ok=True)
+                        limit_str = f"giới hạn {max_skipped_segments}" if max_skipped_segments > 0 else "không giới hạn"
+                        job.log(
+                            f"[Backup-Resume] [Skip-Segment] Bỏ qua segment lỗi {seg['index']} sau khi đã dùng hết số lần retry. "
+                            f"(Đã skip {skipped_segments_count} segment - {limit_str}). Tiếp tục tải các segment khác..."
+                        )
+                    else:
+                        if skip_broken_segments and max_skipped_segments > 0 and skipped_segments_count >= max_skipped_segments:
+                            raise ProviderFailure(
+                                "DOWNLOAD_FAILED",
+                                f"Tải segment {seg['index']} thất bại và đã đạt giới hạn tối đa số segment lỗi cho phép ({max_skipped_segments}): {last_seg_err}"
+                            ) from last_seg_err
+                        raise ProviderFailure(
+                            "DOWNLOAD_FAILED",
+                            f"Failed to download segment {seg['index']} after all recovery rounds: {last_seg_err}"
+                        ) from last_seg_err
+                else:
+                    accumulated_bytes += seg_sz
+                    cur_batch_segments.append(seg)
+                    cur_batch_paths.append(seg_file)
+                    total_downloaded_segs += 1
 
                 # Progress logging every 50 segments
-                if total_downloaded_segs % 50 == 0 or seg["index"] == total_segments - 1:
-                    pct = (last_synced_seg + 1 + total_downloaded_segs) * 100 // total_segments
-                    job.log(f"[Download] {last_synced_seg + 1 + total_downloaded_segs}/{total_segments} segments ({pct}%) | {accumulated_bytes // (1024*1024)} MB tích lũy")
+                if (total_downloaded_segs + skipped_segments_count) % 50 == 0 or seg["index"] == total_segments - 1:
+                    pct = (last_synced_seg + 1 + total_downloaded_segs + skipped_segments_count) * 100 // total_segments
+                    skip_info = f", {skipped_segments_count} skipped" if skipped_segments_count > 0 else ""
+                    job.log(f"[Download] {last_synced_seg + 1 + total_downloaded_segs + skipped_segments_count}/{total_segments} segments ({pct}%{skip_info}) | {accumulated_bytes // (1024*1024)} MB tích lũy")
 
                 # Check threshold trigger
                 hit_seg_threshold = len(cur_batch_segments) >= chunk_segments
                 hit_mb_threshold = accumulated_bytes >= (chunk_mb * 1024 * 1024)
                 is_last_seg = (seg["index"] == total_segments - 1)
 
-                if hit_seg_threshold or hit_mb_threshold or is_last_seg:
+                if (hit_seg_threshold or hit_mb_threshold or is_last_seg) and cur_batch_segments:
                     # Determine part index — skip indices already used by completed parts
                     while any(cp["part_index"] == part_idx for cp in completed_parts):
                         part_idx += 1
@@ -1335,6 +1400,34 @@ async def run_resumable_backup_pipeline(
                             raise exc
                     active_upload_tasks = [t for t in active_upload_tasks if not t.done()]
 
+            if cur_batch_segments:
+                while any(cp["part_index"] == part_idx for cp in completed_parts):
+                    part_idx += 1
+
+                part_name = f"part_{part_idx:04d}.ts"
+                part_path = parts_local_dir / part_name
+                part_bytes = merge_segments_to_part(cur_batch_paths, part_path)
+
+                part_meta = {
+                    "part_index": part_idx,
+                    "file_name": part_name,
+                    "start_seg": cur_batch_segments[0]["index"],
+                    "end_seg": cur_batch_segments[-1]["index"],
+                    "segment_count": len(cur_batch_segments),
+                    "bytes": part_bytes,
+                }
+
+                for p in cur_batch_paths:
+                    p.unlink(missing_ok=True)
+
+                cur_batch_segments.clear()
+                cur_batch_paths.clear()
+                accumulated_bytes = 0
+
+                task = asyncio.create_task(_upload_part_worker(part_path, part_meta))
+                active_upload_tasks.append(task)
+                part_idx += 1
+
             # Wait for remaining background uploads after all segments downloaded
             if active_upload_tasks:
                 job.log(f"[Upload-Pipe] Đợi {len(active_upload_tasks)} upload task(s) còn lại hoàn tất...")
@@ -1347,11 +1440,13 @@ async def run_resumable_backup_pipeline(
 
 
     # 4. Check if all segments are covered before Final Assembly
-    total_synced = sum(cp.get("segment_count", 0) for cp in completed_parts)
+    total_synced = sum(cp.get("segment_count", 0) for cp in completed_parts) + len(skipped_segment_indices)
+    if not completed_parts:
+        raise ProviderFailure("DOWNLOAD_FAILED", "Không có segment nào tải thành công (toàn bộ segment bị lỗi hoặc bị bỏ qua).")
     if total_synced < total_segments:
         job.log(
             f"[Backup-Resume] Phiên này đã sao lưu {total_synced}/{total_segments} segments "
-            f"({len(completed_parts)} parts). Dữ liệu an toàn trên Cloud — hãy resume phiên tiếp để hoàn tất."
+            f"({len(completed_parts)} parts, {len(skipped_segment_indices)} skipped). Dữ liệu an toàn trên Cloud — hãy resume phiên tiếp để hoàn tất."
         )
         shutil.rmtree(job_work_dir, ignore_errors=True)
         # Return None for partial session; caller checks is not None
@@ -1360,8 +1455,9 @@ async def run_resumable_backup_pipeline(
     # If skip_final_assembly is active (due to space > 50% free disk, Kaggle limit, or option):
     if skip_final_assembly:
         total_synced_mb = sum(cp.get("bytes", 0) for cp in completed_parts) / (1024 * 1024)
+        skipped_str = f", {len(skipped_segment_indices)} segment đã bỏ qua" if skipped_segment_indices else ""
         job.log(
-            f"[Backup-Resume] [Space-Saver] 100% segments ({total_segments} segments, {len(completed_parts)} parts, ~{total_synced_mb:.1f} MB) "
+            f"[Backup-Resume] [Space-Saver] 100% segments ({total_segments} segments{skipped_str}, {len(completed_parts)} parts, ~{total_synced_mb:.1f} MB) "
             f"đã được sao lưu an toàn và hoàn chỉnh lên Cloud tại thư mục '{backup_folder_name}'! "
             f"Bỏ qua bước ghép video (Final Assembly) trên runtime để tiết kiệm không gian đĩa và tránh lỗi tràn bộ nhớ (Errno 28)."
         )
@@ -1370,7 +1466,8 @@ async def run_resumable_backup_pipeline(
         return job_work_dir / backup_folder_name
 
     # 5. Final Assembly: Concatenate all parts into final MP4
-    job.log(f"[Final-Assembly] 100% segments ({total_segments} segments) đã sao lưu lên Cloud! Bắt đầu ghép file hoàn chỉnh: {final_video_name}...")
+    skipped_str = f" ({len(skipped_segment_indices)} segment lỗi đã được bỏ qua)" if skipped_segment_indices else ""
+    job.log(f"[Final-Assembly] Hoàn tất 100% segments ({total_segments} segments{skipped_str})! Bắt đầu ghép file hoàn chỉnh: {final_video_name}...")
     final_output_path = job_work_dir / final_video_name
 
     # Download missing local parts for final concat

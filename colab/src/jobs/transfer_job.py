@@ -1166,7 +1166,16 @@ async def _run_backup_resume_batches(
     dl_concurrency = max(1, dl_concurrency)
     dl_sem = asyncio.Semaphore(dl_concurrency)
 
-    job.log(f"[Backup-Resume] Kích hoạt chế độ Sao lưu phân đoạn Resumable ({len(pipeline_items)} mục, song song: {dl_concurrency} items)")
+    skip_segs = options.get("skip_broken_segments") or options.get("skipBrokenSegments")
+    skip_msg = ""
+    if skip_segs:
+        max_sk = options.get("max_skipped_segments") or options.get("maxSkippedSegments")
+        try:
+            max_sk_str = f"tối đa {int(max_sk)}" if max_sk and int(max_sk) > 0 else "không giới hạn"
+        except (ValueError, TypeError):
+            max_sk_str = "không giới hạn"
+        skip_msg = f", bỏ qua segment lỗi: {max_sk_str}"
+    job.log(f"[Backup-Resume] Kích hoạt chế độ Sao lưu phân đoạn Resumable ({len(pipeline_items)} mục, song song: {dl_concurrency} items{skip_msg})")
 
     async def process_one_item(idx: int, item: dict[str, Any]) -> None:
         item_name = _item_name(item)

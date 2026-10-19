@@ -101,6 +101,8 @@ async def startup() -> None:
     heartbeat_task = asyncio.create_task(_keep_alive_heartbeat())
     if AUTO_STOP_ENABLED:
         autostop_task = asyncio.create_task(_autostop_watchdog())
+    else:
+        print(f"[*] [{ENV_NAME}] Auto-stop watchdog is DISABLED (Server will run continuously).", flush=True)
 
 def _drive_mounted() -> bool:
     return DRIVE_MOUNT_PATH.exists() and DRIVE_MOUNT_PATH.is_dir()

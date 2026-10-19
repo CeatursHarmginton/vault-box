@@ -2,27 +2,65 @@ from __future__ import annotations
 
 import os
 import secrets
+import sys
 from pathlib import Path
 
 NO_AUTH = os.environ.get("COLAB_NO_AUTH", "").lower() in {"1", "true", "yes"}
 
 # Environment auto-detection
 IS_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
-IS_KAGGLE = bool(
-    os.environ.get("KAGGLE_KERNEL_RUN_TYPE")
-    or os.environ.get("KAGGLE_CONTAINER_NAME")
-    or os.environ.get("KAGGLE_URL_BASE")
-    or Path("/kaggle").exists()
-)
-IS_COLAB = bool(
-    not IS_KAGGLE
-    and not IS_GITHUB_ACTIONS
-    and (
-        os.environ.get("COLAB_GPU") is not None
+
+_explicit_env = os.environ.get("VAULTBOX_ENV", "").strip().lower()
+if _explicit_env == "kaggle":
+    IS_KAGGLE = True
+    IS_COLAB = False
+elif _explicit_env in {"colab", "google_colab"}:
+    IS_KAGGLE = False
+    IS_COLAB = True
+else:
+    # 1. Colab markers: presence of google.colab module, Colab release/runtime tags, or Linux /content directory
+    _colab_markers = bool(
+        "google.colab" in sys.modules
+        or os.environ.get("COLAB_RELEASE_TAG") is not None
+        or os.environ.get("COLAB_BACKEND_VERSION") is not None
+        or os.environ.get("COLAB_GPU") is not None
+        or os.environ.get("COLAB_JUPYTER_IP") is not None
         or os.environ.get("GCS_READ_CACHE") is not None
-        or Path("/content").exists()
+        or (os.name != "nt" and Path("/content/sample_data").is_dir())
+        or (os.name != "nt" and Path("/content").is_dir() and not Path("/kaggle/working").is_dir())
     )
-)
+
+    # 2. Kaggle markers: Kaggle environment variables or /kaggle/working directory (without /content)
+    _kaggle_markers = bool(
+        os.environ.get("KAGGLE_KERNEL_RUN_TYPE") is not None
+        or os.environ.get("KAGGLE_CONTAINER_NAME") is not None
+        or os.environ.get("KAGGLE_URL_BASE") is not None
+        or os.environ.get("KAGGLE_DOCKER_IMAGE") is not None
+        or os.environ.get("KAGGLE_USER_SECRETS_TOKEN") is not None
+        or (os.name != "nt" and Path("/kaggle/working").is_dir() and not Path("/content").is_dir())
+    )
+
+    if not IS_GITHUB_ACTIONS and _colab_markers and not _kaggle_markers:
+        IS_COLAB = True
+        IS_KAGGLE = False
+    elif not IS_GITHUB_ACTIONS and _kaggle_markers and not _colab_markers:
+        IS_KAGGLE = True
+        IS_COLAB = False
+    elif not IS_GITHUB_ACTIONS and _colab_markers and _kaggle_markers:
+        # Conflict resolution between competing signals
+        if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or os.environ.get("KAGGLE_URL_BASE"):
+            IS_KAGGLE = True
+            IS_COLAB = False
+        elif "google.colab" in sys.modules or os.environ.get("COLAB_RELEASE_TAG") or os.environ.get("COLAB_BACKEND_VERSION"):
+            IS_COLAB = True
+            IS_KAGGLE = False
+        else:
+            IS_COLAB = False
+            IS_KAGGLE = False
+    else:
+        IS_COLAB = False
+        IS_KAGGLE = False
+
 IS_LOCAL = os.environ.get("COLAB_LOCAL") == "1" or NO_AUTH or (not IS_KAGGLE and not IS_COLAB and not IS_GITHUB_ACTIONS)
 ENV_NAME = "GitHub Actions" if IS_GITHUB_ACTIONS else ("Kaggle" if IS_KAGGLE else ("Colab" if IS_COLAB else "Local"))
 

@@ -36,7 +36,7 @@ from src.config import (  # noqa: E402
 
 is_local = os.environ.get("COLAB_LOCAL") == "1" or NO_AUTH or (not IS_KAGGLE and not IS_COLAB)
 
-if not is_local and os.name != "nt" and (Path("/content").exists() or Path("/kaggle").exists()):
+if not is_local and os.name != "nt" and (Path("/content").is_dir() or Path("/kaggle/working").is_dir() or IS_COLAB or IS_KAGGLE):
     try:
         import subprocess
         if (repo_root / ".git").exists():
@@ -152,7 +152,9 @@ if __name__ == "__main__":
         if AUTO_STOP_ENABLED:
             print(f"[+] Kaggle Auto-Stop: Active (Will automatically shutdown after {AUTO_STOP_IDLE_MINUTES}m idle without active jobs to save quota).", flush=True)
     elif IS_COLAB:
-        print("[+] Environment: Google Colab detected (Continuous keepalive active).", flush=True)
+        print("[+] Environment: Google Colab detected (Continuous keepalive active, auto-stop watchdog disabled).", flush=True)
+        if AUTO_STOP_ENABLED:
+            print(f"[*] Colab Auto-Stop: Enabled via COLAB_AUTO_STOP ({AUTO_STOP_IDLE_MINUTES}m idle).", flush=True)
     elif is_local:
         print("[+] Environment: Local PC worker.", flush=True)
         if NO_AUTH:
