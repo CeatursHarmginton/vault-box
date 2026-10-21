@@ -682,18 +682,14 @@ async def run_resumable_backup_pipeline(
         active_proxy: str | None = headers.pop("_active_proxy", None)
 
         def _ensure_socks_installed():
-            try:
-                import socksio
-            except ImportError:
-                import subprocess, sys
-                try:
-                    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "socksio", "httpx[socks]"], check=False)
-                except Exception:
-                    pass
+            from ..utils.http import ensure_socks_support
+            ensure_socks_support()
 
         def _make_http_client(proxy: str | None = None) -> httpx.AsyncClient:
             client_kw: dict[str, Any] = {"follow_redirects": True, "timeout": 25.0}
-            if proxy and "socks" not in proxy.lower():
+            if proxy:
+                if "socks" in str(proxy).lower():
+                    _ensure_socks_installed()
                 client_kw["proxy"] = proxy
             return httpx.AsyncClient(**client_kw)
 

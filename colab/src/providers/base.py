@@ -312,6 +312,9 @@ async def stream_download(
                     b"url expired", b'"errmsg"', b"<html", b"<!doctype html"
                 )
                 if proxy or cookies:
+                    if proxy and "socks" in str(proxy).lower():
+                        from ..utils.http import ensure_socks_support
+                        ensure_socks_support()
                     async with httpx.AsyncClient(cookies=cookies, proxy=proxy, timeout=httpx.Timeout(None, connect=30.0, read=DOWNLOAD_READ_TIMEOUT, write=60.0, pool=30.0), follow_redirects=True) as client:
                         async with client.stream("GET", url, headers=req_headers) as resp:
                             if resp.status_code in (401, 403):

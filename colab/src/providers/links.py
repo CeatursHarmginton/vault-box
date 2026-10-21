@@ -79,22 +79,22 @@ class LinksProvider(BaseProvider):
             except ImportError:
                 missing.append("cryptography")
 
-        try:
-            import socksio
-        except ImportError:
-            missing.extend(["socksio", "httpx[socks]"])
-            
         if missing:
             try:
                 subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q'] + missing)
             except Exception:
                 pass
-            
+
+        from ..utils.http import ensure_socks_support
+        ensure_socks_support()
+
         cls._deps_checked = True
 
     @classmethod
     async def _ensure_tor_proxy(cls, progress: JobState | None = None) -> str | None:
         """Set up Tor as SOCKS5 proxy on 127.0.0.1:9050 (pure TCP, works 100% in Colab)."""
+        from ..utils.http import ensure_socks_support
+        ensure_socks_support()
         global _proxy_ready, PROXY_SETUP_LOCK
         import socket
 
@@ -296,6 +296,9 @@ class LinksProvider(BaseProvider):
             except Exception as cffi_exc:
                 try:
                     cks = session_cookies if use_cookies else None
+                    if active_px and "socks" in str(active_px).lower():
+                        from ..utils.http import ensure_socks_support
+                        ensure_socks_support()
                     with httpx.Client(follow_redirects=True, timeout=25.0, proxy=active_px, cookies=cks) as client:
                         if post_data is not None:
                             r = client.post(target_url, content=post_data if isinstance(post_data, (bytes, str)) else json.dumps(post_data), headers=hdrs)
@@ -641,6 +644,9 @@ class LinksProvider(BaseProvider):
         timeout = httpx.Timeout(connect=30.0, read=45.0, write=30.0, pool=60.0)
         client_kwargs: dict[str, Any] = {"follow_redirects": True, "timeout": timeout, "limits": limits}
         if proxy:
+            if "socks" in str(proxy).lower():
+                from ..utils.http import ensure_socks_support
+                ensure_socks_support()
             client_kwargs["proxy"] = proxy
 
         async with _base_mod.httpx.AsyncClient(**client_kwargs) as client:

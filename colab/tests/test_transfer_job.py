@@ -4939,3 +4939,21 @@ def test_pikpak_provider_list_files_pagination(monkeypatch):
     res = asyncio.run(provider.list_files({}, "folder_id"))
     assert len(res["items"]) == 1050
     assert pages_requested == ["", "next_tok_1"]
+
+
+def test_ensure_socks_support_recovers_httpcore_stubs():
+    from src.utils.http import ensure_socks_support
+    import sys, httpcore, httpx
+
+    # Simulate httpcore being imported without socksio
+    sys.modules['httpcore._async.socks_proxy'] = None
+    sys.modules['httpcore._sync.socks_proxy'] = None
+
+    # Call ensure_socks_support to test self-healing
+    assert ensure_socks_support() is True
+
+    # Test that httpx can initialize both sync and async clients with socks5 proxy
+    c_sync = httpx.Client(proxy='socks5://127.0.0.1:9050')
+    c_async = httpx.AsyncClient(proxy='socks5://127.0.0.1:9050')
+    assert c_sync is not None
+    assert c_async is not None
