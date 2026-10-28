@@ -236,6 +236,8 @@ class DriveProvider(BaseProvider):
         return {"Authorization": f"Bearer {self._token(c)}", **(extra or {})}
 
     async def _send_request(self, client: Any, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        if hasattr(client, "cookies") and hasattr(client.cookies, "clear"):
+            client.cookies.clear()
         fn = getattr(client, method.lower(), None)
         if callable(fn):
             return await fn(url, **kwargs)
@@ -311,6 +313,9 @@ class DriveProvider(BaseProvider):
                     timeout=15.0,
                 )
                 self._update_cookies_from_response(credentials, resp)
+                resp_url = str(getattr(resp, "url", "") or "")
+                if "accounts.google.com" in resp_url or "ServiceLogin" in resp_url:
+                    return False
                 return resp.status_code < 400
         except Exception:
             return False
@@ -358,7 +363,7 @@ class DriveProvider(BaseProvider):
 
             # 2. Try Bearer token if available
             bearer_token = str(credentials.get("web_access_token") or credentials.get("access_token") or credentials.get("token") or "")
-            if bearer_token and not bearer_token.lower().startswith("sapisidhash "):
+            if bearer_token and not bearer_token.lower().startswith("sapisidhash"):
                 bearer_headers = self._web_headers(credentials, extra_headers)
                 bearer_headers["Authorization"] = f"Bearer {bearer_token}"
                 resp = await self._send_request(client, method, url, headers=bearer_headers, params=params, **kwargs)

@@ -1125,6 +1125,7 @@ async def run_resumable_backup_pipeline(
         an expired/revoked Drive web session (401/403), the provider's session is
         refreshed and the upload retried up to 3 times before giving up.
         """
+        nonlocal target_creds, target_folder, dst_provider, backup_folder_id
         p_name = part_file.name
         size_mb = p_meta['bytes'] / (1024 * 1024)
 
@@ -1137,70 +1138,80 @@ async def run_resumable_backup_pipeline(
             return
 
         job.log(f"[Trace] Phân đoạn mới: {p_name} ({p_meta['segment_count']} segments, {size_mb:.1f} MB) -> Đang upload lên Cloud đích...")
-        target_ref = {
-            "id": target_folder,
-            "path": target_folder,
-            "relative_path": f"{backup_folder_name}/{p_name}",
-        }
 
         max_upload_retries = 3
         last_upload_err: Exception | None = None
-        for upload_attempt in range(max_upload_retries):
+        upload_attempt = 0
+        while upload_attempt < max_upload_retries:
+            upload_attempt += 1
             try:
                 target_creds = target.get("credentials") or {}
+                cur_folder = str((target.get("folder") or {}).get("id") or (target.get("folder") or {}).get("path") or "/")
+                if cur_folder.startswith("id:"):
+                    cur_folder = cur_folder[3:].strip()
+                target_folder = cur_folder
+                dst_provider = PROVIDERS.get(str(target.get("provider") or "").lower(), dst_provider)
+                target_ref = {
+                    "id": target_folder,
+                    "path": target_folder,
+                    "relative_path": f"{backup_folder_name}/{p_name}",
+                }
                 res = await dst_provider.upload_file(target_creds, part_file, target_ref, job)
+                job.error = None
                 break  # success
             except ProviderFailure as up_err:
                 last_upload_err = up_err
-                is_auth = up_err.code == "INVALID_PROVIDER_CREDENTIALS" or "session expired" in str(up_err).lower() or "revoked" in str(up_err).lower()
-                is_retryable = is_auth or up_err.code == "UPLOAD_FAILED" and int((up_err.details or {}).get("status") or 0) in (401, 403, 429, 500, 502, 503)
-
-                if not is_retryable or upload_attempt >= max_upload_retries - 1:
-                    raise
-
-                job.log(
-                    f"[Upload-Retry] Upload {p_name} thất bại (lần {upload_attempt + 1}/{max_upload_retries}): {up_err}. "
-                    f"Đang kiểm tra và làm mới web session..."
+                is_auth = (
+                    up_err.code in ("INVALID_PROVIDER_CREDENTIALS", "PROVIDER_TOKEN_EXPIRED")
+                    or "session expired" in str(up_err).lower()
+                    or "revoked" in str(up_err).lower()
+                )
+                is_retryable = is_auth or (
+                    up_err.code == "UPLOAD_FAILED"
+                    and int((up_err.details or {}).get("status") or 0) in (0, 401, 403, 429, 500, 502, 503)
                 )
 
-                refreshed = False
-                # Attempt to refresh the Drive web session on the dst_provider
-                if hasattr(dst_provider, "_refresh_web_session"):
-                    try:
-                        refreshed = await dst_provider._refresh_web_session(target_creds)
-                        if refreshed:
-                            job.log(f"[Upload-Retry] Đã refresh Drive web session thành công.")
-                        else:
-                            job.log(f"[Upload-Retry] Drive web session đã hết hạn hoặc bị thu hồi trên Google.")
-                    except Exception as ref_err:
-                        job.log(f"[Upload-Retry] Refresh web session thất bại: {ref_err}")
-                elif hasattr(dst_provider, "_web_request"):
-                    try:
-                        val = await dst_provider.validate_credentials(target_creds)
-                        refreshed = bool(val and val.get("ok"))
-                        if refreshed:
-                            job.log(f"[Upload-Retry] Đã validate lại credentials thành công.")
-                    except Exception:
-                        refreshed = False
+                if not is_retryable:
+                    raise
 
-                # If the session is truly revoked/expired and local probe failed, request fresh credentials from Relay/App
-                if is_auth and not refreshed:
-                    try:
+                # When is_auth is True or retries are exhausted, prompt user for fresh account/credentials
+                if is_auth or upload_attempt >= max_upload_retries:
+                    refreshed = False
+                    if not is_auth and hasattr(dst_provider, "_refresh_web_session"):
+                        try:
+                            refreshed = await dst_provider._refresh_web_session(target_creds)
+                        except Exception:
+                            refreshed = False
+                    if not refreshed:
                         from .transfer_job import _wait_for_retry_account
+                        old_acc = str(target.get("accountId") or target.get("account_id") or (target.get("credentials") or {}).get("account_id") or "")
+                        old_prov = str(target.get("provider") or "").lower()
                         await _wait_for_retry_account(job, target, up_err)
                         target_creds = target.get("credentials") or {}
+                        new_acc = str(target.get("accountId") or target.get("account_id") or target_creds.get("account_id") or "")
+                        new_prov = str(target.get("provider") or "").lower()
+                        dst_provider = PROVIDERS.get(new_prov, dst_provider)
+                        cur_folder = str((target.get("folder") or {}).get("id") or (target.get("folder") or {}).get("path") or "/")
+                        if cur_folder.startswith("id:"):
+                            cur_folder = cur_folder[3:].strip()
+                        target_folder = cur_folder
+                        if new_acc != old_acc or (new_prov and new_prov != old_prov):
+                            backup_folder_id = None
+                        upload_attempt = 0
                         job.log(f"[Upload-Retry] Đã nhận thông tin xác thực mới từ hệ thống. Tiếp tục upload {p_name}...")
                         continue
-                    except Exception:
-                        raise
 
-                await asyncio.sleep(min(2 ** upload_attempt, 8))
+                job.log(
+                    f"[Upload-Retry] Upload {p_name} thất bại (lần {upload_attempt}/{max_upload_retries}): {up_err}. "
+                    f"Đang thử lại..."
+                )
+                await asyncio.sleep(min(2 ** (upload_attempt - 1), 8))
             except (httpx.HTTPError, OSError) as net_err:
                 last_upload_err = net_err
-                if upload_attempt >= max_upload_retries - 1:
+                if upload_attempt >= max_upload_retries:
                     raise ProviderFailure("UPLOAD_FAILED", f"Network error uploading {p_name}: {net_err}")
-                job.log(f"[Upload-Retry] Lỗi mạng upload {p_name} (lần {upload_attempt + 1}/{max_upload_retries}): {net_err}. Thử lại...")
-                await asyncio.sleep(min(2 ** upload_attempt, 8))
+                job.log(f"[Upload-Retry] Lỗi mạng upload {p_name} (lần {upload_attempt}/{max_upload_retries}): {net_err}. Thử lại...")
+                await asyncio.sleep(min(2 ** (upload_attempt - 1), 8))
         else:
             raise ProviderFailure("UPLOAD_FAILED", f"Upload {p_name} thất bại sau {max_upload_retries} lần thử: {last_upload_err}")
 
@@ -1584,12 +1595,27 @@ async def run_resumable_backup_pipeline(
     job.log(f"[Final-Assembly] Ghép thành công video hoàn chỉnh ({final_size} bytes). Đang upload lên Cloud đích...")
 
     # Upload final MP4 to main target folder
-    target_final_ref = {
-        "id": target_folder,
-        "path": target_folder,
-        "relative_path": final_video_name,
-    }
-    await dst_provider.upload_file(target_creds, final_output_path, target_final_ref, job)
+    while True:
+        target_creds = target.get("credentials") or {}
+        cur_folder = str((target.get("folder") or {}).get("id") or (target.get("folder") or {}).get("path") or "/")
+        if cur_folder.startswith("id:"):
+            cur_folder = cur_folder[3:].strip()
+        target_folder = cur_folder
+        dst_provider = PROVIDERS.get(str(target.get("provider") or "").lower(), dst_provider)
+        target_final_ref = {
+            "id": target_folder,
+            "path": target_folder,
+            "relative_path": final_video_name,
+        }
+        try:
+            await dst_provider.upload_file(target_creds, final_output_path, target_final_ref, job)
+            job.error = None
+            break
+        except ProviderFailure as up_err:
+            if up_err.code not in ("UPLOAD_FAILED", "INVALID_PROVIDER_CREDENTIALS", "PROVIDER_TOKEN_EXPIRED"):
+                raise
+            from .transfer_job import _wait_for_retry_account
+            await _wait_for_retry_account(job, target, up_err)
     job.log(f"[Done] Đã lưu thành phẩm {final_video_name} vào thư mục đích trên Cloud!")
 
     # 6. Cleanup backup folder if auto_clean is enabled

@@ -4957,3 +4957,69 @@ def test_ensure_socks_support_recovers_httpcore_stubs():
     c_async = httpx.AsyncClient(proxy='socks5://127.0.0.1:9050')
     assert c_sync is not None
     assert c_async is not None
+
+
+
+def test_retry_upload_same_account_with_refreshed_credentials(tmp_path, monkeypatch):
+    dirs = {"input": tmp_path / "input", "output": tmp_path / "output"}
+    dirs["input"].mkdir()
+    dirs["output"].mkdir()
+    attempts = []
+
+    class Source:
+        async def download_file(self, credentials, item, local_dir, progress):
+            dest = local_dir / item["name"]
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text("payload")
+            return dest
+
+    class Dst:
+        async def upload_file(self, credentials, local_path, target_ref, progress):
+            attempts.append((credentials.get("account_id"), credentials.get("cookies", {}).get("SAPISID"), target_ref.get("id")))
+            if credentials.get("cookies", {}).get("SAPISID") != "fresh_sapisid":
+                raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked")
+            return {"ok": True}
+
+    monkeypatch.setattr(transfer_job_mod, "job_dirs", lambda job_id: dirs)
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "drive", Dst())
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "pikpak", Source())
+
+    payload = {
+        "source": {"provider": "pikpak", "items": [{"id": "s1", "name": "video.mp4", "type": "file", "size": 7}]},
+        "target": {
+            "provider": "drive",
+            "accountId": "acc_1",
+            "account_id": "acc_1",
+            "folder": {"id": "folder_on_acc_1", "path": "/MyFolder"},
+            "credentials": {"account_id": "acc_1", "auth_mode": "web_session", "cookies": {"SAPISID": "expired_sapisid"}},
+        },
+        "options": {"transfer_strategy": "file_by_file", "cleanupAfterFinish": True},
+    }
+    job = JobState("test-same-acc-retry", payload)
+
+    def confirm():
+        for _ in range(1000):
+            if job.status == "waiting_target_account":
+                job.payload.setdefault("target", {}).update({
+                    "provider": "drive",
+                    "accountId": "acc_1",
+                    "account_id": "acc_1",
+                    "credentials": {"account_id": "acc_1", "auth_mode": "web_session", "cookies": {"SAPISID": "fresh_sapisid"}},
+                })
+                job.confirm_action = "retry_upload"
+                job.confirm_event.set()
+                return
+            time.sleep(0.01)
+
+    thread = threading.Thread(target=confirm)
+    thread.start()
+    asyncio.run(run_transfer(job))
+    thread.join(timeout=2)
+
+    assert job.status == "completed"
+    assert job.error is None
+    assert job.files_uploaded == 1
+    assert attempts == [
+        ("acc_1", "expired_sapisid", "folder_on_acc_1"),
+        ("acc_1", "fresh_sapisid", "folder_on_acc_1"),
+    ]
