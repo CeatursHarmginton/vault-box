@@ -1215,26 +1215,13 @@ async def _run_backup_resume_batches(
                         # Fully completed: all segments backed up + merged + uploaded
                         job.files_downloaded += 1
                         job.files_uploaded += 1
-                        job.finish_item(item_k, status="done", name=item_name)
-                        timing = job.item_timings.get(item_k) or {}
-                        job.completed_items.append({
-                            **_queue_item_ref(source, item),
-                            "startTime": timing.get("startTime"),
-                            "endTime": timing.get("endTime"),
-                            "duration": timing.get("duration"),
-                        })
+                        job.uploaded_files.add(item_name)
+                        _finish_items(job, source, [item])
                         job.log(f"[Backup-Resume] Hoàn tất truyền tải file: {item_name}")
                     else:
                         # Partial session: segments backed up to cloud but not yet fully merged
                         job.files_downloaded += 1
-                        job.finish_item(item_k, status="done", name=item_name)
-                        timing = job.item_timings.get(item_k) or {}
-                        job.completed_items.append({
-                            **_queue_item_ref(source, item),
-                            "startTime": timing.get("startTime"),
-                            "endTime": timing.get("endTime"),
-                            "duration": timing.get("duration"),
-                        })
+                        _finish_items(job, source, [item])
                         job.log(f"[Backup-Resume] Phiên backup chưa hoàn tất, dữ liệu an toàn trên Cloud. Resume lần sau để tiếp tục: {item_name}")
                 except JobCancelled:
                     raise
@@ -1277,25 +1264,12 @@ async def _run_backup_resume_batches(
                             if final_file is not None:
                                 job.files_downloaded += 1
                                 job.files_uploaded += 1
-                                job.finish_item(item_k, status="done", name=item_name)
-                                timing = job.item_timings.get(item_k) or {}
-                                job.completed_items.append({
-                                    **_queue_item_ref(source, item),
-                                    "startTime": timing.get("startTime"),
-                                    "endTime": timing.get("endTime"),
-                                    "duration": timing.get("duration"),
-                                })
+                                job.uploaded_files.add(item_name)
+                                _finish_items(job, source, [item])
                                 job.log(f"[Backup-Resume] Hoàn tất truyền tải file sau retry: {item_name}")
                             else:
                                 job.files_downloaded += 1
-                                job.finish_item(item_k, status="done", name=item_name)
-                                timing = job.item_timings.get(item_k) or {}
-                                job.completed_items.append({
-                                    **_queue_item_ref(source, item),
-                                    "startTime": timing.get("startTime"),
-                                    "endTime": timing.get("endTime"),
-                                    "duration": timing.get("duration"),
-                                })
+                                _finish_items(job, source, [item])
                                 job.log(f"[Backup-Resume] Phiên backup chưa hoàn tất sau retry, dữ liệu an toàn trên Cloud: {item_name}")
                             break
                         except _ItemSkippedFailure as skip_err:
@@ -1392,17 +1366,27 @@ def _item_type(item: dict[str, Any]) -> str:
     return item.get("type") or ("folder" if item.get("is_folder") else "file")
 
 def _finish_items(job: JobState, source: dict[str, Any], items: list[dict[str, Any]]) -> None:
+    seen_completed = {
+        (str(entry.get("provider") or ""), str(entry.get("accountId") or entry.get("account_id") or ""), str(entry.get("id") or ""))
+        for entry in (job.completed_items or [])
+    }
     for item in items:
         item_k = _queue_item_key(source, item)
         name = _item_name(item)
+        ref = _queue_item_ref(source, item)
+        key = (str(ref.get("provider") or ""), str(ref.get("accountId") or ref.get("account_id") or ""), str(ref.get("id") or ""))
         job.finish_item(item_k, status="done", name=name)
         timing = job.item_timings.get(item_k) or {}
-        job.completed_items.append({
-            **_queue_item_ref(source, item),
-            "startTime": timing.get("startTime"),
-            "endTime": timing.get("endTime"),
-            "duration": timing.get("duration"),
-        })
+        if key not in seen_completed:
+            job.completed_items.append({
+                **ref,
+                "name": name,
+                "startTime": timing.get("startTime"),
+                "endTime": timing.get("endTime"),
+                "duration": timing.get("duration"),
+            })
+            seen_completed.add(key)
+    job.save_state()
 
 def _item_scope(source: dict[str, Any], item: dict[str, Any]) -> tuple[str, str]:
     provider = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
@@ -1490,25 +1474,95 @@ def _mark_remaining_items_completed(job: JobState, source: dict[str, Any]) -> No
             "duration": timing.get("duration"),
         })
 
+def _is_item_already_completed(job: JobState, source: dict[str, Any], item: dict[str, Any]) -> bool:
+    ref = _queue_item_ref(source, item)
+    prov = str(ref.get("provider") or "").lower()
+    acc = str(ref.get("accountId") or ref.get("account_id") or "")
+    ref_id = str(ref.get("id") or "")
+    ref_path = str(ref.get("path") or "")
+    item_k = _queue_item_key(source, item)
+    item_name = _item_name(item)
+    raw_name = str(item.get("name") or "").strip()
+
+    for entry in (job.completed_items or []):
+        e_prov = str(entry.get("provider") or "").lower()
+        e_acc = str(entry.get("accountId") or entry.get("account_id") or "")
+        e_id = str(entry.get("id") or "")
+        e_path = str(entry.get("path") or "")
+        e_name = str(entry.get("name") or "").strip()
+        if ref_id and e_id == ref_id and (not e_prov or not prov or e_prov == prov) and (not e_acc or not acc or e_acc == acc):
+            return True
+        if ref_path and e_path == ref_path and (not e_prov or not prov or e_prov == prov) and (not e_acc or not acc or e_acc == acc):
+            return True
+        if not ref_id and not ref_path and e_name and e_name.lower() in {item_name.lower(), raw_name.lower()}:
+            return True
+
+    for tk in (item_k, ref_id, ref_path, item_name, raw_name):
+        if tk and isinstance(job.item_timings.get(tk), dict) and job.item_timings[tk].get("status") == "done":
+            return True
+
+    item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
+    options = (job.payload or {}).get("options") or {}
+    is_extracted_archive = bool(options.get("extract")) and _is_archive_item(item)
+    if item_type != "folder" and not is_extracted_archive and job.uploaded_files:
+        uploaded_set = {str(u) for u in job.uploaded_files}
+        uploaded_basenames = {PurePosixPath(str(u).replace("\\", "/")).name for u in job.uploaded_files}
+        if item_name in uploaded_set or item_name in uploaded_basenames:
+            return True
+        if raw_name and (raw_name in uploaded_set or raw_name in uploaded_basenames):
+            return True
+
+    return False
+
 def _mark_remaining_items_failed(job: JobState, source: dict[str, Any], reason: str) -> None:
-    """Mark any uncompleted item as failed in job.failed_items when a job fails."""
-    seen = {(str(entry.get("provider") or ""), str(entry.get("accountId") or entry.get("account_id") or ""), str(entry.get("id") or "")) for entry in (*job.failed_items, *job.completed_items)}
+    """Mark any uncompleted item as failed in job.failed_items when a job fails or is cancelled."""
+    completed_keys = {
+        (str(entry.get("provider") or ""), str(entry.get("accountId") or entry.get("account_id") or ""), str(entry.get("id") or ""))
+        for entry in (job.completed_items or [])
+    }
+    failed_keys = {
+        (str(entry.get("provider") or ""), str(entry.get("accountId") or entry.get("account_id") or ""), str(entry.get("id") or ""))
+        for entry in (job.failed_items or [])
+    }
     for item in (source.get("items") or []):
         ref = _queue_item_ref(source, item)
         key = (str(ref.get("provider") or ""), str(ref.get("accountId") or ref.get("account_id") or ""), str(ref.get("id") or ""))
-        if key not in seen:
-            item_k = _queue_item_key(source, item)
-            job.finish_item(item_k, status="failed", name=_item_name(item))
+        item_k = _queue_item_key(source, item)
+        item_name = _item_name(item)
+
+        if key in completed_keys or _is_item_already_completed(job, source, item):
+            if key not in completed_keys:
+                job.finish_item(item_k, status="done", name=item_name)
+                timing = job.item_timings.get(item_k) or job.item_timings.get(item_name) or {}
+                job.completed_items.append({
+                    **ref,
+                    "name": item_name,
+                    "startTime": timing.get("startTime"),
+                    "endTime": timing.get("endTime"),
+                    "duration": timing.get("duration"),
+                })
+                completed_keys.add(key)
+            if key in failed_keys:
+                job.failed_items = [
+                    f for f in job.failed_items
+                    if (str(f.get("provider") or ""), str(f.get("accountId") or f.get("account_id") or ""), str(f.get("id") or "")) != key
+                ]
+                failed_keys.discard(key)
+            continue
+
+        if key not in failed_keys:
+            job.finish_item(item_k, status="failed", name=item_name)
             timing = job.item_timings.get(item_k) or {}
             job.failed_items.append({
                 **ref,
-                "name": _item_name(item),
+                "name": item_name,
                 "reason": reason,
                 "startTime": timing.get("startTime"),
                 "endTime": timing.get("endTime"),
                 "duration": timing.get("duration"),
             })
-            seen.add(key)
+            failed_keys.add(key)
+    job.active_files.clear()
 
 def _log_skip_summary(job: JobState) -> None:
     if not job.failed_items:
@@ -1531,8 +1585,13 @@ async def _upload_outputs(job: JobState, target: dict[str, Any], options: dict[s
         try:
             rel0 = files[0].relative_to(upload_root).as_posix() if upload_root != files[0] else files[0].name
             await _upload_path_with_retry(job, target, options, dst, files[0], rel0, item, shared_gate)
+            job.uploaded_files.add(rel0)
             job.finish_file(files[0].name, phase="upload", size=f0_sz)
             job.finish_item(files[0].name, status="done", name=files[0].name)
+            if not options.get("extract"):
+                src_ref_item = getattr(job, "_source_refs", {}).get(str(files[0].resolve()))
+                if src_ref_item and not src_ref_item.get("_parent_folder"):
+                    _finish_items(job, (job.payload or {}).get("source") or {}, [src_ref_item])
         except Exception:
             job.finish_file(files[0].name, phase="upload")
             raise
@@ -1567,6 +1626,10 @@ async def _upload_outputs(job: JobState, target: dict[str, Any], options: dict[s
                 job.save_state()
                 job.finish_file(path.name, phase="upload", size=file_sz)
                 job.finish_item(path.name, status="done", name=path.name)
+                if not options.get("extract"):
+                    src_ref_item = getattr(job, "_source_refs", {}).get(str(path.resolve()))
+                    if src_ref_item and not src_ref_item.get("_parent_folder"):
+                        _finish_items(job, (job.payload or {}).get("source") or {}, [src_ref_item])
             except Exception:
                 job.finish_file(path.name, phase="upload")
                 raise
@@ -1719,6 +1782,11 @@ async def _upload_one_with_retry(job: JobState, target: dict[str, Any], options:
                 job.save_state()
                 job.error = None
                 job.finish_file(path.name, phase="upload", size=file_sz)
+                job.finish_item(path.name, status="done", name=path.name)
+                if not options.get("extract"):
+                    src_ref_item = getattr(job, "_source_refs", {}).get(str(path.resolve()))
+                    if src_ref_item and not src_ref_item.get("_parent_folder"):
+                        _finish_items(job, (job.payload or {}).get("source") or {}, [src_ref_item])
                 job.log(f"[1/1] Uploaded: {path.name}")
                 return result
             except _ItemSkippedFailure as exc:
@@ -1945,10 +2013,13 @@ def _queue_item_ref(source: dict[str, Any], item: dict[str, Any]) -> dict[str, A
     account = item.get("accountId") or item.get("account_id") or (item.get("meta") or {}).get("accountId") or (item.get("meta") or {}).get("account_id") or source.get("accountId") or source.get("account_id")
     relay = item.get("relay") if isinstance(item.get("relay"), dict) else {}
     original = relay.get("sourcePath") or relay.get("sourceId")
+    item_id = original or item.get("id") or item.get("path") or item.get("url")
+    item_path = original or item.get("path") or item.get("id") or item.get("url")
     ref = {
         "provider": item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider"),
-        "id": original or item.get("id") or item.get("path"),
-        "path": original or item.get("path") or item.get("id"),
+        "id": item_id,
+        "path": item_path,
+        "name": item.get("name") or _item_name(item),
     }
     if account:
         ref["accountId"] = account
@@ -1960,7 +2031,7 @@ def _queue_item_key(source: dict[str, Any], item: dict[str, Any]) -> str:
     account = str(item.get("accountId") or item.get("account_id") or (item.get("meta") or {}).get("accountId") or (item.get("meta") or {}).get("account_id") or source.get("accountId") or source.get("account_id") or "")
     relay = item.get("relay") if isinstance(item.get("relay"), dict) else {}
     original = relay.get("sourcePath") or relay.get("sourceId")
-    item_id = str(original or item.get("id") or item.get("path") or item.get("name") or "")
+    item_id = str(original or item.get("id") or item.get("path") or item.get("url") or item.get("name") or "")
     return f"{provider}:{account}:{item_id}"
 
 def _is_video_item(item: dict[str, Any]) -> bool:

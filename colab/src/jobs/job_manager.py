@@ -119,6 +119,10 @@ class JobManager:
         if not job:
             return False
         job.cancel = True
+        source = (job.payload or {}).get("source") if isinstance(job.payload, dict) else {}
+        if isinstance(source, dict) and source.get("items"):
+            from .transfer_job import _mark_remaining_items_failed
+            _mark_remaining_items_failed(job, source, "Cancelled")
         job.status = "cancelled"
         job.step = "cancelled"
         job.save_state()

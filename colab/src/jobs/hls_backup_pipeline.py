@@ -521,6 +521,14 @@ async def run_resumable_backup_pipeline(
 
     chunk_segments = int(options.get("backup_chunk_segments") or DEFAULT_CHUNK_SEGMENTS)
     chunk_mb = int(options.get("backup_chunk_mb") or DEFAULT_CHUNK_MB)
+    raw_and_mode = options.get("backup_chunk_and_mode")
+    if raw_and_mode is None:
+        raw_and_mode = options.get("backupChunkAndMode")
+    if raw_and_mode is None and options.get("backup_chunk_mode") is not None:
+        raw_and_mode = str(options.get("backup_chunk_mode")).strip().lower() == "and"
+    if raw_and_mode is None and options.get("backupChunkMode") is not None:
+        raw_and_mode = str(options.get("backupChunkMode")).strip().lower() == "and"
+    chunk_and_mode = bool(raw_and_mode)
     auto_clean = bool(options.get("backup_auto_clean", True))
 
     is_source_links = (
@@ -607,7 +615,13 @@ async def run_resumable_backup_pipeline(
             final_video_name = generate_final_video_name(raw_target_name)
             chunk_segments = int(options.get("backup_chunk_segments") or folder_manifest_data.get("chunk_size_segments") or chunk_segments)
             chunk_mb = int(options.get("backup_chunk_mb") or folder_manifest_data.get("chunk_size_mb") or chunk_mb)
-            job.log(f"[Backup-Resume] Đọc manifest thành công: Video đích '{final_video_name}', URL gốc: {source_url[:60]}... (Ngưỡng cắt: {chunk_segments} segs / {chunk_mb} MB)")
+            if raw_and_mode is None:
+                if folder_manifest_data.get("chunk_and_mode") is not None:
+                    chunk_and_mode = bool(folder_manifest_data.get("chunk_and_mode"))
+                elif folder_manifest_data.get("chunk_condition_mode") is not None:
+                    chunk_and_mode = str(folder_manifest_data.get("chunk_condition_mode")).strip().lower() == "and"
+            cond_op_label = "VÀ (AND)" if chunk_and_mode else "HOẶC (OR)"
+            job.log(f"[Backup-Resume] Đọc manifest thành công: Video đích '{final_video_name}', URL gốc: {source_url[:60]}... (Ngưỡng cắt: {chunk_segments} segs {cond_op_label} {chunk_mb} MB)")
         else:
             final_video_name = generate_final_video_name(raw_name.replace("__backup_resume", ""))
     else:
@@ -723,16 +737,15 @@ async def run_resumable_backup_pipeline(
             except Exception:
                 pass
 
-        if links_resolver and hasattr(links_resolver, "_ensure_deps"):
-            try:
-                await links_resolver._ensure_deps()
-            except Exception:
-                pass
-
         async def _attempt_resolve_stream(target_u: str) -> bool:
             nonlocal resolved_url, active_proxy, cookies_str, page_url
             if not (links_resolver and hasattr(links_resolver, "_resolve_universal_page")):
                 return False
+            if hasattr(links_resolver, "_ensure_deps"):
+                try:
+                    await links_resolver._ensure_deps()
+                except Exception:
+                    pass
             ref_payload = {**file_item, "page_url": page_url or target_u, "headers": headers, "cookies": cookies_str}
             try:
                 fresh_res_url, _, fresh_hdrs = await links_resolver._resolve_universal_page(
@@ -874,7 +887,8 @@ async def run_resumable_backup_pipeline(
             raise ProviderFailure("INVALID_STREAM", f"Không tìm thấy segments trong playlist HLS: {resolved_url[:80]} ({err_msg})")
 
         total_segments = len(all_segments)
-        job.log(f"[Backup-Resume] Playlist hợp lệ: Tổng cộng {total_segments} segments (Ngưỡng cắt: {chunk_segments} segments hoặc {chunk_mb} MB/part)")
+        cond_word = "và (AND)" if chunk_and_mode else "hoặc (OR)"
+        job.log(f"[Backup-Resume] Playlist hợp lệ: Tổng cộng {total_segments} segments (Ngưỡng cắt: {chunk_segments} segments {cond_word} {chunk_mb} MB/part)")
 
         # 2. Check remote target backup folder for existing manifest or parts (Multi-session check)
         try:
@@ -1037,6 +1051,8 @@ async def run_resumable_backup_pipeline(
             "target_filename": final_video_name,
             "chunk_size_segments": chunk_segments,
             "chunk_size_mb": chunk_mb,
+            "chunk_and_mode": chunk_and_mode,
+            "chunk_condition_mode": "and" if chunk_and_mode else "or",
             "total_segments_expected": total_segments,
             "completed_parts": sorted(completed_parts, key=lambda x: x["part_index"]),
             "last_synced_segment": max((cp["end_seg"] for cp in completed_parts), default=-1),
@@ -1150,7 +1166,8 @@ async def run_resumable_backup_pipeline(
                 if cur_folder.startswith("id:"):
                     cur_folder = cur_folder[3:].strip()
                 target_folder = cur_folder
-                dst_provider = PROVIDERS.get(str(target.get("provider") or "").lower(), dst_provider)
+                if dst_provider is None:
+                    dst_provider = PROVIDERS.get(str(target.get("provider") or "").lower(), dst_provider)
                 target_ref = {
                     "id": target_folder,
                     "path": target_folder,
@@ -1345,12 +1362,13 @@ async def run_resumable_backup_pipeline(
                     skip_info = f", {skipped_segments_count} skipped" if skipped_segments_count > 0 else ""
                     job.log(f"[Download] {last_synced_seg + 1 + total_downloaded_segs + skipped_segments_count}/{total_segments} segments ({pct}%{skip_info}) | {accumulated_bytes // (1024*1024)} MB tích lũy")
 
-                # Check threshold trigger
+                # Check threshold trigger (OR by default: either condition met; AND when chunk_and_mode is enabled: both conditions must be met)
                 hit_seg_threshold = len(cur_batch_segments) >= chunk_segments
                 hit_mb_threshold = accumulated_bytes >= (chunk_mb * 1024 * 1024)
                 is_last_seg = (seg["index"] == total_segments - 1)
+                hit_chunk_threshold = (hit_seg_threshold and hit_mb_threshold) if chunk_and_mode else (hit_seg_threshold or hit_mb_threshold)
 
-                if (hit_seg_threshold or hit_mb_threshold or is_last_seg) and cur_batch_segments:
+                if (hit_chunk_threshold or is_last_seg) and cur_batch_segments:
                     # Determine part index — skip indices already used by completed parts
                     while any(cp["part_index"] == part_idx for cp in completed_parts):
                         part_idx += 1
@@ -1601,7 +1619,8 @@ async def run_resumable_backup_pipeline(
         if cur_folder.startswith("id:"):
             cur_folder = cur_folder[3:].strip()
         target_folder = cur_folder
-        dst_provider = PROVIDERS.get(str(target.get("provider") or "").lower(), dst_provider)
+        if dst_provider is None:
+            dst_provider = PROVIDERS.get(str(target.get("provider") or "").lower(), dst_provider)
         target_final_ref = {
             "id": target_folder,
             "path": target_folder,
@@ -1615,7 +1634,11 @@ async def run_resumable_backup_pipeline(
             if up_err.code not in ("UPLOAD_FAILED", "INVALID_PROVIDER_CREDENTIALS", "PROVIDER_TOKEN_EXPIRED"):
                 raise
             from .transfer_job import _wait_for_retry_account
+            old_prov = str(target.get("provider") or "").lower()
             await _wait_for_retry_account(job, target, up_err)
+            new_prov = str(target.get("provider") or "").lower()
+            if new_prov and new_prov != old_prov:
+                dst_provider = PROVIDERS.get(new_prov, dst_provider)
     job.log(f"[Done] Đã lưu thành phẩm {final_video_name} vào thư mục đích trên Cloud!")
 
     # 6. Cleanup backup folder if auto_clean is enabled
