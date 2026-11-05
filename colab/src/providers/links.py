@@ -3637,30 +3637,43 @@ class LinksProvider(BaseProvider):
             )
             if exp_val and str(exp_val).isdigit():
                 exp_ts = int(exp_val)
-                now_ts = int(time.time())
-                can_pre_resolve = page_url or (file_ref and file_ref.get("page_url"))
-                if exp_ts <= now_ts + 60 and can_pre_resolve:
-                    diff_m = max(1, (now_ts - exp_ts) // 60) if exp_ts < now_ts else 0
-                    msg_txt = f"Link token expired {diff_m} minute(s) ago" if exp_ts < now_ts else "Link token expires in < 1 minute"
-                    progress.log(f"[Auto-Resolve] {msg_txt}! Proactively resolving fresh stream URL and cookies from webpage...")
-                    try:
-                        ref_payload = {**(file_ref or {}), "page_url": page_url or (file_ref or {}).get("page_url")}
-                        fresh_url, _, fresh_hdrs = await self._resolve_universal_page(url, ref_payload, progress, proxy=proxy)
-                        if fresh_url and fresh_url != url:
-                            url = fresh_url
-                            if fresh_hdrs:
-                                headers.update(fresh_hdrs)
-                                if "Cookie" in fresh_hdrs:
-                                    cookies = fresh_hdrs["Cookie"]
-                            progress.log(f"[Auto-Resolve] Successfully acquired fresh stream URL and cookies before download!")
-                    except Exception as pre_err:
-                        progress.log(f"[Auto-Resolve] Preemptive token resolution notice: {pre_err}")
-                elif exp_ts < now_ts:
-                    diff_m = max(1, (now_ts - exp_ts) // 60)
-                    progress.log(f"[WARNING] Link token expired {diff_m} minute(s) ago! (Expires: {exp_ts}, Now: {now_ts}). If download fails with 410/403, please refresh the webpage and copy a fresh link.")
-                elif (exp_ts - now_ts) < 300:
-                    diff_m = max(1, (exp_ts - now_ts) // 60)
-                    progress.log(f"[WARNING] Link token will expire in ~{diff_m} minute(s)! Ensure download completes before expiration or copy a fresh link.")
+                if exp_ts < 1_000_000_000:
+                    start_val = (
+                        parsed_query.get("s", [None])[0]
+                        or parsed_query.get("st", [None])[0]
+                        or parsed_query.get("start", [None])[0]
+                    )
+                    if start_val and str(start_val).isdigit() and int(start_val) >= 1_000_000_000:
+                        exp_ts = int(start_val) + exp_ts
+                    else:
+                        exp_ts = 0
+                        exp_val = None
+                if exp_ts >= 1_000_000_000:
+                    exp_val = str(exp_ts)
+                    now_ts = int(time.time())
+                    can_pre_resolve = page_url or (file_ref and file_ref.get("page_url"))
+                    if exp_ts <= now_ts + 60 and can_pre_resolve:
+                        diff_m = max(1, (now_ts - exp_ts) // 60) if exp_ts < now_ts else 0
+                        msg_txt = f"Link token expired {diff_m} minute(s) ago" if exp_ts < now_ts else "Link token expires in < 1 minute"
+                        progress.log(f"[Auto-Resolve] {msg_txt}! Proactively resolving fresh stream URL and cookies from webpage...")
+                        try:
+                            ref_payload = {**(file_ref or {}), "page_url": page_url or (file_ref or {}).get("page_url")}
+                            fresh_url, _, fresh_hdrs = await self._resolve_universal_page(url, ref_payload, progress, proxy=proxy)
+                            if fresh_url and fresh_url != url:
+                                url = fresh_url
+                                if fresh_hdrs:
+                                    headers.update(fresh_hdrs)
+                                    if "Cookie" in fresh_hdrs:
+                                        cookies = fresh_hdrs["Cookie"]
+                                progress.log(f"[Auto-Resolve] Successfully acquired fresh stream URL and cookies before download!")
+                        except Exception as pre_err:
+                            progress.log(f"[Auto-Resolve] Preemptive token resolution notice: {pre_err}")
+                    elif exp_ts < now_ts:
+                        diff_m = max(1, (now_ts - exp_ts) // 60)
+                        progress.log(f"[WARNING] Link token expired {diff_m} minute(s) ago! (Expires: {exp_ts}, Now: {now_ts}). If download fails with 410/403, please refresh the webpage and copy a fresh link.")
+                    elif (exp_ts - now_ts) < 300:
+                        diff_m = max(1, (exp_ts - now_ts) // 60)
+                        progress.log(f"[WARNING] Link token will expire in ~{diff_m} minute(s)! Ensure download completes before expiration or copy a fresh link.")
         except Exception:
             pass
 

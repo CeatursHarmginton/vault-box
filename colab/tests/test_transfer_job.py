@@ -5307,3 +5307,60 @@ def test_auto_skip_folder_when_all_files_exist_completes_without_downloading(tmp
     assert len(job.completed_items) == 1
 
 
+def test_duplicate_filenames_partial_skip_records_completed_and_failed_distinctly(monkeypatch, tmp_path):
+    """When 3 items share the same name (e.g. index-v1-a1.mp4) and 1 succeeds while 2 fail,
+    completed_items must have only the 1 succeeded item and failed_items must have the 2 failed items."""
+    dirs = {
+        "root": tmp_path / "job",
+        "input": tmp_path / "job" / "input",
+        "work": tmp_path / "job" / "work",
+        "output": tmp_path / "job" / "output",
+    }
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+
+    class FakeSource:
+        async def download_file(self, credentials, file_ref, local_dir: Path, progress: JobState):
+            fid = file_ref.get("id")
+            if fid in ("url_fail_1", "url_fail_2"):
+                raise ProviderFailure("LINK_EXPIRED", "Link token expired")
+            out = local_dir / "index-v1-a1.mp4"
+            out.write_bytes(b"ok-stream-data")
+            return out
+
+    class FakeTarget:
+        async def upload_file(self, credentials, local_path: Path, target_ref, progress: JobState):
+            progress.files_uploaded += 1
+            return {"ok": True}
+
+        async def upload_folder(self, credentials, local_dir: Path, target_ref, progress: JobState):
+            files = [p for p in local_dir.rglob("*") if p.is_file()]
+            progress.files_uploaded += len(files)
+            return {"ok": True, "uploaded": len(files)}
+
+    monkeypatch.setattr(transfer_job_mod, "job_dirs", lambda job_id: dirs)
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "links", FakeSource())
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "drive", FakeTarget())
+
+    items = [
+        {"id": "url_ok_1", "name": "index-v1-a1.mp4", "type": "file"},
+        {"id": "url_fail_1", "name": "index-v1-a1.mp4", "type": "file"},
+        {"id": "url_fail_2", "name": "index-v1-a1.mp4", "type": "file"},
+    ]
+    payload = {
+        "source": {"provider": "links", "items": items},
+        "target": {"provider": "drive", "folder": {"id": "root", "path": "/"}},
+        "options": {"transfer_strategy": "file_by_file", "cleanupAfterFinish": False},
+    }
+    job = JobState("test-dup-names-skip", payload)
+    asyncio.run(run_transfer(job))
+
+    assert job.status == "completed"
+    assert [e["id"] for e in job.completed_items] == ["url_ok_1"]
+    assert sorted(e["id"] for e in job.failed_items) == ["url_fail_1", "url_fail_2"]
+    assert transfer_job_mod._is_item_already_completed(job, payload["source"], items[0]) is True
+    assert transfer_job_mod._is_item_already_completed(job, payload["source"], items[1]) is False
+    assert transfer_job_mod._is_item_already_completed(job, payload["source"], items[2]) is False
+
+
+

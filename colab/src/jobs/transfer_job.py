@@ -343,6 +343,9 @@ async def run_transfer(job: JobState) -> None:
                         cand_paths.append(dirs["input"] / f"{safe_cand}.mp4")
                     for existing in cand_paths:
                         if existing.is_file() and existing.stat().st_size > 0:
+                            prev_ref = (getattr(job, "_source_refs", None) or {}).get(str(existing.resolve()))
+                            if prev_ref and _queue_item_key(source, prev_ref) != item_k:
+                                continue
                             part_files = list(dirs["input"].glob(f"{existing.name}*.part*")) + list(dirs["input"].glob(f".tmp_ytdlp_*{existing.stem[:8]}*"))
                             if not part_files:
                                 job.log(f"[Cache-Hit] File already downloaded in workspace: {existing.name} ({existing.stat().st_size} bytes). Skipping re-download.")
@@ -804,6 +807,9 @@ async def _run_plain_file_batches(job: JobState, dirs: dict[str, Path], source: 
                     cand_paths.append(dl_dir / f"{safe_cand}.mp4")
                 for existing in cand_paths:
                     if existing.is_file() and existing.stat().st_size > 0:
+                        prev_ref = (getattr(job, "_source_refs", None) or {}).get(str(existing.resolve()))
+                        if prev_ref and _queue_item_key(source, prev_ref) != item_k:
+                            continue
                         part_files = list(dl_dir.glob(f"{existing.name}*.part*")) + list(dl_dir.glob(f".tmp_ytdlp_*{existing.stem[:8]}*"))
                         if not part_files:
                             job.log(f"[Cache-Hit] File already downloaded in batch: {existing.name} ({existing.stat().st_size} bytes). Skipping re-download.")
@@ -1779,20 +1785,43 @@ def _is_item_already_completed(job: JobState, source: dict[str, Any], item: dict
         if not ref_id and not ref_path and e_name and e_name.lower() in {item_name.lower(), raw_name.lower()}:
             return True
 
-    for tk in (item_k, ref_id, ref_path, item_name, raw_name):
-        if tk and isinstance(job.item_timings.get(tk), dict) and job.item_timings[tk].get("status") == "done":
-            return True
+    for f_entry in (job.failed_items or []):
+        f_prov = str(f_entry.get("provider") or "").lower()
+        f_acc = str(f_entry.get("accountId") or f_entry.get("account_id") or "")
+        f_id = str(f_entry.get("id") or "")
+        f_path = str(f_entry.get("path") or "")
+        if ref_id and f_id == ref_id and (not f_prov or not prov or f_prov == prov) and (not f_acc or not acc or f_acc == acc):
+            return False
+        if ref_path and f_path == ref_path and (not f_prov or not prov or f_prov == prov) and (not f_acc or not acc or f_acc == acc):
+            return False
 
-    item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
-    options = (job.payload or {}).get("options") or {}
-    is_extracted_archive = bool(options.get("extract")) and _is_archive_item(item)
-    if item_type != "folder" and not is_extracted_archive and job.uploaded_files:
-        uploaded_set = {str(u) for u in job.uploaded_files}
-        uploaded_basenames = {PurePosixPath(str(u).replace("\\", "/")).name for u in job.uploaded_files}
-        if item_name in uploaded_set or item_name in uploaded_basenames:
-            return True
-        if raw_name and (raw_name in uploaded_set or raw_name in uploaded_basenames):
-            return True
+    for tk in (item_k, ref_id, ref_path):
+        if tk and isinstance(job.item_timings.get(tk), dict):
+            st = job.item_timings[tk].get("status")
+            if st in ("failed", "skipped"):
+                return False
+            if st == "done":
+                return True
+
+    same_name_count = sum(
+        1 for it in (source.get("items") or [])
+        if isinstance(it, dict) and _item_name(it).lower() == item_name.lower()
+    )
+    if same_name_count <= 1:
+        for tk in (item_name, raw_name):
+            if tk and isinstance(job.item_timings.get(tk), dict) and job.item_timings[tk].get("status") == "done":
+                return True
+
+        item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
+        options = (job.payload or {}).get("options") or {}
+        is_extracted_archive = bool(options.get("extract")) and _is_archive_item(item)
+        if item_type != "folder" and not is_extracted_archive and job.uploaded_files:
+            uploaded_set = {str(u) for u in job.uploaded_files}
+            uploaded_basenames = {PurePosixPath(str(u).replace("\\", "/")).name for u in job.uploaded_files}
+            if item_name in uploaded_set or item_name in uploaded_basenames:
+                return True
+            if raw_name and (raw_name in uploaded_set or raw_name in uploaded_basenames):
+                return True
 
     return False
 
