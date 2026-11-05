@@ -125,9 +125,38 @@ async def _relay_loop(manager: JobManager) -> None:
                         monitors[job.job_id] = asyncio.create_task(_monitor(ws, manager, job.job_id))
                     elif typ == "cancel":
                         manager.cancel(job_id)
+                    elif typ == "update_options":
+                        job = manager.get(job_id)
+                        if job:
+                            raw_opts = msg.get("options") if isinstance(msg.get("options"), dict) else (msg.get("payload") or {})
+                            if isinstance(raw_opts, dict):
+                                opts = raw_opts.get("options") if isinstance(raw_opts.get("options"), dict) else raw_opts
+                                job.update_options(opts)
+                                await ws.send(json.dumps({
+                                    "type": "progress",
+                                    "jobId": job.job_id,
+                                    "job": job.view(),
+                                    "environment": ENV_NAME,
+                                }))
                     elif typ == "confirm":
                         job = manager.get(job_id)
                         if job:
+                            if msg.get("action") == "update_options":
+                                payload_obj = msg.get("payload") if isinstance(msg.get("payload"), dict) else {}
+                                opts = (
+                                    msg.get("options")
+                                    if isinstance(msg.get("options"), dict)
+                                    else (payload_obj.get("options") if isinstance(payload_obj.get("options"), dict) else payload_obj)
+                                )
+                                if isinstance(opts, dict):
+                                    job.update_options(opts)
+                                await ws.send(json.dumps({
+                                    "type": "progress",
+                                    "jobId": job.job_id,
+                                    "job": job.view(),
+                                    "environment": ENV_NAME,
+                                }))
+                                continue
                             if msg.get("action") == "retry_upload" and isinstance(msg.get("payload"), dict):
                                 job.payload.setdefault("target", {}).update((msg["payload"].get("target") or {}))
                             job.confirm_action = msg.get("action")

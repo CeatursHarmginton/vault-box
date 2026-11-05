@@ -204,6 +204,104 @@ def _get_target_checker(
     job._target_checker = checker
     return checker
 
+
+def _live_options(job: JobState | None, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Always return the live options dict from job.payload['options'], keeping fallback synced."""
+    if job is not None and isinstance(getattr(job, "payload", None), dict):
+        opts = job.payload.get("options")
+        if not isinstance(opts, dict):
+            opts = dict(fallback) if isinstance(fallback, dict) else {}
+            job.payload["options"] = opts
+        elif isinstance(fallback, dict) and fallback is not opts:
+            # Propagate live updates into derived sub_options while preserving local upload_prefix
+            saved_prefix = fallback.get("upload_prefix")
+            fallback.update(opts)
+            if saved_prefix is not None and "upload_prefix" not in opts:
+                fallback["upload_prefix"] = saved_prefix
+        return opts
+    return fallback if isinstance(fallback, dict) else {}
+
+
+def _live_dl_concurrency(job: JobState | None, default_concurrency: int = FOLDER_DOWNLOAD_CONCURRENCY, fallback: dict[str, Any] | None = None) -> int:
+    opts = _live_options(job, fallback)
+    parallel_val = opts.get("parallel_download")
+    if parallel_val is None:
+        parallel_val = opts.get("parallelDownload")
+    if parallel_val is False:
+        return 1
+    raw = opts.get("download_concurrency") or opts.get("downloadConcurrency") or opts.get("max_concurrent_items") or default_concurrency
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return max(1, int(default_concurrency))
+
+
+def _live_ul_concurrency(job: JobState | None, default_concurrency: int = UPLOAD_FILE_CONCURRENCY, fallback: dict[str, Any] | None = None) -> int:
+    opts = _live_options(job, fallback)
+    raw = opts.get("upload_concurrency") or opts.get("uploadConcurrency") or opts.get("upload_parallel") or default_concurrency
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return max(1, int(default_concurrency))
+
+
+class _DynamicSemaphore:
+    """Async semaphore whose concurrency limit is evaluated dynamically from live job options."""
+
+    def __init__(self, limit_fn: Any, job: JobState | None = None) -> None:
+        self._limit_fn = limit_fn if callable(limit_fn) else (lambda: int(limit_fn or 1))
+        self._active = 0
+        self._cond = asyncio.Condition()
+        if job is not None:
+            sems = getattr(job, "_dynamic_semaphores", None)
+            if not isinstance(sems, list):
+                sems = []
+                setattr(job, "_dynamic_semaphores", sems)
+            sems.append(self)
+
+    def current_limit(self) -> int:
+        try:
+            return max(1, int(self._limit_fn()))
+        except Exception:
+            return 1
+
+    def notify_limit_changed(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+            loop.call_soon_threadsafe(self._schedule_wakeup)
+        except RuntimeError:
+            pass
+
+    def _schedule_wakeup(self) -> None:
+        async def _wake() -> None:
+            async with self._cond:
+                self._cond.notify_all()
+        try:
+            asyncio.create_task(_wake())
+        except Exception:
+            pass
+
+    async def acquire(self) -> bool:
+        async with self._cond:
+            while self._active >= self.current_limit():
+                await self._cond.wait()
+            self._active += 1
+            return True
+
+    def release(self) -> None:
+        self._active = max(0, self._active - 1)
+        self._schedule_wakeup()
+
+    async def __aenter__(self) -> "_DynamicSemaphore":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        async with self._cond:
+            self._active = max(0, self._active - 1)
+            self._cond.notify_all()
+
+
 async def run_transfer(job: JobState) -> None:
     dirs = job_dirs(job.job_id)
     payload = job.payload
@@ -211,7 +309,9 @@ async def run_transfer(job: JobState) -> None:
         job.set(status="running", step="downloading")
         source = payload["source"]
         target = payload["target"]
-        options = payload.get("options") or {}
+        if not isinstance(payload.get("options"), dict):
+            payload["options"] = dict(payload.get("options") or {})
+        options = payload["options"]
         src = PROVIDERS[str(source.get("provider") or "").lower()]
         dst = PROVIDERS[str(target.get("provider") or "").lower()]
         job.files_downloaded = 0
@@ -326,15 +426,24 @@ async def run_transfer(job: JobState) -> None:
             or any(str(i.get("provider") or (i.get("meta") or {}).get("provider") or source.get("provider") or "").lower() == "links" for i in file_items)
         )
         default_concurrency = 1 if is_links_provider else FOLDER_DOWNLOAD_CONCURRENCY
-        concurrency = int(options.get("download_concurrency") or default_concurrency)
-        sem = asyncio.Semaphore(max(1, concurrency))
+        concurrency = _live_dl_concurrency(job, default_concurrency, options)
+        sem = _DynamicSemaphore(lambda: _live_dl_concurrency(job, default_concurrency, options), job=job)
 
         async def download_one(item: dict[str, Any]) -> list[Path]:
             async with sem:
                 job.check_cancelled()
+                live_opts = _live_options(job, options)
                 item_name = _item_name(item)
                 item_size = _item_size(item)
                 item_k = _queue_item_key(source, item)
+
+                if _is_auto_skip_enabled(live_opts):
+                    checker = _get_target_checker(job, dst, target, live_opts)
+                    if await checker.item_exists(item, live_opts):
+                        job.files_skipped += 1
+                        job.log(f"[Auto-Skip] File đã tồn tại ở đích, bỏ qua tải: {item_name}")
+                        _finish_items(job, source, [item])
+                        return []
 
                 if item_name:
                     safe_cand = safe_name(item_name)
@@ -784,15 +893,29 @@ async def _run_plain_file_batches(job: JobState, dirs: dict[str, Path], source: 
         or any(str(i.get("provider") or (i.get("meta") or {}).get("provider") or source.get("provider") or "").lower() == "links" for i in file_items)
     )
     default_concurrency = 1 if is_links_provider else FOLDER_DOWNLOAD_CONCURRENCY
-    concurrency = int(options.get("download_concurrency") or default_concurrency)
-    sem = asyncio.Semaphore(max(1, concurrency))
+    concurrency = _live_dl_concurrency(job, default_concurrency, options)
+    sem = _DynamicSemaphore(lambda: _live_dl_concurrency(job, default_concurrency, options), job=job)
 
     async def download_one(item: dict[str, Any], batch_input: Path) -> list[Path]:
         async with sem:
             job.check_cancelled()
+            live_opts = _live_options(job, options)
             item_name = _item_name(item)
             item_size = _item_size(item)
             item_k = _queue_item_key(source, item)
+
+            if _is_auto_skip_enabled(live_opts):
+                checker = _get_target_checker(job, dst, target, live_opts)
+                parent_pf = str(item.get("_parent_prefix") or "").strip("/")
+                sub_opts = dict(live_opts)
+                if parent_pf:
+                    existing_pfx = str(live_opts.get("upload_prefix") or "").strip("/")
+                    sub_opts["upload_prefix"] = f"{existing_pfx}/{parent_pf}".strip("/") if existing_pfx else parent_pf
+                if await checker.item_exists(item, sub_opts, folder_name=parent_pf):
+                    job.files_skipped += 1
+                    job.log(f"[Auto-Skip] File đã tồn tại ở đích, bỏ qua tải: {item_name}")
+                    _finish_items(job, source, [item])
+                    return []
 
             dl_dir = batch_input
             parent_pf = str(item.get("_parent_prefix") or "").strip("/")
@@ -1103,16 +1226,23 @@ async def _run_smart_folder_batches(
                 if len(file_batches) > 1:
                     job.log(f"[Smart Folder {idx}/{total_groups}] Đợt {b_idx}/{len(file_batches)}: Đang tải {len(b_files)} file của thư mục {f_name}...")
 
-                conc = int(options.get("download_concurrency") or FOLDER_DOWNLOAD_CONCURRENCY)
-                dl_sem = asyncio.Semaphore(max(1, conc))
+                conc = _live_dl_concurrency(job, FOLDER_DOWNLOAD_CONCURRENCY, options)
+                dl_sem = _DynamicSemaphore(lambda: _live_dl_concurrency(job, FOLDER_DOWNLOAD_CONCURRENCY, options), job=job)
 
                 async def dl_sub(it: dict[str, Any]) -> list[Path]:
                     async with dl_sem:
                         job.check_cancelled()
+                        live_opts = _live_options(job, sub_options)
                         it_name = _item_name(it)
                         it_rel = it.get("_relative_path") or f"{f_name}/{it_name}"
                         it_size = _item_size(it)
                         it_k = _queue_item_key(source, it)
+                        if _is_auto_skip_enabled(live_opts):
+                            checker = _get_target_checker(job, dst, target, live_opts)
+                            if await checker.item_exists(it, sub_options, folder_name=f_name):
+                                job.files_skipped += 1
+                                job.log(f"[Auto-Skip] File đã tồn tại ở đích, bỏ qua tải: {it_rel}")
+                                return []
                         target_dir = batch_input / PurePosixPath(it_rel).parent
                         target_dir.mkdir(parents=True, exist_ok=True)
                         job.start_file(it_name, phase="download", size=it_size, key=it_k)
@@ -1140,15 +1270,16 @@ async def _run_smart_folder_batches(
 
                 upload_root = batch_input
                 outputs = batch_downloaded
-                if options.get("extract"):
+                live_opts = _live_options(job, sub_options)
+                if live_opts.get("extract"):
                     extract_root = batch_output / "extracted"
-                    outputs = await extract_archives(batch_input, extract_root, job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
+                    outputs = await extract_archives(batch_input, extract_root, job, _archive_passwords(live_opts), bool(live_opts.get("deleteArchiveAfterExtract")))
                     upload_root = extract_root
 
-                if _should_process_video_thumbnails(options, job.payload):
+                if _should_process_video_thumbnails(live_opts, job.payload):
                     try:
                         from ..utils.video_thumbnail import process_video_thumbnails
-                        outputs = await asyncio.to_thread(process_video_thumbnails, outputs, options, job)
+                        outputs = await asyncio.to_thread(process_video_thumbnails, outputs, live_opts, job)
                     except Exception as exc:
                         job.log(f"[Thumbnail] Warning during video thumbnailing: {exc}")
 
@@ -1159,9 +1290,10 @@ async def _run_smart_folder_batches(
                     job.log(f"[Smart Folder {idx}/{total_groups}] Đang upload thư mục {f_name} ({len(outputs)} files) lên đích...")
 
                 job._upload_log_total = len(folder_files)
+                _live_options(job, sub_options)
                 await _upload_outputs_with_retry(job, target, sub_options, dst, upload_root, f_item)
 
-                if options.get("cleanupAfterFinish", True) or len(file_batches) > 1:
+                if _live_options(job, sub_options).get("cleanupAfterFinish", True) or len(file_batches) > 1:
                     shutil.rmtree(batch_input, ignore_errors=True)
                     shutil.rmtree(batch_output, ignore_errors=True)
                     batch_input.mkdir(parents=True, exist_ok=True)
@@ -1197,20 +1329,21 @@ async def _run_smart_folder_batches(
 
             upload_root = batch_input
             outputs = downloaded
-            if options.get("extract"):
+            live_opts = _live_options(job, sub_options)
+            if live_opts.get("extract"):
                 job.log(f"[Smart Folder {idx}/{total_groups}] Giải nén các file nén trong thư mục {f_name}...")
                 extract_root = batch_output / "extracted"
-                outputs = await extract_archives(batch_input, extract_root, job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
+                outputs = await extract_archives(batch_input, extract_root, job, _archive_passwords(live_opts), bool(live_opts.get("deleteArchiveAfterExtract")))
                 upload_root = extract_root
                 job.log(f"Extract stage output files: {len(outputs)}")
 
-            if _should_process_video_thumbnails(options, job.payload):
+            if _should_process_video_thumbnails(live_opts, job.payload):
                 try:
                     from ..utils.video_thumbnail import process_video_thumbnails
                     outputs = await asyncio.to_thread(
                         process_video_thumbnails,
                         outputs,
-                        options,
+                        live_opts,
                         job,
                     )
                 except Exception as exc:
@@ -1219,9 +1352,10 @@ async def _run_smart_folder_batches(
             job.set(status="running", step="uploading")
             job.log(f"[Smart Folder {idx}/{total_groups}] Đang upload thư mục {f_name} ({len(outputs)} files) lên đích...")
             job._upload_log_total = len(outputs)
+            _live_options(job, sub_options)
             await _upload_outputs_with_retry(job, target, sub_options, dst, upload_root, f_item)
 
-            if options.get("cleanupAfterFinish", True):
+            if _live_options(job, sub_options).get("cleanupAfterFinish", True):
                 shutil.rmtree(batch_input, ignore_errors=True)
                 shutil.rmtree(batch_output, ignore_errors=True)
                 job.log(f"[Smart Folder {idx}/{total_groups}] Đã dọn dẹp đĩa tạm Colab cho thư mục {f_name}.")
@@ -1289,10 +1423,10 @@ async def _run_file_pipeline_batches(
     job._upload_log_total = len(file_items)
     job._upload_log_done = 0
 
-    dl_concurrency = int(options.get("download_concurrency") or options.get("downloadConcurrency") or FOLDER_DOWNLOAD_CONCURRENCY)
-    ul_concurrency = int(options.get("upload_concurrency") or options.get("uploadConcurrency") or options.get("upload_parallel") or UPLOAD_FILE_CONCURRENCY)
-    dl_sem = asyncio.Semaphore(max(1, dl_concurrency))
-    ul_sem = asyncio.Semaphore(max(1, ul_concurrency))
+    dl_concurrency = _live_dl_concurrency(job, FOLDER_DOWNLOAD_CONCURRENCY, options)
+    ul_concurrency = _live_ul_concurrency(job, UPLOAD_FILE_CONCURRENCY, options)
+    dl_sem = _DynamicSemaphore(lambda: _live_dl_concurrency(job, FOLDER_DOWNLOAD_CONCURRENCY, options), job=job)
+    ul_sem = _DynamicSemaphore(lambda: _live_ul_concurrency(job, UPLOAD_FILE_CONCURRENCY, options), job=job)
     pipeline_gate = _UploadGate()
     job._upload_gate = pipeline_gate
 
@@ -1327,6 +1461,18 @@ async def _run_file_pipeline_batches(
 
         async with dl_sem:
             job.check_cancelled()
+            live_opts = _live_options(job, options)
+            if _is_auto_skip_enabled(live_opts):
+                checker = _get_target_checker(job, dst, target, live_opts)
+                parent_folder = item.get("_parent_folder") or {}
+                f_name = safe_name(PurePosixPath(str(parent_folder.get("name") or parent_folder.get("path") or "")).name) if parent_folder else ""
+                if await checker.item_exists(item, live_opts, folder_name=f_name):
+                    job.files_skipped += 1
+                    job.log(f"[Auto-Skip] File đã tồn tại ở đích, bỏ qua tải: {rel_path}")
+                    if not item.get("_parent_folder"):
+                        _finish_items(job, source, [item])
+                    shutil.rmtree(pipe_in, ignore_errors=True)
+                    return
             job.start_file(item_name, phase="download", size=item_size, key=item_k)
             job.start_item(item_k, name=item_name)
             try:
@@ -1455,10 +1601,8 @@ async def _run_backup_resume_batches(
     job.files_to_download = len(pipeline_items)
     job.files_to_upload = len(pipeline_items)
 
-    parallel_enabled = options.get("parallelDownload", True) if options.get("parallelDownload") is not None else options.get("parallel_download", True)
-    dl_concurrency = int(options.get("download_concurrency") or options.get("downloadConcurrency") or FOLDER_DOWNLOAD_CONCURRENCY) if parallel_enabled else 1
-    dl_concurrency = max(1, dl_concurrency)
-    dl_sem = asyncio.Semaphore(dl_concurrency)
+    dl_concurrency = _live_dl_concurrency(job, FOLDER_DOWNLOAD_CONCURRENCY, options)
+    dl_sem = _DynamicSemaphore(lambda: _live_dl_concurrency(job, FOLDER_DOWNLOAD_CONCURRENCY, options), job=job)
 
     skip_segs = options.get("skip_broken_segments") or options.get("skipBrokenSegments")
     skip_msg = ""
@@ -1911,11 +2055,11 @@ async def _upload_outputs(job: JobState, target: dict[str, Any], options: dict[s
         return
     if not getattr(job, "_pipeline_preallocated", False) or job.files_to_upload == 0:
         job.files_to_upload += len(files)
-    upload_concurrency = int(options.get("upload_concurrency") or options.get("uploadConcurrency") or options.get("upload_parallel") or UPLOAD_FILE_CONCURRENCY)
+    upload_concurrency = _live_ul_concurrency(job, UPLOAD_FILE_CONCURRENCY, options)
     workers = max(1, min(upload_concurrency, len(files)))
     gate = shared_gate or _UploadGate()
-    sem = asyncio.Semaphore(workers)
-    prefix = str(options.get("upload_prefix") or "").strip("/")
+    sem = _DynamicSemaphore(lambda: max(1, min(_live_ul_concurrency(job, UPLOAD_FILE_CONCURRENCY, options), len(files))), job=job)
+    prefix = str(_live_options(job, options).get("upload_prefix") or options.get("upload_prefix") or "").strip("/")
 
     async def one(path: Path) -> None:
         async with sem:

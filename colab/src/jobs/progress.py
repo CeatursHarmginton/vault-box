@@ -259,6 +259,86 @@ class JobState:
         if self.cancel:
             raise JobCancelled("JOB_CANCELLED")
 
+    def update_options(self, new_options: dict[str, Any] | None) -> dict[str, Any]:
+        """Update this job's transfer options in-place so running tasks see changes immediately."""
+        if not isinstance(self.payload, dict):
+            self.payload = {}
+        cur = self.payload.get("options")
+        if not isinstance(cur, dict):
+            cur = {}
+            self.payload["options"] = cur
+        if not isinstance(new_options, dict) or not new_options:
+            return cur
+
+        alias_pairs = (
+            ("extract", "unzip"),
+            ("auto_skip", "autoSkip"),
+            ("preserveFolderStructure", "preserve_folder_structure"),
+            ("cleanupAfterFinish", "cleanup_after_finish"),
+            ("parallel_download", "parallelDownload"),
+            ("download_concurrency", "downloadConcurrency"),
+            ("download_threads", "downloadThreads"),
+            ("upload_concurrency", "uploadConcurrency"),
+            ("upload_threads", "uploadThreads"),
+            ("set_video_thumbnail", "setVideoThumbnail"),
+            ("video_thumbnail_Time", "videoThumbnailTime"),
+            ("trim_intro", "trimIntro"),
+            ("trim_intro_seconds", "trimIntroSeconds"),
+            ("optimize_image", "optimizeImage"),
+            ("skip_broken_segments", "skipBrokenSegments"),
+            ("max_skipped_segments", "maxSkippedSegments"),
+            ("backup_chunk_segments", "backupChunkSegments"),
+            ("backup_chunk_mb", "backupChunkMb"),
+            ("backup_chunk_and_mode", "backupChunkAndMode"),
+            ("backup_chunk_mode", "backupChunkMode"),
+            ("transfer_strategy", "transferStrategy"),
+            ("fresh_url", "freshUrl"),
+            ("archive_password", "archivePassword"),
+            ("archive_passwords", "archivePasswords"),
+        )
+        normalized = dict(new_options)
+        for k1, k2 in alias_pairs:
+            if k1 in normalized and k2 not in normalized:
+                normalized[k2] = normalized[k1]
+            elif k2 in normalized and k1 not in normalized:
+                normalized[k1] = normalized[k2]
+        if "download_concurrency" in normalized:
+            normalized.setdefault("max_concurrent_items", normalized["download_concurrency"])
+        if "download_threads" in normalized:
+            normalized.setdefault("threads_per_item", normalized["download_threads"])
+        if "upload_concurrency" in normalized:
+            normalized.setdefault("upload_parallel", normalized["upload_concurrency"])
+        if "backup_chunk_mode" in normalized and "backup_chunk_and_mode" not in normalized:
+            is_and = str(normalized["backup_chunk_mode"]).strip().lower() == "and"
+            normalized["backup_chunk_and_mode"] = is_and
+            normalized["backupChunkAndMode"] = is_and
+
+        changed_keys: list[str] = []
+        primary_keys = {k1 for k1, _ in alias_pairs} | {
+            "min_target_mb", "max_target_mb", "upscale", "scale", "quality", "format", "replace",
+        }
+        for k, v in normalized.items():
+            if cur.get(k) != v and k in primary_keys:
+                changed_keys.append(f"{k}={v}")
+
+        cur.update(normalized)
+        if not cur.get("auto_skip") and not cur.get("autoSkip"):
+            setattr(self, "_target_checker", None)
+
+        if changed_keys:
+            summary = ", ".join(changed_keys[:8])
+            if len(changed_keys) > 8:
+                summary += f" (+{len(changed_keys) - 8})"
+            self.log(f"[Live-Options] Đã cập nhật Transfer Options cho Job #{self.job_id}: {summary}")
+        for dyn_sem in list(getattr(self, "_dynamic_semaphores", None) or []):
+            try:
+                dyn_sem.notify_limit_changed()
+            except Exception:
+                pass
+        self.updated_at = time.time()
+        self.save_state()
+        return cur
+
     def view(self) -> dict[str, Any]:
         options = self.payload.get("options") or {}
         phases = ["download"]

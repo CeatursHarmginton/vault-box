@@ -1309,9 +1309,69 @@ async def run_resumable_backup_pipeline(
             return await download_single_segment(c, s, dp, h, sm, jb)
 
         dl_client = _make_http_client(active_proxy)
+        last_applied_fresh_url = str(
+            (job.payload.get("options") or options).get("fresh_url")
+            or (job.payload.get("options") or options).get("freshUrl")
+            or ""
+        ).strip()
         try:
             for seg in remaining_segments:
                 job.check_cancelled()
+                live_opts = (job.payload.get("options") if isinstance(getattr(job, "payload", None), dict) else None) or options
+                if isinstance(live_opts, dict):
+                    try:
+                        if live_opts.get("backup_chunk_segments"):
+                            chunk_segments = max(1, int(live_opts["backup_chunk_segments"]))
+                        if live_opts.get("backup_chunk_mb"):
+                            chunk_mb = max(1, int(live_opts["backup_chunk_mb"]))
+                    except (TypeError, ValueError):
+                        pass
+                    live_and = live_opts.get("backup_chunk_and_mode")
+                    if live_and is None:
+                        live_and = live_opts.get("backupChunkAndMode")
+                    if live_and is None and live_opts.get("backup_chunk_mode") is not None:
+                        live_and = str(live_opts.get("backup_chunk_mode")).strip().lower() == "and"
+                    if live_and is None and live_opts.get("backupChunkMode") is not None:
+                        live_and = str(live_opts.get("backupChunkMode")).strip().lower() == "and"
+                    if live_and is not None:
+                        chunk_and_mode = bool(live_and)
+                    skip_broken_segments = bool(
+                        live_opts.get("skip_broken_segments")
+                        or live_opts.get("skipBrokenSegments")
+                        or live_opts.get("skip_failed_segments")
+                        or live_opts.get("skipFailedSegments")
+                    )
+                    raw_live_max_skip = (
+                        live_opts.get("max_skipped_segments")
+                        if live_opts.get("max_skipped_segments") is not None
+                        else live_opts.get("maxSkippedSegments")
+                    )
+                    try:
+                        max_skipped_segments = int(raw_live_max_skip) if raw_live_max_skip is not None and str(raw_live_max_skip).strip() != "" else 0
+                    except (ValueError, TypeError):
+                        max_skipped_segments = 0
+                    if live_opts.get("backup_auto_clean") is not None:
+                        auto_clean = bool(live_opts.get("backup_auto_clean"))
+                    live_fresh = str(live_opts.get("fresh_url") or live_opts.get("freshUrl") or "").strip()
+                    if live_fresh and live_fresh != last_applied_fresh_url:
+                        last_applied_fresh_url = live_fresh
+                        resolved_url = live_fresh
+                        source_url = live_fresh
+                        job.log(f"[Live-Options] Phát hiện URL luồng mới vừa được cập nhật trực tiếp: {live_fresh[:80]}...")
+                        try:
+                            if not any(k in live_fresh.lower() for k in (".m3u8", "/hls/", ".mpd")):
+                                await _attempt_resolve_stream(live_fresh)
+                            _, fresh_segs_live, _ = await _fetch_playlist_with_fallback()
+                            if fresh_segs_live:
+                                fresh_map_live = {s["index"]: s["url"] for s in fresh_segs_live}
+                                for rem in remaining_segments:
+                                    if rem["index"] in fresh_map_live:
+                                        rem["url"] = fresh_map_live[rem["index"]]
+                                seg["url"] = fresh_map_live.get(seg["index"], seg["url"])
+                                job.log(f"[Live-Options] Đã làm mới URL cho {len(remaining_segments)} segments từ URL luồng mới!")
+                        except Exception as live_url_exc:
+                            job.log(f"[Live-Options] Lưu ý khi áp dụng URL luồng mới: {live_url_exc}")
+
                 seg_file = segs_local_dir / f"seg_{seg['index']:06d}.ts"
                 seg_sz = None
                 last_seg_err = None
@@ -1648,6 +1708,16 @@ async def run_resumable_backup_pipeline(
         raise ProviderFailure("FFMPEG_MERGE_FAILED", f"Lỗi ghép video qua FFmpeg: {err_msg}")
 
     final_size = final_output_path.stat().st_size
+    live_opts_final = (job.payload.get("options") if isinstance(getattr(job, "payload", None), dict) else None) or options
+    if isinstance(live_opts_final, dict) and (live_opts_final.get("set_video_thumbnail") or live_opts_final.get("trim_intro")):
+        try:
+            from ..utils.video_thumbnail import process_video_thumbnails
+            processed = await asyncio.to_thread(process_video_thumbnails, [final_output_path], live_opts_final, job)
+            if processed and processed[0].is_file():
+                final_output_path = processed[0]
+                final_size = final_output_path.stat().st_size
+        except Exception as thumb_exc:
+            job.log(f"[Thumbnail] Lưu ý xử lý video sau khi ghép: {thumb_exc}")
     job.log(f"[Final-Assembly] Ghép thành công video hoàn chỉnh ({final_size} bytes). Đang upload lên Cloud đích...")
 
     # Upload final MP4 to main target folder

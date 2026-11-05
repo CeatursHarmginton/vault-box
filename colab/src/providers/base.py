@@ -173,11 +173,16 @@ class BaseProvider(ABC):
         progress.files_to_download += len(eligible)
         options = (progress.payload or {}).get("options", {}) if hasattr(progress, "payload") else {}
         conc = int(options.get("download_concurrency") or FOLDER_DOWNLOAD_CONCURRENCY)
-        sem = _sem or asyncio.Semaphore(max(1, conc))
+        if _sem is not None:
+            sem = _sem
+        else:
+            from ..jobs.transfer_job import _DynamicSemaphore, _live_dl_concurrency
+            sem = _DynamicSemaphore(lambda: _live_dl_concurrency(progress, FOLDER_DOWNLOAD_CONCURRENCY, options), job=progress)
         log_token = _DOWNLOAD_LOG_CONTEXT.set({"done": 0, "total": len(eligible), "lock": asyncio.Lock()})
 
         async def save(item: dict[str, Any]) -> list[Path]:
             progress.check_cancelled()
+            live_options = (progress.payload or {}).get("options", options) if hasattr(progress, "payload") else options
             if item.get("type") == "folder" or item.get("is_folder") or item.get("isdir"):
                 sub = local_dir / _safe_name(item.get("name") or item.get("server_filename") or "folder")
                 sub.mkdir(parents=True, exist_ok=True)
@@ -187,11 +192,11 @@ class BaseProvider(ABC):
                 progress.log(f"[SKIP] File ignored by image optimizer: {item.get('name') or item.get('server_filename') or item.get('id') or 'file'}")
                 return []
             checker = getattr(progress, "_target_checker", None)
-            if checker is not None:
+            if checker is not None and (live_options.get("auto_skip") or live_options.get("autoSkip")):
                 f_name = _safe_name(folder_ref.get("name") or folder_ref.get("path") or folder_ref.get("id") or "folder")
                 item_name_cand = _safe_name(item.get("name") or item.get("server_filename") or item.get("id") or "file")
                 check_item = {**item, "_relative_path": f"{f_name}/{item_name_cand}"}
-                if await checker.item_exists(check_item, options, folder_name=f_name):
+                if await checker.item_exists(check_item, live_options, folder_name=f_name):
                     progress.files_skipped += 1
                     progress.log(f"[Auto-Skip] File đã tồn tại ở đích, bỏ qua tải: {f_name}/{item_name_cand}")
                     return []
@@ -240,7 +245,8 @@ class BaseProvider(ABC):
         paths = [path for path in sorted(local_dir.rglob("*")) if path.is_file()]
         options = progress.payload.get("options") or {}
         upload_concurrency = int(options.get("upload_concurrency") or options.get("uploadConcurrency") or options.get("upload_parallel") or FOLDER_UPLOAD_CONCURRENCY)
-        sem = asyncio.Semaphore(max(1, upload_concurrency))
+        from ..jobs.transfer_job import _DynamicSemaphore, _live_ul_concurrency
+        sem = _DynamicSemaphore(lambda: _live_ul_concurrency(progress, FOLDER_UPLOAD_CONCURRENCY, options), job=progress)
         root_target = target_ref
 
         progress.files_to_upload = len(paths)

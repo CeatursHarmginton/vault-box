@@ -212,6 +212,12 @@ async def transfer_confirm(job_id: str, payload: dict[str, Any]) -> dict[str, An
     if not job:
         raise HTTPException(status_code=404, detail={"code": "JOB_NOT_FOUND", "message": "Job not found"})
     action = payload.get("action")
+    if action == "update_options":
+        raw_opts = payload.get("options") if isinstance(payload.get("options"), dict) else (payload.get("payload") or payload)
+        if isinstance(raw_opts, dict):
+            opts = raw_opts.get("options") if isinstance(raw_opts.get("options"), dict) else raw_opts
+            job.update_options(opts)
+        return {"ok": True, "jobId": job_id, "action": action, "options": (job.payload or {}).get("options") or {}, "job": job.view()}
     if action not in {"replace", "upload_new", "retry_upload", "cancel"}:
         raise HTTPException(status_code=400, detail={"code": "INVALID_ACTION", "message": "Invalid action"})
     if action == "retry_upload":
@@ -222,6 +228,17 @@ async def transfer_confirm(job_id: str, payload: dict[str, Any]) -> dict[str, An
     job.confirm_action = action
     job.confirm_event.set()
     return {"ok": True, "jobId": job_id, "action": action}
+
+@app.post("/transfer/options/{job_id}", dependencies=[Depends(require_token)])
+@app.patch("/transfer/options/{job_id}", dependencies=[Depends(require_token)])
+async def transfer_update_options(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    job = manager.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail={"code": "JOB_NOT_FOUND", "message": "Job not found"})
+    opts = payload.get("options") if isinstance(payload.get("options"), dict) else payload
+    if isinstance(opts, dict):
+        job.update_options(opts)
+    return job.view()
 
 @app.get("/transfer/logs/{job_id}", dependencies=[Depends(require_token)])
 async def transfer_logs(job_id: str) -> dict[str, Any]:

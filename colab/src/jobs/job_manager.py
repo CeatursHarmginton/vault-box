@@ -111,6 +111,13 @@ class JobManager:
     def get(self, job_id: str) -> JobState | None:
         return self.jobs.get(job_id)
 
+    def update_options(self, job_id: str, options: dict[str, Any] | None) -> JobState | None:
+        job = self.jobs.get(job_id)
+        if not job:
+            return None
+        job.update_options(options)
+        return job
+
     def list(self) -> list[dict[str, Any]]:
         return [j.view() for j in sorted(self.jobs.values(), key=lambda x: x.created_at, reverse=True)]
 
