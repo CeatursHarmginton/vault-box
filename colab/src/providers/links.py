@@ -9,6 +9,7 @@ import random
 import re
 import shutil
 import string
+import struct
 import subprocess
 import sys
 import tempfile
@@ -16,7 +17,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse, urljoin
+from urllib.parse import parse_qs, unquote, urlencode, urlparse, urljoin, urlunparse
 
 TOR_PROXY = "socks5://127.0.0.1:9050"
 PROXY_SETUP_LOCK: asyncio.Lock | None = None
@@ -395,9 +396,36 @@ class LinksProvider(BaseProvider):
         parsed = urlparse(url_lower)
         if parsed.netloc.endswith("gofile.io"):
             return "direct" if parsed.path.startswith("/download/web/") else "gofile_page"
-            
+
+        if any(h in url_lower for h in ("mega.nz", "mega.co.nz")):
+            if "#" in url_lower and "/file/" in url_lower.split("#", 1)[1]:
+                return "mega_file"
+            if "/folder/" in url_lower or "#f!" in url_lower:
+                return "mega_folder"
+            return "mega_file"
+
+        if "pixeldrain.com" in url_lower:
+            if "/l/" in url_lower or "/api/list/" in url_lower:
+                return "pixeldrain_list"
+            return "pixeldrain"
+
         if "mediafire.com" in url_lower:
+            if "/folder/" in url_lower:
+                return "mediafire_folder"
             return "mediafire"
+
+        if "drive.google.com" in url_lower or "docs.google.com" in url_lower:
+            if "/drive/folders/" in url_lower or "/drive/u/" in url_lower and "/folders/" in url_lower or "folders/" in parsed.path:
+                return "gdrive_folder"
+            return "gdrive"
+
+        if "dropbox.com" in url_lower or "dropboxusercontent.com" in url_lower:
+            if "/scl/fo/" in url_lower or "/sh/" in url_lower:
+                return "dropbox_folder"
+            return "dropbox"
+
+        if any(h in url_lower for h in ("1drv.ms", "onedrive.live.com", "sharepoint.com")):
+            return "onedrive"
 
         if "sorafolder.com" in url_lower:
             return "sorafolder"
@@ -420,8 +448,8 @@ class LinksProvider(BaseProvider):
 
         ytdlp_domains = [
             "youtube", "youtu.be", "tiktok", "bilibili", "vimeo", 
-            "dailymotion", "twitch", "mega.nz", 
-            "pixeldrain.com", "1fichier.com", "pornhub.com"
+            "dailymotion", "twitch", 
+            "1fichier.com", "pornhub.com"
         ]
         
         if url_lower.endswith(".m3u8") or url_lower.endswith(".mpd") or ".m3u8?" in url_lower or ".mpd?" in url_lower or "/hls/" in url_lower:
@@ -431,9 +459,6 @@ class LinksProvider(BaseProvider):
             if domain in url_lower:
                 return "ytdlp"
                 
-        if "drive.google.com" in url_lower:
-            return "gdrive"
-            
         return "direct"
 
     def _parse_aria2_progress(self, line: str) -> tuple[int, int] | None:
@@ -1546,17 +1571,893 @@ class LinksProvider(BaseProvider):
         progress.log(f"Starting gdown download for: {url}")
         try:
             import gdown
-            before = set(dest_dir.iterdir()) if dest_dir.exists() else set()
+            before = {p for p in dest_dir.rglob("*") if p.is_file()} if dest_dir.exists() else set()
             def run_gdown() -> None:
-                output = str(dest_dir / name) if name else str(dest_dir) + "/"
+                output = str(dest_dir / name) if (name and "." in name) else str(dest_dir) + "/"
                 gdown.download(url, output, quiet=False, fuzzy=True)
             await asyncio.to_thread(run_gdown)
-            after = set(dest_dir.iterdir()) if dest_dir.exists() else set()
-            new_files = [p for p in (after - before) if p.is_file()]
-            return new_files or [p for p in dest_dir.iterdir() if p.is_file()]
+            after = {p for p in dest_dir.rglob("*") if p.is_file()} if dest_dir.exists() else set()
+            new_files = [p for p in sorted(after - before) if p.is_file() and not p.name.endswith(".part")]
+            return new_files or [p for p in sorted(dest_dir.rglob("*")) if p.is_file() and not p.name.endswith(".part")]
         except Exception as e:
             progress.log(f"gdown failed, falling back to yt-dlp: {e}")
             return await self._download_ytdlp(url, dest_dir, name, progress)
+
+    async def _download_gdrive_folder(self, url: str, dest_dir: Path, progress: JobState) -> list[Path]:
+        progress.log(f"Starting Google Drive folder download via gdown: {url}")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            import gdown
+            before = {p for p in dest_dir.rglob("*") if p.is_file()} if dest_dir.exists() else set()
+            def run_gdown_folder() -> None:
+                gdown.download_folder(url=url, output=str(dest_dir), quiet=False, use_cookies=False, remaining_ok=True)
+            await asyncio.to_thread(run_gdown_folder)
+            after = {p for p in dest_dir.rglob("*") if p.is_file()} if dest_dir.exists() else set()
+            new_files = [p for p in sorted(after - before) if p.is_file() and not p.name.endswith(".part")]
+            res = new_files or [p for p in sorted(dest_dir.rglob("*")) if p.is_file() and not p.name.endswith(".part")]
+            if not res:
+                raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"No files downloaded from Google Drive folder: {url}")
+            self._validate_downloaded_files(res)
+            return res
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure("DOWNLOAD_FAILED", f"Google Drive folder download failed: {exc}") from exc
+
+    # -------------------------------------------------------------------------
+    # MEGA.nz Cloud Support (File + Folder with AES-128-ECB/CBC/CTR Decryption)
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _mega_b64_decode(s: str) -> bytes:
+        s = str(s or "").strip().replace("-", "+").replace("_", "/").replace(",", "")
+        pad = len(s) % 4
+        if pad:
+            s += "=" * (4 - pad)
+        return base64.b64decode(s)
+
+    @staticmethod
+    def _mega_bytes_to_a32(b: bytes) -> list[int]:
+        if len(b) % 4:
+            b += b"\x00" * (4 - (len(b) % 4))
+        return list(struct.unpack(f">{len(b) // 4}I", b))
+
+    @staticmethod
+    def _mega_a32_to_bytes(a: list[int]) -> bytes:
+        return struct.pack(f">{len(a)}I", *(x & 0xFFFFFFFF for x in a))
+
+    @classmethod
+    def _mega_aes_ecb_decrypt(cls, data: bytes, key: bytes) -> bytes:
+        try:
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            from cryptography.hazmat.backends import default_backend
+            dec = Cipher(algorithms.AES(key), modes.ECB(), backend=default_backend()).decryptor()
+            return dec.update(data) + dec.finalize()
+        except ImportError:
+            from Crypto.Cipher import AES
+            return AES.new(key, AES.MODE_ECB).decrypt(data)
+
+    @classmethod
+    def _mega_aes_cbc_decrypt(cls, data: bytes, key: bytes) -> bytes:
+        iv = b"\x00" * 16
+        try:
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            from cryptography.hazmat.backends import default_backend
+            dec = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend()).decryptor()
+            return dec.update(data) + dec.finalize()
+        except ImportError:
+            from Crypto.Cipher import AES
+            return AES.new(key, AES.MODE_CBC, iv).decrypt(data)
+
+    @classmethod
+    def _mega_decrypt_attr(cls, attr_b64: str, key_a32: list[int]) -> dict[str, Any]:
+        try:
+            raw = cls._mega_b64_decode(attr_b64)
+            if not raw:
+                return {}
+            if len(key_a32) >= 8:
+                k = [key_a32[0] ^ key_a32[4], key_a32[1] ^ key_a32[5], key_a32[2] ^ key_a32[6], key_a32[3] ^ key_a32[7]]
+            else:
+                k = key_a32[:4]
+            dec = cls._mega_aes_cbc_decrypt(raw, cls._mega_a32_to_bytes(k)).rstrip(b"\x00")
+            if dec.startswith(b"MEGA{"):
+                end = dec.rfind(b"}") + 1
+                if end > 4:
+                    return json.loads(dec[4:end].decode("utf-8", errors="replace"))
+        except Exception:
+            pass
+        return {}
+
+    @staticmethod
+    def _parse_mega_url(url: str) -> dict[str, str]:
+        """Parse MEGA URL formats:
+        - https://mega.nz/folder/FOLDER_ID#KEY or .../folder/FOLDER_ID#KEY/file/SUB_ID
+        - https://mega.nz/file/FILE_ID#KEY
+        - https://mega.nz/#F!FOLDER_ID!KEY
+        - https://mega.nz/#!FILE_ID!KEY
+        """
+        u = str(url or "").strip()
+        m_folder = re.search(r"mega\.(?:co\.)?nz/folder/([a-zA-Z0-9_-]+)#([a-zA-Z0-9_-]+)(?:/(?:file|folder)/([a-zA-Z0-9_-]+))?", u)
+        if m_folder:
+            return {"kind": "folder", "id": m_folder.group(1), "key": m_folder.group(2), "sub_id": m_folder.group(3) or ""}
+        m_old_folder = re.search(r"mega\.(?:co\.)?nz/#F!([a-zA-Z0-9_-]+)!([a-zA-Z0-9_-]+)", u)
+        if m_old_folder:
+            return {"kind": "folder", "id": m_old_folder.group(1), "key": m_old_folder.group(2), "sub_id": ""}
+        m_file = re.search(r"mega\.(?:co\.)?nz/file/([a-zA-Z0-9_-]+)#([a-zA-Z0-9_-]+)", u)
+        if m_file:
+            return {"kind": "file", "id": m_file.group(1), "key": m_file.group(2), "sub_id": ""}
+        m_old_file = re.search(r"mega\.(?:co\.)?nz/#!([a-zA-Z0-9_-]+)!([a-zA-Z0-9_-]+)", u)
+        if m_old_file:
+            return {"kind": "file", "id": m_old_file.group(1), "key": m_old_file.group(2), "sub_id": ""}
+        raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"Invalid or unsupported MEGA URL format (missing decryption key after #): {u}")
+
+    async def _mega_api_req(self, payload: list[dict[str, Any]], params: dict[str, Any] | None = None, proxy: str | None = None) -> Any:
+        q = {"id": str(random.randint(100000, 9999999))}
+        if params:
+            q.update({k: str(v) for k, v in params.items() if v is not None})
+        api_url = f"https://g.api.mega.co.nz/cs?{urlencode(q)}"
+        client_kw: dict[str, Any] = {"timeout": 30.0, "follow_redirects": True}
+        if proxy:
+            if "socks" in str(proxy).lower():
+                from ..utils.http import ensure_socks_support
+                ensure_socks_support()
+            client_kw["proxy"] = proxy
+        for attempt in range(4):
+            async with httpx.AsyncClient(**client_kw) as client:
+                resp = await client.post(api_url, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+            if isinstance(data, int) and data == -3:
+                await asyncio.sleep(1.0 * (attempt + 1))
+                continue
+            if isinstance(data, list) and data and isinstance(data[0], int) and data[0] < 0:
+                code = data[0]
+                if code == -3 and attempt < 3:
+                    await asyncio.sleep(1.0 * (attempt + 1))
+                    continue
+                if code in (-9, -16, -11):
+                    raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"MEGA item not found or access denied (API error {code})")
+                if code in (-17, -18):
+                    raise ProviderFailure("PROVIDER_RATE_LIMITED", f"MEGA bandwidth quota or temporary unavailability (API error {code})")
+                raise ProviderFailure("DOWNLOAD_FAILED", f"MEGA API error {code}")
+            return data[0] if isinstance(data, list) and data else data
+        raise ProviderFailure("DOWNLOAD_FAILED", "MEGA API busy (-3 EAGAIN)")
+
+    async def _list_mega_folder_nodes(self, url: str, proxy: str | None = None) -> list[dict[str, Any]]:
+        parsed = self._parse_mega_url(url)
+        if parsed["kind"] != "folder":
+            return []
+        folder_id = parsed["id"]
+        folder_key_b64 = parsed["key"]
+        sub_target = parsed.get("sub_id") or ""
+        master_key = self._mega_b64_decode(folder_key_b64)
+        if len(master_key) not in (16, 24, 32):
+            master_key = master_key[:16].ljust(16, b"\x00")
+
+        res = await self._mega_api_req([{"a": "f", "c": 1, "r": 1}], params={"n": folder_id}, proxy=proxy)
+        if not isinstance(res, dict) or "f" not in res:
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"Could not list MEGA folder {folder_id}")
+
+        raw_nodes = res.get("f") or []
+        nodes_by_id: dict[str, dict[str, Any]] = {}
+        for n in raw_nodes:
+            h = str(n.get("h") or "")
+            p = str(n.get("p") or "")
+            t = int(n.get("t") if n.get("t") is not None else 0)
+            k_full = str(n.get("k") or "")
+            if not h or not k_full:
+                continue
+            # A node key may contain multiple slash-separated entries: "owner:b64/owner2:b64"
+            dec_k_a32: list[int] = []
+            for part in k_full.split("/"):
+                k_b64 = part.split(":", 1)[1] if ":" in part else part
+                if not k_b64:
+                    continue
+                try:
+                    enc_k = self._mega_b64_decode(k_b64)
+                    if len(enc_k) % 16 != 0:
+                        continue
+                    dec_k_bytes = self._mega_aes_ecb_decrypt(enc_k, master_key)
+                    dec_k_a32 = self._mega_bytes_to_a32(dec_k_bytes)
+                    break
+                except Exception:
+                    continue
+            if not dec_k_a32:
+                continue
+            attrs = self._mega_decrypt_attr(str(n.get("a") or ""), dec_k_a32)
+            node_name = safe_name(str(attrs.get("n") or h))
+            nodes_by_id[h] = {
+                "h": h,
+                "p": p,
+                "t": t,
+                "s": int(n.get("s") or 0),
+                "name": node_name,
+                "key_a32": dec_k_a32,
+            }
+
+        if not nodes_by_id:
+            return []
+
+        # Build relative paths for all file nodes (t == 0)
+        # Note: The root folder node itself is the first t==1 node whose parent is not in nodes_by_id.
+        root_handles = {h for h, info in nodes_by_id.items() if info["p"] not in nodes_by_id}
+
+        def _build_rel_path(handle: str) -> str:
+            parts: list[str] = []
+            curr = handle
+            visited: set[str] = set()
+            while curr and curr in nodes_by_id and curr not in visited:
+                visited.add(curr)
+                info = nodes_by_id[curr]
+                # If there is a single root folder in MEGA share and transfer_job already creates folder_dir for the item,
+                # check if curr is the root handle itself. Including root folder name or relative children:
+                if curr in root_handles and len(root_handles) == 1 and info["t"] == 1:
+                    break
+                parts.append(info["name"])
+                curr = info["p"]
+            parts.reverse()
+            return "/".join(parts) if parts else nodes_by_id[handle]["name"]
+
+        file_items: list[dict[str, Any]] = []
+        for h, info in nodes_by_id.items():
+            if info["t"] != 0:
+                continue
+            if sub_target and h != sub_target:
+                # Check if sub_target is an ancestor folder of h
+                curr_p = info["p"]
+                is_desc = False
+                seen_p: set[str] = set()
+                while curr_p and curr_p in nodes_by_id and curr_p not in seen_p:
+                    if curr_p == sub_target:
+                        is_desc = True
+                        break
+                    seen_p.add(curr_p)
+                    curr_p = nodes_by_id[curr_p]["p"]
+                if not is_desc:
+                    continue
+            rel_path = _build_rel_path(h)
+            k_a32 = info["key_a32"]
+            if len(k_a32) < 8:
+                continue
+            file_key_bytes = self._mega_a32_to_bytes([k_a32[0] ^ k_a32[4], k_a32[1] ^ k_a32[5], k_a32[2] ^ k_a32[6], k_a32[3] ^ k_a32[7]])
+            file_iv_bytes = self._mega_a32_to_bytes([k_a32[4], k_a32[5], 0, 0])
+            node_url = f"https://mega.nz/folder/{folder_id}#{folder_key_b64}/file/{h}"
+            file_items.append({
+                "id": node_url,
+                "path": node_url,
+                "url": node_url,
+                "name": info["name"],
+                "type": "file",
+                "size": info["s"],
+                "provider": "links",
+                "_relative_path": rel_path,
+                "meta": {
+                    "provider": "links",
+                    "mega_folder_id": folder_id,
+                    "mega_node_id": h,
+                    "mega_key_hex": file_key_bytes.hex(),
+                    "mega_iv_hex": file_iv_bytes.hex(),
+                    "size": info["s"],
+                    "relative_path": rel_path,
+                },
+            })
+        return file_items
+
+    async def _download_mega_stream_decrypt(
+        self,
+        dl_url: str,
+        dest: Path,
+        file_key: bytes,
+        file_iv: bytes,
+        expected_size: int,
+        progress: JobState,
+        proxy: str | None = None,
+    ) -> Path:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        part_path = dest.with_suffix(dest.suffix + ".part")
+        progress.current_file = dest.name
+
+        def _make_decryptor(initial_iv: bytes, byte_offset: int = 0) -> Any:
+            if byte_offset > 0:
+                block_offset = byte_offset // 16
+                iv_int = int.from_bytes(initial_iv, "big") + block_offset
+                ctr_iv = iv_int.to_bytes(16, "big")
+            else:
+                ctr_iv = initial_iv
+            try:
+                from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+                from cryptography.hazmat.backends import default_backend
+                return Cipher(algorithms.AES(file_key), modes.CTR(ctr_iv), backend=default_backend()).decryptor()
+            except ImportError:
+                from Crypto.Cipher import AES
+                from Crypto.Util import Counter
+                ctr = Counter.new(128, initial_value=int.from_bytes(ctr_iv, "big"))
+                return AES.new(file_key, AES.MODE_CTR, counter=ctr)
+
+        client_kw: dict[str, Any] = {
+            "follow_redirects": True,
+            "timeout": httpx.Timeout(None, connect=30.0, read=60.0, write=30.0, pool=30.0),
+        }
+        if proxy:
+            if "socks" in str(proxy).lower():
+                from ..utils.http import ensure_socks_support
+                ensure_socks_support()
+            client_kw["proxy"] = proxy
+
+        for attempt in range(4):
+            progress.check_cancelled()
+            done = part_path.stat().st_size if part_path.exists() else 0
+            # Align resume offset to 16-byte AES block boundary
+            if done % 16 != 0:
+                done = (done // 16) * 16
+                with part_path.open("r+b") as f_trunc:
+                    f_trunc.truncate(done)
+            req_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36"}
+            if done > 0:
+                req_headers["Range"] = f"bytes={done}-"
+            decryptor = _make_decryptor(file_iv, done)
+            try:
+                async with httpx.AsyncClient(**client_kw) as client:
+                    async with client.stream("GET", dl_url, headers=req_headers) as resp:
+                        if resp.status_code == 509 or resp.status_code == 429:
+                            raise ProviderFailure("PROVIDER_RATE_LIMITED", f"MEGA bandwidth quota exceeded (HTTP {resp.status_code})")
+                        resp.raise_for_status()
+                        if done > 0 and resp.status_code != 206:
+                            part_path.unlink(missing_ok=True)
+                            done = 0
+                            decryptor = _make_decryptor(file_iv, 0)
+                        total = expected_size or (done + int(resp.headers.get("content-length") or 0))
+                        with part_path.open("ab" if done > 0 else "wb") as fh:
+                            async for chunk in resp.aiter_bytes(262144):
+                                progress.check_cancelled()
+                                if not chunk:
+                                    continue
+                                plain = decryptor.update(chunk)
+                                fh.write(plain)
+                                done += len(plain)
+                                progress.add_bytes(len(plain), total, "download", dest.name)
+                            if hasattr(decryptor, "finalize"):
+                                tail = decryptor.finalize()
+                                if tail:
+                                    fh.write(tail)
+                                    done += len(tail)
+                if not expected_size or part_path.stat().st_size >= expected_size:
+                    break
+            except ProviderFailure as pf:
+                if pf.code == "PROVIDER_RATE_LIMITED" and not proxy:
+                    tor_px = await self._ensure_tor_proxy(progress)
+                    if tor_px:
+                        proxy = self._isolated_proxy(tor_px, uuid.uuid4().hex[:8])
+                        client_kw["proxy"] = proxy
+                        progress.log("[MEGA] Bandwidth limit reached; switching to isolated Tor circuit and resuming...")
+                        continue
+                raise
+            except Exception as exc:
+                if attempt == 3:
+                    raise ProviderFailure("DOWNLOAD_FAILED", f"MEGA file stream failed for {dest.name}: {exc}") from exc
+                await asyncio.sleep(1.5 * (attempt + 1))
+
+        part_path.replace(dest)
+        self._validate_downloaded_files([dest])
+        return dest
+
+    async def _download_mega_file(
+        self,
+        url: str,
+        dest_dir: Path,
+        name: str | None,
+        progress: JobState,
+        file_ref: dict[str, Any] | None = None,
+        proxy: str | None = None,
+    ) -> list[Path]:
+        file_ref = file_ref or {}
+        meta = file_ref.get("meta") or {}
+
+        # Case 1: Pre-resolved folder child node with key/iv in metadata
+        folder_id = str(meta.get("mega_folder_id") or "")
+        node_id = str(meta.get("mega_node_id") or "")
+        key_hex = str(meta.get("mega_key_hex") or "")
+        iv_hex = str(meta.get("mega_iv_hex") or "")
+
+        if folder_id and node_id and key_hex and iv_hex:
+            res = await self._mega_api_req([{"a": "g", "g": 1, "n": node_id}], params={"n": folder_id}, proxy=proxy)
+            dl_url = str(res.get("g") or "")
+            if not dl_url:
+                raise ProviderFailure("DOWNLOAD_FAILED", f"MEGA did not return download URL for folder node {node_id}")
+            file_sz = int(res.get("s") or meta.get("size") or file_ref.get("size") or 0)
+            out_name = safe_name(name or file_ref.get("name") or f"{node_id}.bin")
+            dest = dest_dir / out_name
+            progress.log(f"[MEGA] Downloading & decrypting node {out_name} ({file_sz} bytes)...")
+            downloaded_path = await self._download_mega_stream_decrypt(
+                dl_url, dest, bytes.fromhex(key_hex), bytes.fromhex(iv_hex), file_sz, progress, proxy=proxy
+            )
+            return [downloaded_path]
+
+        # Case 2: Public file link (mega.nz/file/ID#KEY or mega.nz/folder/FID#FKEY/file/NID)
+        parsed = self._parse_mega_url(url)
+        if parsed["kind"] == "folder" and parsed.get("sub_id"):
+            nodes = await self._list_mega_folder_nodes(url, proxy=proxy)
+            if not nodes:
+                raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"MEGA folder file node not found: {url}")
+            target_node = nodes[0]
+            return await self._download_mega_file(target_node["url"], dest_dir, name or target_node["name"], progress, file_ref=target_node, proxy=proxy)
+        if parsed["kind"] == "folder":
+            return await self._download_mega_folder(url, dest_dir, progress, proxy=proxy)
+
+        file_id = parsed["id"]
+        raw_key = self._mega_b64_decode(parsed["key"])
+        k_a32 = self._mega_bytes_to_a32(raw_key)
+        if len(k_a32) < 8:
+            raise ProviderFailure("DOWNLOAD_FAILED", f"Invalid MEGA file decryption key length for {file_id}")
+        file_key = self._mega_a32_to_bytes([k_a32[0] ^ k_a32[4], k_a32[1] ^ k_a32[5], k_a32[2] ^ k_a32[6], k_a32[3] ^ k_a32[7]])
+        file_iv = self._mega_a32_to_bytes([k_a32[4], k_a32[5], 0, 0])
+
+        res = await self._mega_api_req([{"a": "g", "g": 1, "p": file_id}], proxy=proxy)
+        dl_url = str(res.get("g") or "")
+        if not dl_url:
+            raise ProviderFailure("DOWNLOAD_FAILED", f"MEGA did not return download URL for file {file_id}")
+        attrs = self._mega_decrypt_attr(str(res.get("at") or ""), k_a32)
+        real_name = str(attrs.get("n") or "").strip()
+        if not name or name in ("file", file_id) or name.startswith(("download_", "video_download_")):
+            out_name = safe_name(real_name or name or f"{file_id}.bin")
+        else:
+            out_name = safe_name(name)
+        file_sz = int(res.get("s") or file_ref.get("size") or 0)
+        dest = dest_dir / out_name
+        progress.log(f"[MEGA] Downloading & decrypting {out_name} ({file_sz} bytes)...")
+        downloaded_path = await self._download_mega_stream_decrypt(
+            dl_url, dest, file_key, file_iv, file_sz, progress, proxy=proxy
+        )
+        return [downloaded_path]
+
+    async def _download_mega_folder(
+        self,
+        url: str,
+        dest_dir: Path,
+        progress: JobState,
+        proxy: str | None = None,
+    ) -> list[Path]:
+        nodes = await self._list_mega_folder_nodes(url, proxy=proxy)
+        if not nodes:
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"MEGA folder is empty or could not be decrypted: {url}")
+        progress.log(f"[MEGA] Resolved {len(nodes)} file(s) inside MEGA folder. Starting download...")
+        options = (progress.payload or {}).get("options", {}) if hasattr(progress, "payload") else {}
+        conc = max(1, min(8, int(options.get("download_concurrency") or 4)))
+        sem = asyncio.Semaphore(conc)
+        results: list[Path] = []
+
+        async def _dl_node(node: dict[str, Any]) -> list[Path]:
+            async with sem:
+                progress.check_cancelled()
+                rel = str(node.get("_relative_path") or node.get("name") or "file")
+                target_sub = dest_dir / Path(rel).parent
+                target_sub.mkdir(parents=True, exist_ok=True)
+                return await self._download_mega_file(node["url"], target_sub, Path(rel).name, progress, file_ref=node, proxy=proxy)
+
+        for batch in await asyncio.gather(*(_dl_node(n) for n in nodes)):
+            results.extend(batch)
+        return results
+
+    # -------------------------------------------------------------------------
+    # Gofile.io Cloud Support (Guest Token + WT Signature + Folder Tree)
+    # -------------------------------------------------------------------------
+
+    _gofile_token_cache: dict[str, Any] = {}
+
+    @classmethod
+    async def _get_gofile_guest_session(cls, proxy: str | None = None) -> tuple[str, str, str]:
+        now = time.time()
+        cached = cls._gofile_token_cache
+        if cached.get("token") and cached.get("wt") and now - float(cached.get("ts") or 0) < 1800:
+            return str(cached["token"]), str(cached["wt"]), str(cached["ua"])
+
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        lang = "en-US"
+        client_kw: dict[str, Any] = {"timeout": 20.0, "follow_redirects": True, "headers": {"User-Agent": ua}}
+        if proxy:
+            if "socks" in str(proxy).lower():
+                from ..utils.http import ensure_socks_support
+                ensure_socks_support()
+            client_kw["proxy"] = proxy
+
+        async with httpx.AsyncClient(**client_kw) as client:
+            r_acc = await client.post("https://api.gofile.io/accounts")
+            r_acc.raise_for_status()
+            acc_data = r_acc.json()
+            token = str((acc_data.get("data") or {}).get("token") or "")
+            if not token:
+                raise ProviderFailure("DOWNLOAD_FAILED", "Gofile failed to mint guest account token")
+
+            secret = "4fd6sg89d7s6"
+            try:
+                r_wt = await client.get("https://gofile.io/js/wt.obf.js")
+                if r_wt.status_code == 200 and r_wt.text:
+                    dec = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), r_wt.text)
+                    idx = dec.find("function generateWT")
+                    chunk = dec[idx : idx + 700] if idx >= 0 else dec
+                    # Find static secret literal in generateWT dictionary (e.g. 'Qsvxv':'12af056dacea0b')
+                    for m_s in re.finditer(r"[\x22\x27]([0-9a-zA-Z_-]{8,32})[\x22\x27]", chunk):
+                        cand = m_s.group(1)
+                        if cand not in ("function", "toString", "userAgent", "language") and not cand.startswith("0x"):
+                            secret = cand
+                            break
+            except Exception:
+                pass
+
+            bucket = str(int(time.time() // 14400))
+            wt = hashlib.sha256(f"{ua}::{lang}::{token}::{bucket}::{secret}".encode("utf-8")).hexdigest()
+            cls._gofile_token_cache = {"token": token, "wt": wt, "ua": ua, "ts": now}
+            return token, wt, ua
+
+    async def _list_gofile_items(self, url: str, proxy: str | None = None, _rel_prefix: str = "") -> list[dict[str, Any]]:
+        m = re.search(r"gofile\.io/d/([a-zA-Z0-9_-]+)", url)
+        content_id = m.group(1) if m else url.rstrip("/").split("/")[-1]
+        if not content_id:
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"Invalid Gofile URL ({url}). Click Download in browser, stop it, copy the store-*.gofile.io/download/web/... URL, then paste that link.")
+
+        token, wt, ua = await self._get_gofile_guest_session(proxy=proxy)
+        headers = {
+            "User-Agent": ua,
+            "Authorization": f"Bearer {token}",
+            "X-Website-Token": wt,
+            "X-BL": "en-US",
+            "Referer": "https://gofile.io/",
+            "Origin": "https://gofile.io",
+        }
+        client_kw: dict[str, Any] = {"timeout": 25.0, "follow_redirects": True}
+        if proxy:
+            if "socks" in str(proxy).lower():
+                from ..utils.http import ensure_socks_support
+                ensure_socks_support()
+            client_kw["proxy"] = proxy
+
+        async with httpx.AsyncClient(**client_kw) as client:
+            api_url = f"https://api.gofile.io/contents/{content_id}?page=1&pageSize=1000&sortField=name&sortDirection=1"
+            resp = await client.get(api_url, headers=headers)
+            resp.raise_for_status()
+            body = resp.json()
+
+        if body.get("status") != "ok":
+            raise ProviderFailure(
+                "SOURCE_FILE_NOT_FOUND",
+                f"Gofile content error ({body.get('status')}): Gofile page links require valid public share or store-*.gofile.io/download/web/... URL.",
+            )
+
+        data = body.get("data") or {}
+        if data.get("canAccess") is False:
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"Gofile content {content_id} is private or password-protected. Click Download in browser, stop it, copy the store-*.gofile.io/download/web/... URL, then paste that link.")
+
+        if data.get("type") == "file" and data.get("link"):
+            fname = safe_name(str(data.get("name") or f"{content_id}.bin"))
+            rel = f"{_rel_prefix}/{fname}" if _rel_prefix else fname
+            return [{
+                "id": str(data["link"]),
+                "path": str(data["link"]),
+                "url": str(data["link"]),
+                "name": fname,
+                "type": "file",
+                "size": int(data.get("size") or 0),
+                "provider": "links",
+                "_relative_path": rel,
+                "cookies": f"accountToken={token}",
+                "headers": {"Cookie": f"accountToken={token}", "Referer": "https://gofile.io/", "User-Agent": ua},
+                "meta": {
+                    "provider": "links",
+                    "headers": {"Cookie": f"accountToken={token}", "Referer": "https://gofile.io/", "User-Agent": ua},
+                    "cookies": f"accountToken={token}",
+                    "size": int(data.get("size") or 0),
+                },
+            }]
+
+        children = data.get("children") or {}
+        child_list = list(children.values()) if isinstance(children, dict) else (children if isinstance(children, list) else [])
+        out: list[dict[str, Any]] = []
+        for child in child_list:
+            if not isinstance(child, dict):
+                continue
+            ctype = str(child.get("type") or "file").lower()
+            cname = safe_name(str(child.get("name") or child.get("id") or "file"))
+            crel = f"{_rel_prefix}/{cname}" if _rel_prefix else cname
+            if ctype == "folder":
+                cid = str(child.get("code") or child.get("id") or "")
+                if cid:
+                    sub = await self._list_gofile_items(f"https://gofile.io/d/{cid}", proxy=proxy, _rel_prefix=crel)
+                    out.extend(sub)
+            else:
+                dlink = str(child.get("link") or "")
+                if not dlink:
+                    continue
+                out.append({
+                    "id": dlink,
+                    "path": dlink,
+                    "url": dlink,
+                    "name": cname,
+                    "type": "file",
+                    "size": int(child.get("size") or 0),
+                    "provider": "links",
+                    "_relative_path": crel,
+                    "cookies": f"accountToken={token}",
+                    "headers": {"Cookie": f"accountToken={token}", "Referer": "https://gofile.io/", "User-Agent": ua},
+                    "meta": {
+                        "provider": "links",
+                        "headers": {"Cookie": f"accountToken={token}", "Referer": "https://gofile.io/", "User-Agent": ua},
+                        "cookies": f"accountToken={token}",
+                        "size": int(child.get("size") or 0),
+                    },
+                })
+        return out
+
+    async def _download_gofile_page(self, url: str, dest_dir: Path, name: str | None, progress: JobState, proxy: str | None = None) -> list[Path]:
+        progress.log(f"[Gofile] Resolving Gofile share link: {url}")
+        try:
+            items = await self._list_gofile_items(url, proxy=proxy)
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(
+                "SOURCE_FILE_NOT_FOUND",
+                f"Gofile page links could not be resolved ({exc}). Click Download in browser, stop it, copy the store-*.gofile.io/download/web/... URL, then paste that link.",
+            ) from exc
+
+        if not items:
+            raise ProviderFailure(
+                "SOURCE_FILE_NOT_FOUND",
+                "Gofile page links are empty or not direct downloads. Click Download in browser, stop it, copy the store-*.gofile.io/download/web/... URL, then paste that link.",
+            )
+
+        results: list[Path] = []
+        for idx, it in enumerate(items):
+            rel = str(it.get("_relative_path") or it.get("name") or f"file_{idx + 1}")
+            sub_dir = dest_dir / Path(rel).parent
+            sub_dir.mkdir(parents=True, exist_ok=True)
+            target_name = name if (len(items) == 1 and name and "." in name and not name.startswith("gofile_")) else Path(rel).name
+            hdrs = it.get("headers") or {}
+            cks = it.get("cookies") or ""
+            try:
+                dl = await self._download_aria2(it["url"], sub_dir, target_name, progress, headers=hdrs, proxy=proxy, cookies=cks)
+            except Exception:
+                dl = await self._download_http_stream(it["url"], sub_dir, target_name, progress, headers=hdrs, proxy=proxy, cookies=cks)
+            results.extend(dl)
+        return results
+
+    # -------------------------------------------------------------------------
+    # Pixeldrain Cloud Support (File /u/ID & Album List /l/ID)
+    # -------------------------------------------------------------------------
+
+    async def _list_pixeldrain_items(self, url: str, proxy: str | None = None) -> list[dict[str, Any]]:
+        m_list = re.search(r"pixeldrain\.com/(?:l|api/list)/([a-zA-Z0-9_-]+)", url)
+        if m_list:
+            list_id = m_list.group(1)
+            api_url = f"https://pixeldrain.com/api/list/{list_id}"
+            client_kw: dict[str, Any] = {"timeout": 20.0, "follow_redirects": True}
+            if proxy:
+                if "socks" in str(proxy).lower():
+                    from ..utils.http import ensure_socks_support
+                    ensure_socks_support()
+                client_kw["proxy"] = proxy
+            async with httpx.AsyncClient(**client_kw) as client:
+                resp = await client.get(api_url)
+                resp.raise_for_status()
+                data = resp.json()
+            files = data.get("files") or []
+            out: list[dict[str, Any]] = []
+            for f in files:
+                fid = str(f.get("id") or "")
+                if not fid:
+                    continue
+                fname = safe_name(str(f.get("name") or fid))
+                dl_url = f"https://pixeldrain.com/api/file/{fid}?download"
+                out.append({
+                    "id": dl_url,
+                    "path": dl_url,
+                    "url": dl_url,
+                    "name": fname,
+                    "type": "file",
+                    "size": int(f.get("size") or 0),
+                    "provider": "links",
+                    "_relative_path": fname,
+                    "meta": {"provider": "links", "size": int(f.get("size") or 0)},
+                })
+            return out
+
+        m_file = re.search(r"pixeldrain\.com/(?:u|api/file)/([a-zA-Z0-9_-]+)", url)
+        if not m_file:
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"Invalid Pixeldrain URL: {url}")
+        fid = m_file.group(1)
+        info_url = f"https://pixeldrain.com/api/file/{fid}/info"
+        dl_url = f"https://pixeldrain.com/api/file/{fid}?download"
+        fname = f"{fid}.bin"
+        fsize = 0
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                r = await client.get(info_url)
+                if r.status_code == 200:
+                    info = r.json()
+                    if info.get("name"):
+                        fname = safe_name(str(info["name"]))
+                    fsize = int(info.get("size") or 0)
+        except Exception:
+            pass
+        return [{
+            "id": dl_url,
+            "path": dl_url,
+            "url": dl_url,
+            "name": fname,
+            "type": "file",
+            "size": fsize,
+            "provider": "links",
+            "_relative_path": fname,
+            "meta": {"provider": "links", "size": fsize},
+        }]
+
+    async def _download_pixeldrain(self, url: str, dest_dir: Path, name: str | None, progress: JobState, proxy: str | None = None) -> list[Path]:
+        if "?download" in url and name and "." in name and not name.startswith(("download_", "video_download_")):
+            target_name = safe_name(name)
+            try:
+                return await self._download_aria2(url, dest_dir, target_name, progress, proxy=proxy)
+            except Exception:
+                return await self._download_http_stream(url, dest_dir, target_name, progress, proxy=proxy)
+        items = await self._list_pixeldrain_items(url, proxy=proxy)
+        if not items:
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"No files found on Pixeldrain link: {url}")
+        results: list[Path] = []
+        for it in items:
+            target_name = it["name"]
+            if len(items) == 1 and name and "." in name and not name.startswith(("download_", "video_download_")):
+                target_name = safe_name(name)
+            try:
+                dl = await self._download_aria2(it["url"], dest_dir, target_name, progress, proxy=proxy)
+            except Exception:
+                dl = await self._download_http_stream(it["url"], dest_dir, target_name, progress, proxy=proxy)
+            results.extend(dl)
+        return results
+
+    # -------------------------------------------------------------------------
+    # MediaFire Folder Support + Dropbox + OneDrive
+    # -------------------------------------------------------------------------
+
+    async def _list_mediafire_folder_items(self, url: str, _rel_prefix: str = "") -> list[dict[str, Any]]:
+        m = re.search(r"mediafire\.com/folder/([a-zA-Z0-9,_-]+)", url)
+        if not m:
+            return []
+        folder_keys = [k.strip() for k in m.group(1).split(",") if k.strip()]
+        out: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(timeout=25.0, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            for fkey in folder_keys:
+                # 1. List files in folder
+                r_files = await client.get(
+                    "https://www.mediafire.com/api/1.4/folder/get_content.php",
+                    params={"r": "utga", "content_type": "files", "filter": "all", "order_by": "name", "order_direction": "asc", "chunk": "1", "version": "1.5", "folder_key": fkey, "response_format": "json"},
+                )
+                if r_files.status_code == 200:
+                    f_json = (r_files.json().get("response") or {}).get("folder_content") or {}
+                    for f_obj in f_json.get("files") or []:
+                        qkey = f_obj.get("quickkey")
+                        fname = safe_name(str(f_obj.get("filename") or qkey or "file"))
+                        f_url = ((f_obj.get("links") or {}).get("normal_download")) or f"https://www.mediafire.com/file/{qkey}/{fname}/file"
+                        rel = f"{_rel_prefix}/{fname}" if _rel_prefix else fname
+                        out.append({
+                            "id": f_url,
+                            "path": f_url,
+                            "url": f_url,
+                            "name": fname,
+                            "type": "file",
+                            "size": int(f_obj.get("size") or 0),
+                            "provider": "links",
+                            "_relative_path": rel,
+                            "meta": {"provider": "links", "size": int(f_obj.get("size") or 0)},
+                        })
+                # 2. List subfolders recursively
+                r_dirs = await client.get(
+                    "https://www.mediafire.com/api/1.4/folder/get_content.php",
+                    params={"r": "utga", "content_type": "folders", "filter": "all", "order_by": "name", "order_direction": "asc", "chunk": "1", "version": "1.5", "folder_key": fkey, "response_format": "json"},
+                )
+                if r_dirs.status_code == 200:
+                    d_json = (r_dirs.json().get("response") or {}).get("folder_content") or {}
+                    for d_obj in d_json.get("folders") or []:
+                        sub_key = d_obj.get("folderkey")
+                        sub_name = safe_name(str(d_obj.get("name") or sub_key or "folder"))
+                        if sub_key:
+                            sub_rel = f"{_rel_prefix}/{sub_name}" if _rel_prefix else sub_name
+                            sub_items = await self._list_mediafire_folder_items(f"https://www.mediafire.com/folder/{sub_key}", _rel_prefix=sub_rel)
+                            out.extend(sub_items)
+        return out
+
+    async def _download_mediafire_folder(self, url: str, dest_dir: Path, progress: JobState) -> list[Path]:
+        items = await self._list_mediafire_folder_items(url)
+        if not items:
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"MediaFire folder is empty or unavailable: {url}")
+        progress.log(f"[MediaFire] Found {len(items)} file(s) in MediaFire folder.")
+        results: list[Path] = []
+        for it in items:
+            rel = str(it.get("_relative_path") or it["name"])
+            sub_dir = dest_dir / Path(rel).parent
+            sub_dir.mkdir(parents=True, exist_ok=True)
+            dl = await self._download_mediafire(it["url"], sub_dir, Path(rel).name, progress)
+            results.extend(dl)
+        return results
+
+    @staticmethod
+    def _resolve_dropbox_direct_url(url: str) -> str:
+        parsed = urlparse(url)
+        q = parse_qs(parsed.query, keep_blank_values=True)
+        q["dl"] = ["1"]
+        new_query = urlencode(q, doseq=True)
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+
+    async def _download_dropbox(self, url: str, dest_dir: Path, name: str | None, progress: JobState, is_folder: bool = False, proxy: str | None = None) -> list[Path]:
+        direct_url = self._resolve_dropbox_direct_url(url)
+        if is_folder and (not name or not name.lower().endswith(".zip")):
+            base_n = safe_name(name or Path(unquote(urlparse(url).path)).name or "dropbox_folder")
+            if not base_n.lower().endswith(".zip"):
+                base_n += ".zip"
+            name = base_n
+        elif not name or name.startswith(("download_", "video_download_")):
+            path_name = unquote(Path(urlparse(url).path).name)
+            if path_name:
+                name = safe_name(path_name)
+        progress.log(f"[Dropbox] Resolved direct download URL: {direct_url[:100]}")
+        try:
+            files = await self._download_aria2(direct_url, dest_dir, name, progress, proxy=proxy)
+        except Exception:
+            files = await self._download_http_stream(direct_url, dest_dir, name, progress, proxy=proxy)
+        if is_folder and files and files[0].suffix.lower() == ".zip":
+            try:
+                import zipfile
+                zpath = files[0]
+                if zipfile.is_zipfile(zpath):
+                    extract_dir = dest_dir / zpath.stem
+                    extract_dir.mkdir(parents=True, exist_ok=True)
+                    with zipfile.ZipFile(zpath, "r") as zf:
+                        zf.extractall(extract_dir)
+                    extracted = [p for p in sorted(extract_dir.rglob("*")) if p.is_file()]
+                    if extracted:
+                        zpath.unlink(missing_ok=True)
+                        return extracted
+            except Exception as exc:
+                progress.log(f"[Dropbox] Notice extracting folder zip ({exc}); keeping zip file.")
+        return files
+
+    async def _download_onedrive(self, url: str, dest_dir: Path, name: str | None, progress: JobState, proxy: str | None = None) -> list[Path]:
+        progress.log(f"[OneDrive] Resolving OneDrive/SharePoint link: {url[:100]}")
+        direct_url = url
+        if "1drv.ms" in url.lower() or "onedrive.live.com" in url.lower():
+            b64 = base64.urlsafe_b64encode(url.encode("utf-8")).decode("ascii").rstrip("=")
+            share_token = f"u!{b64}"
+            api_url = f"https://api.onedrive.com/v1.0/shares/{share_token}/root?expand=children"
+            try:
+                async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+                    r = await client.get(api_url)
+                    if r.status_code == 200:
+                        data = r.json()
+                        if "@content.downloadUrl" in data:
+                            direct_url = str(data["@content.downloadUrl"])
+                            if not name or name.startswith(("download_", "video_download_")):
+                                name = safe_name(str(data.get("name") or name or "onedrive_file"))
+                        elif "children" in data and isinstance(data["children"], list):
+                            results: list[Path] = []
+                            for child in data["children"]:
+                                c_dl = child.get("@content.downloadUrl")
+                                c_name = safe_name(str(child.get("name") or "file"))
+                                if c_dl:
+                                    dl = await self._download_aria2(str(c_dl), dest_dir, c_name, progress, proxy=proxy)
+                                    results.extend(dl)
+                            if results:
+                                return results
+            except Exception:
+                pass
+            if direct_url == url:
+                direct_url = f"https://api.onedrive.com/v1.0/shares/{share_token}/root/content"
+        elif "sharepoint.com" in url.lower():
+            parsed = urlparse(url)
+            q = parse_qs(parsed.query, keep_blank_values=True)
+            q["download"] = ["1"]
+            direct_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, urlencode(q, doseq=True), parsed.fragment))
+
+        try:
+            return await self._download_aria2(direct_url, dest_dir, name, progress, proxy=proxy)
+        except Exception:
+            return await self._download_http_stream(direct_url, dest_dir, name, progress, proxy=proxy)
 
     async def _resolve_mediafire_url(self, url: str) -> str:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}) as client:
@@ -2500,10 +3401,22 @@ class LinksProvider(BaseProvider):
                 headers=headers, cookies=cookies, dec_key=dec_key,
                 proxy=proxy, page_url=page_url, file_ref=file_ref,
             )
+        elif link_type == "mega_file":
+            return await self._download_mega_file(url, dest_dir, name, progress, file_ref=file_ref, proxy=proxy)
+        elif link_type == "mega_folder":
+            return await self._download_mega_folder(url, dest_dir, progress, proxy=proxy)
         elif link_type == "gofile_page":
-            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Gofile page links are not direct downloads. Click Download in browser, stop it, copy the store-*.gofile.io/download/web/... URL, then paste that link.")
+            return await self._download_gofile_page(url, dest_dir, name, progress, proxy=proxy)
+        elif link_type in ("pixeldrain", "pixeldrain_list"):
+            return await self._download_pixeldrain(url, dest_dir, name, progress, proxy=proxy)
         elif link_type == "mediafire":
             return await self._download_mediafire(url, dest_dir, name, progress)
+        elif link_type == "mediafire_folder":
+            return await self._download_mediafire_folder(url, dest_dir, progress)
+        elif link_type in ("dropbox", "dropbox_folder"):
+            return await self._download_dropbox(url, dest_dir, name, progress, is_folder=(link_type == "dropbox_folder"), proxy=proxy)
+        elif link_type == "onedrive":
+            return await self._download_onedrive(url, dest_dir, name, progress, proxy=proxy)
         elif link_type == "sorafolder":
             return await self._download_sorafolder(url, dest_dir, name, progress)
         elif link_type == "ytdlp":
@@ -2513,6 +3426,8 @@ class LinksProvider(BaseProvider):
                 return await self._download_ytdlp(url, dest_dir, name, progress)
         elif link_type == "gdrive":
             return await self._download_gdrive(url, dest_dir, name, progress)
+        elif link_type == "gdrive_folder":
+            return await self._download_gdrive_folder(url, dest_dir, progress)
         else:
             opt = (progress.payload or {}).get("options", {}) if hasattr(progress, "payload") else {}
             tc = int(opt.get("download_threads") or opt.get("threads_per_item") or opt.get("downloadThreads") or DOWNLOAD_THREADS)
@@ -2540,6 +3455,96 @@ class LinksProvider(BaseProvider):
     async def validate_credentials(self, credentials: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True}
 
+    def is_folder_link(self, url: str) -> bool:
+        """Return True if URL points to a multi-file cloud folder or album list."""
+        ltype = self._classify_link(str(url or ""))
+        return ltype in ("mega_folder", "gdrive_folder", "mediafire_folder", "pixeldrain_list", "dropbox_folder")
+
+    async def list_files(self, credentials: dict[str, Any], path_or_id: str) -> dict[str, Any]:
+        """List files inside a supported cloud folder/album URL."""
+        url = str(path_or_id or "").strip()
+        if not url:
+            return {"items": []}
+        ltype = self._classify_link(url)
+        if ltype == "mega_folder":
+            return {"items": await self._list_mega_folder_nodes(url)}
+        if ltype == "gofile_page":
+            return {"items": await self._list_gofile_items(url)}
+        if ltype == "pixeldrain_list":
+            return {"items": await self._list_pixeldrain_items(url)}
+        if ltype == "mediafire_folder":
+            return {"items": await self._list_mediafire_folder_items(url)}
+        return {"items": []}
+
+    async def download_folder(
+        self,
+        credentials: dict[str, Any],
+        folder_ref: dict[str, Any],
+        local_dir: Path,
+        progress: JobState,
+        _sem: asyncio.Semaphore | None = None,
+    ) -> list[Path]:
+        await self._ensure_deps()
+        url = str(folder_ref.get("id") or folder_ref.get("path") or folder_ref.get("url") or "").strip()
+        if not url:
+            raise ProviderFailure("DOWNLOAD_FAILED", "No folder URL provided")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        ltype = self._classify_link(url)
+
+        listing = await self.list_files(credentials, url)
+        items = listing.get("items") or []
+        if items:
+            progress.log(f"[links] Resolved {len(items)} file(s) in {ltype} folder: {folder_ref.get('name') or url[:80]}")
+            progress.files_to_download += len(items)
+            options = (progress.payload or {}).get("options", {}) if hasattr(progress, "payload") else {}
+            conc = max(1, int(options.get("download_concurrency") or 4))
+            sem = _sem or asyncio.Semaphore(conc)
+
+            async def _dl_child(child: dict[str, Any]) -> list[Path]:
+                progress.check_cancelled()
+                async with sem:
+                    rel_raw = str(child.get("_relative_path") or child.get("name") or "file").replace("\\", "/").strip("/")
+                    rel_parts = [safe_name(p) for p in rel_raw.split("/") if p and p not in (".", "..")]
+                    dest_dir = local_dir.joinpath(*rel_parts[:-1]) if len(rel_parts) > 1 else local_dir
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    fname = rel_parts[-1] if rel_parts else safe_name(str(child.get("name") or "file"))
+                    fsize = int(child.get("size") or 0)
+                    progress.start_file(fname, phase="download", size=fsize)
+                    try:
+                        from .base import download_with_retry
+                        path = await download_with_retry(
+                            lambda: self.download_file(credentials, child, dest_dir, progress),
+                            progress=progress,
+                            label=fname,
+                        )
+                        actual_sz = path.stat().st_size if (path and path.exists()) else fsize
+                        progress.finish_file(fname, phase="download", size=actual_sz)
+                        progress.files_downloaded += 1
+                        progress.log(f"[{progress.files_downloaded}/{progress.files_to_download}] Downloaded: {fname}")
+                        return [path]
+                    except ProviderFailure as exc:
+                        progress.finish_file(fname, phase="download")
+                        from .base import is_skippable_download_failure
+                        if not is_skippable_download_failure(exc):
+                            raise
+                        progress.fail_file(fname, exc.code, exc.message)
+                        return []
+                    except Exception:
+                        progress.finish_file(fname, phase="download")
+                        raise
+
+            batches = await asyncio.gather(*(_dl_child(c) for c in items))
+            return [p for batch in batches for p in batch if p and p.is_file()]
+
+        # Direct folder handlers (e.g. gdrive_folder via gdown, dropbox_folder via zip extract)
+        downloaded = await self._dispatch_download(
+            ltype, False, url, [url], local_dir, folder_ref.get("name"), progress, file_ref=folder_ref
+        )
+        valid_files = [p for p in downloaded if p and p.is_file()]
+        progress.files_to_download += len(valid_files)
+        progress.files_downloaded += len(valid_files)
+        return valid_files
+
     async def download_file(self, credentials: dict[str, Any], file_ref: dict[str, Any], local_path: Path, progress: JobState) -> Path:
         """Download a single file from a URL.
 
@@ -2564,7 +3569,8 @@ class LinksProvider(BaseProvider):
         if expected_size and len(urls) > 1:
             urls = await self._filter_urls_by_size(urls, expected_size, headers)
 
-        raw_name = file_ref.get("name") or (local_path.name if local_path.suffix else "")
+        is_existing_dir = local_path.exists() and local_path.is_dir()
+        raw_name = file_ref.get("name") or (local_path.name if (not is_existing_dir and local_path.suffix) else "")
         meta_dict = file_ref.get("meta") or {}
         page_url = str(file_ref.get("page_url") or meta_dict.get("page_url") or "").strip()
         if not page_url:
@@ -2588,7 +3594,7 @@ class LinksProvider(BaseProvider):
 
         progress.log(f"[links] {link_type}: {url[:120]}")
 
-        dest_dir = local_path.parent if local_path.suffix else local_path
+        dest_dir = local_path if is_existing_dir else (local_path.parent if local_path.suffix else local_path)
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         cookies = file_ref.get("cookies") or (file_ref.get("meta") or {}).get("cookies") or ""

@@ -5023,3 +5023,135 @@ def test_retry_upload_same_account_with_refreshed_credentials(tmp_path, monkeypa
         ("acc_1", "expired_sapisid", "folder_on_acc_1"),
         ("acc_1", "fresh_sapisid", "folder_on_acc_1"),
     ]
+
+
+def test_links_provider_classifies_mega_and_popular_cloud_file_and_folder_links():
+    provider = LinksProvider()
+    assert provider._classify_link("https://mega.nz/folder/niBCEa5Q#imRPN1pOpqGumFo1IfuAmg") == "mega_folder"
+    assert provider._classify_link("https://mega.nz/#F!niBCEa5Q!imRPN1pOpqGumFo1IfuAmg") == "mega_folder"
+    assert provider._classify_link("https://mega.nz/file/abc12345#key12345") == "mega_file"
+    assert provider._classify_link("https://mega.nz/#!abc12345!key12345") == "mega_file"
+    assert provider._classify_link("https://mega.nz/folder/niBCEa5Q#imRPN1pOpqGumFo1IfuAmg/file/xyz987") == "mega_file"
+    assert provider._classify_link("https://drive.google.com/drive/folders/1a2b3c4d5e") == "gdrive_folder"
+    assert provider._classify_link("https://drive.google.com/file/d/1a2b3c4d5e/view") == "gdrive"
+    assert provider._classify_link("https://pixeldrain.com/u/abc123") == "pixeldrain"
+    assert provider._classify_link("https://pixeldrain.com/l/list123") == "pixeldrain_list"
+    assert provider._classify_link("https://www.mediafire.com/folder/mf_folder_123/MyFolder") == "mediafire_folder"
+    assert provider._classify_link("https://www.mediafire.com/file/mf_file_123/test.zip/file") == "mediafire"
+    assert provider._classify_link("https://www.dropbox.com/scl/fo/abc123/folder?rlkey=xyz&dl=0") == "dropbox_folder"
+    assert provider._classify_link("https://www.dropbox.com/scl/fi/abc123/video.mp4?rlkey=xyz&dl=0") == "dropbox"
+    assert provider._classify_link("https://1drv.ms/u/s!Am123456") == "onedrive"
+    assert provider._classify_link("https://gofile.io/d/abc123") == "gofile_page"
+
+    assert provider.is_folder_link("https://mega.nz/folder/niBCEa5Q#imRPN1pOpqGumFo1IfuAmg") is True
+    assert provider.is_folder_link("https://drive.google.com/drive/folders/1a2b3c4d5e") is True
+    assert provider.is_folder_link("https://pixeldrain.com/l/list123") is True
+    assert provider.is_folder_link("https://www.mediafire.com/folder/mf_folder_123") is True
+    assert provider.is_folder_link("https://www.dropbox.com/scl/fo/abc123/folder") is True
+    assert provider.is_folder_link("https://mega.nz/file/abc12345#key12345") is False
+
+
+def test_links_provider_mega_folder_transfer_preserves_subfolders(tmp_path, monkeypatch):
+    dirs = {"input": tmp_path / "input", "output": tmp_path / "output"}
+    dirs["input"].mkdir()
+    dirs["output"].mkdir()
+
+    provider = LinksProvider()
+
+    async def no_deps():
+        return None
+
+    async def fake_list_mega(url, proxy=None):
+        assert "niBCEa5Q" in url
+        return [
+            {
+                "id": "https://mega.nz/folder/niBCEa5Q#imRPN1pOpqGumFo1IfuAmg/file/node1",
+                "path": "https://mega.nz/folder/niBCEa5Q#imRPN1pOpqGumFo1IfuAmg/file/node1",
+                "url": "https://mega.nz/folder/niBCEa5Q#imRPN1pOpqGumFo1IfuAmg/file/node1",
+                "name": "photo1.jpg",
+                "type": "file",
+                "size": 5,
+                "provider": "links",
+                "_relative_path": "Album.2026/photo1.jpg",
+                "meta": {
+                    "provider": "links",
+                    "mega_folder_id": "niBCEa5Q",
+                    "mega_node_id": "node1",
+                    "mega_key_hex": "00" * 16,
+                    "mega_iv_hex": "00" * 16,
+                    "size": 5,
+                },
+            },
+            {
+                "id": "https://mega.nz/folder/niBCEa5Q#imRPN1pOpqGumFo1IfuAmg/file/node2",
+                "path": "https://mega.nz/folder/niBCEa5Q#imRPN1pOpqGumFo1IfuAmg/file/node2",
+                "url": "https://mega.nz/folder/niBCEa5Q#imRPN1pOpqGumFo1IfuAmg/file/node2",
+                "name": "clip.mp4",
+                "type": "file",
+                "size": 6,
+                "provider": "links",
+                "_relative_path": "Album.2026/Videos/clip.mp4",
+                "meta": {
+                    "provider": "links",
+                    "mega_folder_id": "niBCEa5Q",
+                    "mega_node_id": "node2",
+                    "mega_key_hex": "00" * 16,
+                    "mega_iv_hex": "00" * 16,
+                    "size": 6,
+                },
+            },
+        ]
+
+    async def fake_dl_mega_file(url, dest_dir, name, progress, file_ref=None, proxy=None):
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out = dest_dir / (name or "file.bin")
+        out.write_bytes(b"hello" if "photo1" in out.name else b"world!")
+        return [out]
+
+    uploaded_rel_paths = []
+
+    class FakeTarget:
+        async def upload_folder(self, credentials, local_dir, target_ref, progress):
+            for p in sorted(local_dir.rglob("*")):
+                if p.is_file():
+                    uploaded_rel_paths.append(p.relative_to(local_dir).as_posix())
+                    progress.files_uploaded += 1
+            return {"ok": True}
+
+        async def upload_file(self, credentials, local_path, target_ref, progress):
+            uploaded_rel_paths.append(target_ref.get("relative_path") or local_path.name)
+            return {"ok": True}
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr(provider, "_list_mega_folder_nodes", fake_list_mega)
+    monkeypatch.setattr(provider, "_download_mega_file", fake_dl_mega_file)
+    monkeypatch.setattr(transfer_job_mod, "job_dirs", lambda job_id: dirs)
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "links", provider)
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "drive", FakeTarget())
+
+    # Even if passed with type="file", run_transfer auto-upgrades MEGA folder URLs to type="folder"
+    payload = {
+        "source": {
+            "provider": "links",
+            "items": [
+                {
+                    "id": "https://mega.nz/folder/niBCEa5Q#imRPN1pOpqGumFo1IfuAmg",
+                    "name": "MEGA_Share",
+                    "type": "file",
+                }
+            ],
+        },
+        "target": {"provider": "drive", "folder": {"id": "root", "path": "/"}},
+        "options": {"transfer_strategy": "smart_folder", "cleanupAfterFinish": True},
+    }
+    job = JobState("test-mega-folder-smart", payload)
+    asyncio.run(run_transfer(job))
+
+    assert job.status == "completed"
+    assert job.files_downloaded == 2
+    assert job.files_uploaded == 2
+    assert sorted(uploaded_rel_paths) == [
+        "MEGA_Share/Album.2026/Videos/clip.mp4",
+        "MEGA_Share/Album.2026/photo1.jpg",
+    ]
+

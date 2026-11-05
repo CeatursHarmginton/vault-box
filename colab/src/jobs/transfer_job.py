@@ -63,6 +63,23 @@ async def run_transfer(job: JobState) -> None:
         job.log(f"Accounts: source={source.get('accountId') or source.get('account_id') or '-'} target={target.get('accountId') or target.get('account_id') or '-'}")
 
         items = source.get("items") or []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
+            item_src = PROVIDERS.get(item_prov, src)
+            item_url = str(item.get("id") or item.get("path") or item.get("url") or "").strip()
+            if item_url and hasattr(item_src, "is_folder_link") and item_src.is_folder_link(item_url):
+                item["type"] = "folder"
+                if isinstance(item.get("meta"), dict):
+                    item["meta"]["type"] = "folder"
+                cur_name = str(item.get("name") or "").strip()
+                if cur_name.lower().endswith(".mp4"):
+                    cur_name = cur_name[:-4].strip()
+                if not cur_name or cur_name.startswith(("http://", "https://")) or "#" in cur_name:
+                    clean_tail = item_url.split("#", 1)[0].split("?", 1)[0].rstrip("/").split("/")[-1]
+                    cur_name = safe_name(clean_tail or "cloud_folder")
+                item["name"] = cur_name
         has_folder_batch = any((item.get("type") == "folder" or item.get("is_folder")) for item in items)
         has_mixed_source_scope = len({_item_scope(source, item) for item in items}) > 1
         if options.get("optimize_image") and len(items) > 1:
@@ -683,7 +700,12 @@ async def _expand_folder_files(
         child_type = child.get("type") or ("folder" if (child.get("is_folder") or child.get("isdir")) else "file")
         raw_name = str(child.get("name") or child.get("server_filename") or child.get("id") or "item").replace("\\", "/")
         child_name = safe_name(PurePosixPath(raw_name).name or raw_name)
-        child_rel = f"{current_rel_prefix}/{child_name}" if current_rel_prefix else child_name
+        rel_from_child = str(child.get("_relative_path") or "").replace("\\", "/").strip("/")
+        if rel_from_child and "/" in rel_from_child:
+            safe_rel = "/".join(safe_name(p) for p in rel_from_child.split("/") if p and p not in (".", ".."))
+            child_rel = f"{current_rel_prefix}/{safe_rel}" if current_rel_prefix else safe_rel
+        else:
+            child_rel = f"{current_rel_prefix}/{child_name}" if current_rel_prefix else child_name
 
         if child_type == "folder":
             sub_files = await _expand_folder_files(provider, credentials, child, child_rel, job)
