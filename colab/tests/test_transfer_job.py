@@ -5155,3 +5155,155 @@ def test_links_provider_mega_folder_transfer_preserves_subfolders(tmp_path, monk
         "MEGA_Share/Album.2026/photo1.jpg",
     ]
 
+
+def test_auto_skip_folder_transfer_checks_individual_child_files_and_downloads_only_missing(tmp_path, monkeypatch):
+    dirs = {"input": tmp_path / "input", "output": tmp_path / "output"}
+    dirs["input"].mkdir()
+    dirs["output"].mkdir()
+
+    downloaded_ids = []
+    uploaded_rel_paths = []
+
+    class FakeSource:
+        async def list_files(self, credentials, path_or_id):
+            if path_or_id == "/CourseFolder":
+                return {
+                    "items": [
+                        {"id": "f1", "name": "lesson1.mp4", "type": "file", "size": 100},
+                        {"id": "f2", "name": "lesson2.mp4", "type": "file", "size": 200},
+                        {"id": "sub1", "name": "Bonus", "type": "folder", "is_folder": True},
+                    ]
+                }
+            if path_or_id == "sub1":
+                return {
+                    "items": [
+                        {"id": "f3", "name": "bonus1.mp4", "type": "file", "size": 150},
+                        {"id": "f4", "name": "bonus2.mp4", "type": "file", "size": 250},
+                    ]
+                }
+            return {"items": []}
+
+        async def download_file(self, credentials, file_ref, dest_dir: Path, progress: JobState):
+            downloaded_ids.append(file_ref["id"])
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            out = dest_dir / file_ref["name"]
+            out.write_bytes(b"video-bytes")
+            return out
+
+    class FakeTarget:
+        async def list_files(self, credentials, path_or_id):
+            # Target root already has CourseFolder, which already has lesson1.mp4 and Bonus/bonus1.mp4
+            if path_or_id in ("/", "root"):
+                return {
+                    "items": [
+                        {"id": "tgt_course", "name": "CourseFolder", "type": "folder", "is_folder": True},
+                    ]
+                }
+            if path_or_id == "tgt_course":
+                return {
+                    "items": [
+                        {"id": "t_f1", "name": "lesson1.mp4", "type": "file", "size": 100},
+                        {"id": "tgt_bonus", "name": "Bonus", "type": "folder", "is_folder": True},
+                    ]
+                }
+            if path_or_id == "tgt_bonus":
+                return {
+                    "items": [
+                        {"id": "t_f3", "name": "bonus1.mp4", "type": "file", "size": 150},
+                    ]
+                }
+            return {"items": []}
+
+        async def upload_file(self, credentials, local_path: Path, target_ref, progress: JobState):
+            uploaded_rel_paths.append(target_ref.get("relative_path") or local_path.name)
+            return {"ok": True}
+
+    monkeypatch.setattr(transfer_job_mod, "job_dirs", lambda job_id: dirs)
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "terabox", FakeSource())
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "drive", FakeTarget())
+
+    payload = {
+        "source": {
+            "provider": "terabox",
+            "items": [
+                {"id": "/CourseFolder", "path": "/CourseFolder", "name": "CourseFolder", "type": "folder", "is_folder": True}
+            ],
+        },
+        "target": {"provider": "drive", "folder": {"id": "root", "path": "/"}},
+        "options": {"transfer_strategy": "smart_folder", "auto_skip": True, "cleanupAfterFinish": True},
+    }
+    job = JobState("test-auto-skip-folder-partial", payload)
+    asyncio.run(run_transfer(job))
+
+    assert job.status == "completed"
+    # lesson1.mp4 and bonus1.mp4 already exist at target -> skipped!
+    # Only lesson2.mp4 (f2) and bonus2.mp4 (f4) are downloaded and uploaded!
+    assert sorted(downloaded_ids) == ["f2", "f4"]
+    assert job.files_skipped == 2
+    assert job.files_downloaded == 2
+    assert job.files_uploaded == 2
+    assert sorted(uploaded_rel_paths) == [
+        "CourseFolder/Bonus/bonus2.mp4",
+        "CourseFolder/lesson2.mp4",
+    ]
+
+
+def test_auto_skip_folder_when_all_files_exist_completes_without_downloading(tmp_path, monkeypatch):
+    dirs = {"input": tmp_path / "input", "output": tmp_path / "output"}
+    dirs["input"].mkdir()
+    dirs["output"].mkdir()
+
+    downloaded_ids = []
+
+    class FakeSource:
+        async def list_files(self, credentials, path_or_id):
+            return {
+                "items": [
+                    {"id": "f1", "name": "ep1.mp4", "type": "file", "size": 100},
+                    {"id": "f2", "name": "ep2.mp4", "type": "file", "size": 200},
+                ]
+            }
+
+        async def download_file(self, credentials, file_ref, dest_dir: Path, progress: JobState):
+            downloaded_ids.append(file_ref["id"])
+            raise AssertionError("Should not download when all files exist at target")
+
+    class FakeTarget:
+        async def list_files(self, credentials, path_or_id):
+            if path_or_id in ("/", "target_dir_id"):
+                return {
+                    "items": [
+                        {"id": "t1", "name": "ep1.mp4", "type": "file", "size": 100},
+                        {"id": "t2", "name": "ep2.mp4", "type": "file", "size": 200},
+                    ]
+                }
+            return {"items": []}
+
+        async def upload_file(self, credentials, local_path: Path, target_ref, progress: JobState):
+            raise AssertionError("Should not upload when all files exist at target")
+
+    monkeypatch.setattr(transfer_job_mod, "job_dirs", lambda job_id: dirs)
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "pikpak", FakeSource())
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "drive", FakeTarget())
+
+    payload = {
+        "source": {
+            "provider": "pikpak",
+            "items": [
+                {"id": "src_folder_1", "name": "MySeries", "type": "folder", "is_folder": True}
+            ],
+        },
+        "target": {"provider": "drive", "folder": {"id": "target_dir_id", "path": "/MySeries"}},
+        "options": {"transfer_strategy": "file_by_file", "autoSkip": True, "cleanupAfterFinish": True},
+    }
+    job = JobState("test-auto-skip-all-exist", payload)
+    asyncio.run(run_transfer(job))
+
+    assert job.status == "completed"
+    assert downloaded_ids == []
+    assert job.files_downloaded == 0
+    assert job.files_uploaded == 0
+    assert job.files_skipped == 2
+    assert len(job.completed_items) == 1
+
+

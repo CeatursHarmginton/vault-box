@@ -186,6 +186,15 @@ class BaseProvider(ABC):
                 progress.files_skipped += 1
                 progress.log(f"[SKIP] File ignored by image optimizer: {item.get('name') or item.get('server_filename') or item.get('id') or 'file'}")
                 return []
+            checker = getattr(progress, "_target_checker", None)
+            if checker is not None:
+                f_name = _safe_name(folder_ref.get("name") or folder_ref.get("path") or folder_ref.get("id") or "folder")
+                item_name_cand = _safe_name(item.get("name") or item.get("server_filename") or item.get("id") or "file")
+                check_item = {**item, "_relative_path": f"{f_name}/{item_name_cand}"}
+                if await checker.item_exists(check_item, options, folder_name=f_name):
+                    progress.files_skipped += 1
+                    progress.log(f"[Auto-Skip] File đã tồn tại ở đích, bỏ qua tải: {f_name}/{item_name_cand}")
+                    return []
             async with sem:
                 dest = local_dir / _safe_name(item.get("name") or item.get("server_filename") or item.get("id") or "file")
                 file_sz = int(item.get("size") or 0)
@@ -236,7 +245,6 @@ class BaseProvider(ABC):
 
         progress.files_to_upload = len(paths)
         progress.files_uploaded = 0
-        progress.files_skipped = 0
         if len(paths) > 1:
             progress.log(f"[UPLOAD] Xử lý song song: {min(len(paths), max(1, upload_concurrency))} worker(s)")
 

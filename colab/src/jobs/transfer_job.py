@@ -42,6 +42,168 @@ def _should_process_video_thumbnails(options: dict[str, Any], payload: dict[str,
         return False
     return bool(options.get("set_video_thumbnail", False) or options.get("trim_intro", False))
 
+
+def _is_auto_skip_enabled(options: dict[str, Any] | None) -> bool:
+    opts = options or {}
+    return bool(opts.get("auto_skip") or opts.get("autoSkip"))
+
+
+class _TargetFileChecker:
+    """Lazily lists and caches target directories to check whether individual files already exist at destination."""
+
+    def __init__(self, dst: Any, target: dict[str, Any], options: dict[str, Any] | None = None, job: JobState | None = None) -> None:
+        self.dst = dst
+        self.target = target
+        self.options = options or {}
+        self.job = job
+        self._dir_cache: dict[str, tuple[set[str], dict[str, str]]] = {}
+        self._lock = asyncio.Lock()
+
+    async def _list_dir(self, folder_id: str) -> tuple[set[str], dict[str, str]]:
+        norm_id = str(folder_id or "/").strip() or "/"
+        if norm_id.startswith("id:"):
+            norm_id = norm_id[3:].strip() or "/"
+        if norm_id in self._dir_cache:
+            return self._dir_cache[norm_id]
+        async with self._lock:
+            if norm_id in self._dir_cache:
+                return self._dir_cache[norm_id]
+            active_dst = PROVIDERS.get(str(self.target.get("provider") or "").lower(), self.dst)
+            files_set: set[str] = set()
+            subfolders_map: dict[str, str] = {}
+            if hasattr(active_dst, "list_files"):
+                try:
+                    creds = self.target.get("credentials") or {}
+                    res = await active_dst.list_files(creds, norm_id)
+                    items = (res or {}).get("items") or (res or {}).get("files") or []
+                    for it in items:
+                        if not isinstance(it, dict):
+                            continue
+                        raw_name = str(it.get("name") or it.get("server_filename") or it.get("path") or "").strip()
+                        if not raw_name:
+                            continue
+                        base_name = PurePosixPath(raw_name.replace("\\", "/")).name
+                        if not base_name:
+                            continue
+                        is_dir = bool(it.get("type") == "folder" or it.get("is_folder") or it.get("isdir"))
+                        if is_dir:
+                            if base_name.lower().endswith("__backup_resume"):
+                                continue
+                            sub_id = str(it.get("id") or it.get("path") or "").strip()
+                            if sub_id:
+                                subfolders_map[base_name.lower()] = sub_id
+                                subfolders_map[safe_name(base_name).lower()] = sub_id
+                        else:
+                            if base_name.lower().endswith("__backup_resume") or base_name.lower().startswith("_resume_manifest"):
+                                continue
+                            files_set.add(base_name.lower())
+                            files_set.add(safe_name(base_name).lower())
+                except Exception:
+                    pass
+            self._dir_cache[norm_id] = (files_set, subfolders_map)
+            return files_set, subfolders_map
+
+    async def _exists_in_dir_path(self, root_id: str, dir_parts: list[str], candidate_names: set[str]) -> bool:
+        curr_id = root_id
+        for part in dir_parts:
+            if not part or part in (".", ".."):
+                continue
+            _, subfolders = await self._list_dir(curr_id)
+            next_id = subfolders.get(part.lower()) or subfolders.get(safe_name(part).lower())
+            if not next_id:
+                return False
+            curr_id = next_id
+        files_set, _ = await self._list_dir(curr_id)
+        return any(cand in files_set for cand in candidate_names)
+
+    async def item_exists(
+        self,
+        item: dict[str, Any],
+        options: dict[str, Any] | None = None,
+        folder_name: str = "",
+    ) -> bool:
+        opts = options if options is not None else self.options
+        target_folder_obj = self.target.get("folder") or {}
+        root_id = str(target_folder_obj.get("id") or target_folder_obj.get("path") or "/").strip() or "/"
+
+        raw_item_name = str(item.get("name") or item.get("server_filename") or "").strip()
+        if not raw_item_name:
+            raw_item_name = _item_name(item)
+        rel = str(item.get("_relative_path") or raw_item_name or "").replace("\\", "/").strip("/")
+        parts = [p for p in rel.split("/") if p and p not in (".", "..")]
+        file_name = parts[-1] if parts else safe_name(raw_item_name or "file")
+        dir_parts = parts[:-1]
+
+        cand_names = {
+            file_name.lower(),
+            safe_name(file_name).lower(),
+        }
+        if raw_item_name:
+            base_raw = PurePosixPath(raw_item_name.replace("\\", "/")).name
+            if base_raw:
+                cand_names.add(base_raw.lower())
+                cand_names.add(safe_name(base_raw).lower())
+
+        item_url = str(item.get("path") or item.get("id") or item.get("url") or "").lower()
+        item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or "").lower()
+        if any(k in item_url for k in (".m3u8", ".mpd", "/hls/", "stream")) or item_prov == "links" or file_name.lower().endswith((".m3u8", ".mpd", ".ts")):
+            try:
+                from .hls_backup_pipeline import generate_final_video_name
+                final_vid = generate_final_video_name(file_name)
+                cand_names.add(final_vid.lower())
+                cand_names.add(safe_name(final_vid).lower())
+            except Exception:
+                pass
+
+        cand_names.discard("")
+        if not cand_names:
+            return False
+
+        upload_prefix = str(opts.get("upload_prefix") or "").replace("\\", "/").strip("/")
+        parent_prefix = str(item.get("_parent_prefix") or "").replace("\\", "/").strip("/")
+        prefix_parts = [p for p in upload_prefix.split("/") if p and p not in (".", "..")]
+        if parent_prefix:
+            for pp in parent_prefix.split("/"):
+                if pp and pp not in (".", "..") and (not prefix_parts or prefix_parts[-1].lower() != pp.lower()):
+                    prefix_parts.append(pp)
+
+        candidate_dir_paths: list[list[str]] = []
+
+        full_dir_parts = prefix_parts + dir_parts
+        candidate_dir_paths.append(full_dir_parts)
+
+        if dir_parts:
+            if folder_name and dir_parts[0].lower() in (folder_name.lower(), safe_name(folder_name).lower()):
+                stripped = prefix_parts + dir_parts[1:]
+                if stripped not in candidate_dir_paths:
+                    candidate_dir_paths.append(stripped)
+            elif len(dir_parts) >= 1:
+                stripped = prefix_parts + dir_parts[1:]
+                if stripped not in candidate_dir_paths:
+                    candidate_dir_paths.append(stripped)
+
+        if opts.get("preserveFolderStructure") is False and [] not in candidate_dir_paths:
+            candidate_dir_paths.append([])
+
+        for d_path in candidate_dir_paths:
+            if await self._exists_in_dir_path(root_id, d_path, cand_names):
+                return True
+        return False
+
+
+def _get_target_checker(
+    job: JobState,
+    dst: Any,
+    target: dict[str, Any],
+    options: dict[str, Any] | None = None,
+) -> _TargetFileChecker:
+    checker = getattr(job, "_target_checker", None)
+    if isinstance(checker, _TargetFileChecker):
+        return checker
+    checker = _TargetFileChecker(dst=dst, target=target, options=options, job=job)
+    job._target_checker = checker
+    return checker
+
 async def run_transfer(job: JobState) -> None:
     dirs = job_dirs(job.job_id)
     payload = job.payload
@@ -58,6 +220,8 @@ async def run_transfer(job: JobState) -> None:
         job.files_skipped = 0
         job.files_to_upload = 0
         job._upload_log_done = 0
+        if _is_auto_skip_enabled(options):
+            _get_target_checker(job, dst, target, options)
 
         job.log(f"Job start: {source.get('provider')} -> {target.get('provider')}")
         job.log(f"Accounts: source={source.get('accountId') or source.get('account_id') or '-'} target={target.get('accountId') or target.get('account_id') or '-'}")
@@ -243,6 +407,19 @@ async def run_transfer(job: JobState) -> None:
                     _mark_item_skipped(job, source, item, f"{job.files_failed - failed_before} file(s) unavailable after retries")
             else:
                 continue
+        if file_items and _is_auto_skip_enabled(options):
+            checker = _get_target_checker(job, dst, target, options)
+            missing_file_items: list[dict[str, Any]] = []
+            for it in file_items:
+                if await checker.item_exists(it, options):
+                    it_name = _item_name(it)
+                    job.files_skipped += 1
+                    job.log(f"[Auto-Skip] File đã tồn tại ở đích, bỏ qua tải: {it_name}")
+                    _finish_items(job, source, [it])
+                else:
+                    missing_file_items.append(it)
+            file_items = missing_file_items
+            job.files_to_download = len(file_items)
         if file_items:
             effective_concurrency = max(1, min(concurrency, len(file_items)))
             job.log(f"Downloading {len(file_items)} file(s), up to {effective_concurrency} in parallel")
@@ -264,6 +441,12 @@ async def run_transfer(job: JobState) -> None:
                     downloaded.extend(batch)
         if not downloaded and options.get("optimize_image") and job.files_skipped:
             job.log("No image files found for optimization.")
+            _mark_remaining_items_completed(job, source)
+            _log_skip_summary(job)
+            job.set(status="completed", step="completed")
+            return
+        if not downloaded and _is_auto_skip_enabled(options) and job.files_skipped and not job.failed_items:
+            job.log(f"[Auto-Skip] Toàn bộ {job.files_skipped} file đã tồn tại ở đích. Hoàn tất!")
             _mark_remaining_items_completed(job, source)
             _log_skip_summary(job)
             job.set(status="completed", step="completed")
@@ -568,6 +751,26 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         job.log("No image files found for optimization.")
 
 async def _run_plain_file_batches(job: JobState, dirs: dict[str, Path], source: dict[str, Any], target: dict[str, Any], options: dict[str, Any], src: Any, dst: Any, file_items: list[dict[str, Any]]) -> None:
+    if _is_auto_skip_enabled(options) and file_items:
+        checker = _get_target_checker(job, dst, target, options)
+        missing_files: list[dict[str, Any]] = []
+        for it in file_items:
+            parent_pf = str(it.get("_parent_prefix") or "").strip("/")
+            sub_opts = dict(options)
+            if parent_pf:
+                existing_pfx = str(options.get("upload_prefix") or "").strip("/")
+                sub_opts["upload_prefix"] = f"{existing_pfx}/{parent_pf}".strip("/") if existing_pfx else parent_pf
+            if await checker.item_exists(it, sub_opts, folder_name=parent_pf):
+                it_name = _item_name(it)
+                job.files_skipped += 1
+                job.log(f"[Auto-Skip] File đã tồn tại ở đích, bỏ qua tải: {it_name}")
+                _finish_items(job, source, [it])
+            else:
+                missing_files.append(it)
+        file_items = missing_files
+        if not file_items:
+            job.log("[Auto-Skip] Toàn bộ file riêng lẻ đã tồn tại ở đích. Bỏ qua tải!")
+            return
     job.files_to_download = len(file_items)
     if not options.get("extract") and (not job.files_to_upload or not getattr(job, "_pipeline_preallocated", False)):
         job.files_to_upload = max(job.files_to_upload, len(file_items))
@@ -588,14 +791,20 @@ async def _run_plain_file_batches(job: JobState, dirs: dict[str, Path], source: 
             item_size = _item_size(item)
             item_k = _queue_item_key(source, item)
 
+            dl_dir = batch_input
+            parent_pf = str(item.get("_parent_prefix") or "").strip("/")
+            if parent_pf:
+                dl_dir = batch_input / parent_pf
+                dl_dir.mkdir(parents=True, exist_ok=True)
+
             if item_name:
                 safe_cand = safe_name(item_name)
-                cand_paths = [batch_input / safe_cand]
+                cand_paths = [dl_dir / safe_cand]
                 if not safe_cand.lower().endswith((".mp4", ".mkv", ".webm", ".ts")):
-                    cand_paths.append(batch_input / f"{safe_cand}.mp4")
+                    cand_paths.append(dl_dir / f"{safe_cand}.mp4")
                 for existing in cand_paths:
                     if existing.is_file() and existing.stat().st_size > 0:
-                        part_files = list(batch_input.glob(f"{existing.name}*.part*")) + list(batch_input.glob(f".tmp_ytdlp_*{existing.stem[:8]}*"))
+                        part_files = list(dl_dir.glob(f"{existing.name}*.part*")) + list(dl_dir.glob(f".tmp_ytdlp_*{existing.stem[:8]}*"))
                         if not part_files:
                             job.log(f"[Cache-Hit] File already downloaded in batch: {existing.name} ({existing.stat().st_size} bytes). Skipping re-download.")
                             job.start_file(item_name, phase="download", size=existing.stat().st_size, key=item_k)
@@ -613,7 +822,7 @@ async def _run_plain_file_batches(job: JobState, dirs: dict[str, Path], source: 
             item_creds = item.get("credentials") or source.get("credentials") or {}
             try:
                 path = await download_with_retry(
-                    lambda: item_src.download_file(item_creds, item, batch_input, job),
+                    lambda: item_src.download_file(item_creds, item, dl_dir, job),
                     progress=job, label=item_name,
                 )
                 actual_size = path.stat().st_size if (path and path.exists()) else item_size
@@ -854,6 +1063,28 @@ async def _run_smart_folder_batches(
             except Exception:
                 folder_files = []
 
+        if folder_files and _is_auto_skip_enabled(options):
+            checker = _get_target_checker(job, dst, target, options)
+            missing_folder_files: list[dict[str, Any]] = []
+            skipped_in_folder = 0
+            for it in folder_files:
+                if await checker.item_exists(it, sub_options, folder_name=f_name):
+                    it_rel = it.get("_relative_path") or f"{f_name}/{_item_name(it)}"
+                    job.files_skipped += 1
+                    skipped_in_folder += 1
+                    job.log(f"[Auto-Skip] File đã tồn tại ở đích, bỏ qua tải: {it_rel}")
+                else:
+                    missing_folder_files.append(it)
+            if skipped_in_folder:
+                job.log(f"[Auto-Skip] Thư mục '{f_name}': Đã bỏ qua {skipped_in_folder}/{len(folder_files)} file đã có ở đích, còn {len(missing_folder_files)} file cần tải.")
+            if not missing_folder_files:
+                job.log(f"[Smart Folder {idx}/{total_groups}] [Auto-Skip] Toàn bộ file trong thư mục '{f_name}' đã tồn tại ở đích. Bỏ qua thư mục!")
+                _finish_items(job, source, [f_item])
+                shutil.rmtree(batch_input, ignore_errors=True)
+                shutil.rmtree(batch_output, ignore_errors=True)
+                continue
+            folder_files = missing_folder_files
+
         if folder_files:
             needs_batches = _needs_download_batches(folder_files, dirs["input"], options)
             file_batches = _download_batches(folder_files, dirs["input"], options, job) if needs_batches else [folder_files]
@@ -997,6 +1228,9 @@ async def _run_smart_folder_batches(
         job.log(f"[Smart Folder {file_grp}/{total_groups}] >>> Bắt đầu xử lý {len(file_items)} file riêng lẻ...")
         await _run_plain_file_batches(job, dirs, source, target, options, src, dst, file_items)
 
+    if not job.failed_items:
+        _mark_remaining_items_completed(job, source)
+
 
 async def _run_file_pipeline_batches(
     job: JobState,
@@ -1022,6 +1256,26 @@ async def _run_file_pipeline_batches(
 
     if not file_items:
         return
+
+    if _is_auto_skip_enabled(options) and file_items:
+        checker = _get_target_checker(job, dst, target, options)
+        missing_files: list[dict[str, Any]] = []
+        for it in file_items:
+            parent_folder = it.get("_parent_folder") or {}
+            f_name = safe_name(PurePosixPath(str(parent_folder.get("name") or parent_folder.get("path") or "")).name) if parent_folder else ""
+            if await checker.item_exists(it, options, folder_name=f_name):
+                rel_p = it.get("_relative_path") or _item_name(it)
+                job.files_skipped += 1
+                job.log(f"[Auto-Skip] File đã tồn tại ở đích, bỏ qua tải: {rel_p}")
+                if not it.get("_parent_folder"):
+                    _finish_items(job, source, [it])
+            else:
+                missing_files.append(it)
+        file_items = missing_files
+        if not file_items:
+            job.log(f"[Pipeline] [Auto-Skip] Toàn bộ {job.files_skipped} file đã tồn tại ở đích. Hoàn tất!")
+            _mark_remaining_items_completed(job, source)
+            return
 
     job.files_to_download = len(file_items)
     job.files_to_upload = len(file_items)
@@ -1131,6 +1385,8 @@ async def _run_file_pipeline_batches(
         await asyncio.gather(*(process_one_file(i, item) for i, item in enumerate(file_items)))
     finally:
         job._upload_gate = None
+    if not job.failed_items:
+        _mark_remaining_items_completed(job, source)
 
 
 async def _download_batch_item(job: JobState, source: dict[str, Any], src: Any, item: dict[str, Any], batch_input: Path) -> list[Path]:
@@ -1240,6 +1496,8 @@ async def _run_backup_resume_batches(
                         job.uploaded_files.add(item_name)
                         _finish_items(job, source, [item])
                         job.log(f"[Backup-Resume] Hoàn tất truyền tải file: {item_name}")
+                    elif item.get("_auto_skipped"):
+                        _finish_items(job, source, [item])
                     else:
                         # Partial session: segments backed up to cloud but not yet fully merged
                         job.files_downloaded += 1
@@ -1289,6 +1547,8 @@ async def _run_backup_resume_batches(
                                 job.uploaded_files.add(item_name)
                                 _finish_items(job, source, [item])
                                 job.log(f"[Backup-Resume] Hoàn tất truyền tải file sau retry: {item_name}")
+                            elif item.get("_auto_skipped"):
+                                _finish_items(job, source, [item])
                             else:
                                 job.files_downloaded += 1
                                 _finish_items(job, source, [item])

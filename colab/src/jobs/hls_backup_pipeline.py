@@ -633,6 +633,44 @@ async def run_resumable_backup_pipeline(
         parts_local_dir.mkdir(parents=True, exist_ok=True)
         segs_local_dir.mkdir(parents=True, exist_ok=True)
 
+    is_auto_skip = bool(options.get("auto_skip") or options.get("autoSkip"))
+    if is_auto_skip and hasattr(dst_provider, "list_files"):
+        try:
+            remote_target_listing = await dst_provider.list_files(target_creds, target_folder)
+            remote_target_items = remote_target_listing.get("items") or remote_target_listing.get("files") or []
+            target_cand_names = {
+                final_video_name.lower(),
+                safe_name(final_video_name).lower(),
+            }
+            raw_clean = safe_name(raw_name).lower()
+            if raw_clean and not raw_clean.endswith("__backup_resume") and not raw_clean.endswith((".m3u8", ".mpd")):
+                target_cand_names.add(raw_clean)
+            existing_complete_video = None
+            has_incomplete_backup = False
+            for r_it in remote_target_items:
+                r_name = str(r_it.get("name") or r_it.get("server_filename") or r_it.get("path") or "").strip()
+                r_base = PurePosixPath(r_name.replace("\\", "/")).name
+                is_dir = bool(r_it.get("type") == "folder" or r_it.get("is_folder") or r_it.get("isdir"))
+                if is_dir:
+                    if r_base.lower() == backup_folder_name.lower() or safe_name(r_base).lower() == safe_name(backup_folder_name).lower():
+                        has_incomplete_backup = True
+                    continue
+                if r_base.lower().endswith("__backup_resume") or r_base.lower().startswith("_resume_manifest"):
+                    continue
+                if r_base.lower() in target_cand_names or safe_name(r_base).lower() in target_cand_names:
+                    existing_complete_video = r_it
+                    break
+            if existing_complete_video is not None:
+                job.log(f"[Auto-Skip] Video hoàn chỉnh '{final_video_name}' đã tồn tại ở đích. Bỏ qua tải & ghép nối!")
+                file_item["_auto_skipped"] = True
+                job.files_skipped += 1
+                shutil.rmtree(job_work_dir, ignore_errors=True)
+                return None
+            if has_incomplete_backup:
+                job.log(f"[Auto-Skip] Video '{final_video_name}' ở đích chưa hoàn chỉnh (đang ở dạng backup folder '{backup_folder_name}'). Tiếp tục xử lý resume như bình thường...")
+        except Exception as auto_skip_err:
+            job.log(f"[Auto-Skip] Lưu ý khi kiểm tra file đích: {auto_skip_err}")
+
     skip_broken_segments = bool(
         options.get("skip_broken_segments")
         or options.get("skipBrokenSegments")

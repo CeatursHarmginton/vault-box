@@ -3495,8 +3495,24 @@ class LinksProvider(BaseProvider):
         items = listing.get("items") or []
         if items:
             progress.log(f"[links] Resolved {len(items)} file(s) in {ltype} folder: {folder_ref.get('name') or url[:80]}")
-            progress.files_to_download += len(items)
             options = (progress.payload or {}).get("options", {}) if hasattr(progress, "payload") else {}
+            checker = getattr(progress, "_target_checker", None)
+            if checker is not None:
+                f_name = safe_name(str(folder_ref.get("name") or "folder"))
+                missing_items: list[dict[str, Any]] = []
+                for child in items:
+                    rel_raw = str(child.get("_relative_path") or child.get("name") or "file").replace("\\", "/").strip("/")
+                    check_child = {**child, "_relative_path": f"{f_name}/{rel_raw}" if f_name else rel_raw}
+                    if await checker.item_exists(check_child, options, folder_name=f_name):
+                        progress.files_skipped += 1
+                        progress.log(f"[Auto-Skip] File đã tồn tại ở đích, bỏ qua tải: {rel_raw}")
+                    else:
+                        missing_items.append(child)
+                items = missing_items
+                if not items:
+                    progress.log(f"[Auto-Skip] Toàn bộ file trong link folder '{folder_ref.get('name') or url[:60]}' đã tồn tại ở đích!")
+                    return []
+            progress.files_to_download += len(items)
             conc = max(1, int(options.get("download_concurrency") or 4))
             sem = _sem or asyncio.Semaphore(conc)
 
