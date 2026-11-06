@@ -26,6 +26,7 @@ class JobState:
     step: str = "pending"
     progress: JobProgress = field(default_factory=JobProgress)
     current_file: str = ""
+    last_active_file: str = ""
     active_files: dict[str, dict[str, Any]] = field(default_factory=dict)
     file_sizes: dict[str, int] = field(default_factory=dict)
     downloaded_files: set[str] = field(default_factory=set)
@@ -102,6 +103,7 @@ class JobState:
         now = time.time()
         base_name = name.replace("\\", "/").rstrip("/").split("/")[-1]
         self.current_file = base_name or name
+        self.last_active_file = self.current_file
         file_info = {
             "name": base_name or name,
             "phase": phase,
@@ -151,16 +153,18 @@ class JobState:
             if key:
                 self.file_sizes[key] = size
         if self.current_file in (name, base_name, key):
+            self.last_active_file = self.current_file
             if self.active_files:
                 first_active = next(iter(self.active_files.values()))
                 self.current_file = str(first_active.get("name") or next(iter(self.active_files.keys())))
+                self.last_active_file = self.current_file or self.last_active_file
             else:
                 self.current_file = ""
         self.updated_at = now
 
     def log(self, message: str) -> None:
         self.logs.append(message)
-        self.logs = self.logs[-200:]
+        self.logs = self.logs[-500:]
         self.updated_at = time.time()
 
     def fail_file(self, name: str, code: str, message: str) -> None:
@@ -180,6 +184,8 @@ class JobState:
             changed = True
         if current_file is not None:
             self.current_file = current_file
+            if current_file:
+                self.last_active_file = current_file
         self.updated_at = time.time()
         if changed:
             self.save_state()
@@ -355,6 +361,7 @@ class JobState:
             "phases": phases,
             "options": options,
             "currentFile": self.current_file,
+            "lastActiveFile": self.last_active_file or self.current_file,
             "activeFiles": self.active_files,
             "fileSizes": self.file_sizes,
             "downloadedFiles": list(self.downloaded_files),
@@ -365,7 +372,7 @@ class JobState:
             "bytesOverallTotal": sum(self._phase_total_by_name.values()) or self.bytes_total,
             "bytesCumulative": self.bytes_done,
             "speed": self.speed,
-            "logs": self.logs[-50:],
+            "logs": self.logs[-500:],
             "error": self.error,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
@@ -410,6 +417,7 @@ class JobState:
                 "step": self.step,
                 "progress": self.progress.__dict__,
                 "current_file": self.current_file,
+                "last_active_file": self.last_active_file or self.current_file,
                 "downloaded_files": list(self.downloaded_files),
                 "uploaded_files": list(self.uploaded_files),
                 "bytes_done": self.bytes_done,
@@ -423,7 +431,7 @@ class JobState:
                 "completed_items": self.completed_items,
                 "failed_items": self.failed_items,
                 "item_timings": self.item_timings,
-                "logs": self.logs[-200:],
+                "logs": self.logs[-500:],
                 "error": self.error,
                 "created_at": self.created_at,
                 "updated_at": self.updated_at,
@@ -456,6 +464,8 @@ class JobState:
                 job.logs = data.get("logs") or []
             job.created_at = data.get("created_at", time.time())
             job.updated_at = data.get("updated_at", time.time())
+            job.current_file = data.get("current_file") or ""
+            job.last_active_file = data.get("last_active_file") or job.current_file
             job.files_downloaded = data.get("files_downloaded", 0)
             job.files_to_download = data.get("files_to_download", 0)
             job.files_uploaded = data.get("files_uploaded", 0)
