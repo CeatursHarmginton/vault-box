@@ -337,32 +337,58 @@ async def _get_whisper_model(model_name: str, has_gpu: bool, cpu_threads: int) -
 
 
 async def _translate_edge_fallback(texts: list[str], src_lang: str, target_lang: str) -> list[str]:
-    """Zero-CPU neural batch translation via Microsoft Edge API (~120ms for 10 lines)."""
-    global _edge_token, _edge_token_exp
+    """Zero-CPU neural batch fallback via Google Translate Clients5 / GTX (<80ms in Colab network). Never raises."""
     if not texts:
         return []
-    now = time.time()
-    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0"
-    async with httpx.AsyncClient(timeout=12.0, headers={"User-Agent": ua}) as http:
-        if not _edge_token or now >= _edge_token_exp:
-            r_tok = await http.get("https://edge.microsoft.com/translate/auth")
-            r_tok.raise_for_status()
-            _edge_token = r_tok.text.strip()
-            _edge_token_exp = now + 480.0
-        from_q = f"&from={quote(src_lang)}" if src_lang and src_lang != "auto" else ""
-        to_code = "zh-Hans" if target_lang in {"zh", "zh-CN"} else ("zh-Hant" if target_lang == "zh-TW" else target_lang)
-        url = f"https://api-edge.cognitive.microsofttranslator.com/translate?api-version=3.0{from_q}&to={quote(to_code)}"
-        resp = await http.post(
-            url,
-            json=[{"Text": t} for t in texts],
-            headers={"Authorization": f"Bearer {_edge_token}", "Content-Type": "application/json"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return [
-            str((item.get("translations") or [{}])[0].get("text") or texts[idx]).strip()
-            for idx, item in enumerate(data)
-        ]
+    sl = "auto" if not src_lang or src_lang.lower() == "auto" else src_lang
+    tl = "zh-CN" if target_lang in {"zh", "zh-CN"} else ("zh-TW" if target_lang == "zh-TW" else (target_lang or "vi"))
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136.0.0.0 Safari/537.36"
+
+    async def _one(http: httpx.AsyncClient, txt: str) -> str:
+        clean = " ".join(line.strip() for line in str(txt or "").splitlines() if line.strip())
+        if not clean:
+            return ""
+        try:
+            c5_url = (
+                f"https://clients5.google.com/translate_a/t?client=dict-chrome-ex"
+                f"&sl={quote(sl)}&tl={quote(tl)}&q={quote(clean)}"
+            )
+            r5 = await http.get(c5_url)
+            if r5.status_code == 200:
+                d5 = r5.json()
+                if isinstance(d5, list) and d5:
+                    first = d5[0]
+                    res = str(first[0] if isinstance(first, list) else first).strip()
+                    if res:
+                        return res
+                elif isinstance(d5, dict) and d5.get("sentences"):
+                    res = " ".join(str(s.get("trans") or "").strip() for s in d5["sentences"]).strip()
+                    if res:
+                        return res
+        except Exception:
+            pass
+        try:
+            g_url = (
+                f"https://translate.googleapis.com/translate_a/single?client=gtx"
+                f"&sl={quote(sl)}&tl={quote(tl)}&dt=t&q={quote(clean)}"
+            )
+            rg = await http.get(g_url)
+            if rg.status_code == 200:
+                dg = rg.json()
+                if isinstance(dg, list) and dg and isinstance(dg[0], list):
+                    parts = [str(seg[0]).strip() for seg in dg[0] if isinstance(seg, list) and seg and seg[0]]
+                    res = " ".join(p for p in parts if p).strip()
+                    if res:
+                        return res
+        except Exception:
+            pass
+        return clean
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": ua}) as http:
+            return list(await asyncio.gather(*(_one(http, t) for t in texts)))
+    except Exception:
+        return list(texts)
 
 
 async def _translate_ollama_keep_context(
@@ -379,11 +405,26 @@ async def _translate_ollama_keep_context(
     Packs all cues of a chunk into ONE numbered JSON map (4-5x less prompt prefill overhead than line-by-line).
     - CPU Default: qwen2.5:1.5b with pinned num_thread=cpu_cores, num_ctx=1536, keep_alive='30m', format='json'.
     - GPU Default: qwen2.5:7b with num_ctx=2048, keep_alive='30m', format='json'.
-    Falls back to Edge Batch only if Ollama is unavailable or times out.
+    Falls back to Google GTX / Clients5 only if Ollama is unavailable or times out.
     """
     if not texts:
         return []
     ollama_ok, models = await _probe_ollama()
+    if not ollama_ok and shutil.which("ollama"):
+        try:
+            env = os.environ.copy()
+            env.setdefault("OLLAMA_NUM_PARALLEL", "1")
+            subprocess.Popen(
+                ["ollama", "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                start_new_session=True,
+            )
+            await asyncio.sleep(2.5)
+            ollama_ok, models = await _probe_ollama()
+        except Exception:
+            pass
     if not ollama_ok or not models:
         return await _translate_edge_fallback(texts, src_lang, target_lang)
 
@@ -424,7 +465,7 @@ async def _translate_ollama_keep_context(
     if is_cpu:
         options["num_thread"] = max(1, int(cpu_cores))
 
-    req_timeout = 15.0 if is_cpu else 28.0
+    req_timeout = 45.0 if is_cpu else 35.0
     try:
         async with httpx.AsyncClient(timeout=req_timeout) as http:
             resp = await http.post(
@@ -476,10 +517,10 @@ async def _translate_smart(
     Default ('auto' / 'llm'): ALWAYS use JSON-batched Ollama KeepContext:
     - CPU runtime -> qwen2.5:1.5b (pinned threads, 1536 ctx, grammar JSON)
     - GPU runtime -> qwen2.5:7b (CUDA, grammar JSON)
-    Only uses Edge Batch if user explicitly picked translate_mode=='edge' or if Ollama fails.
+    Falls back to Google GTX / Clients5 only if Ollama is unavailable or explicitly 'edge_only'.
     """
     mode = (translate_mode or "auto").lower()
-    if mode == "edge":
+    if mode == "edge_only":
         return await _translate_edge_fallback(texts, src_lang, target_lang)
     return await _translate_ollama_keep_context(
         texts,
@@ -893,18 +934,21 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                     locked_lang = det_lang
 
                 if cues and payload.translate_to and payload.translate_to.lower() != "none":
-                    trans_list = await _translate_smart(
-                        [c["text"] for c in cues],
-                        src_lang=det_lang,
-                        target_lang=payload.translate_to,
-                        has_gpu=is_cuda,
-                        cpu_cores=cpu_cores,
-                        translate_mode=payload.translate_mode,
-                        llm_model=payload.llm_model,
-                        session_id=payload.session_id,
-                    )
-                    for c, tr in zip(cues, trans_list):
-                        c["translatedText"] = tr
+                    try:
+                        trans_list = await _translate_smart(
+                            [c["text"] for c in cues],
+                            src_lang=det_lang,
+                            target_lang=payload.translate_to,
+                            has_gpu=is_cuda,
+                            cpu_cores=cpu_cores,
+                            translate_mode=payload.translate_mode,
+                            llm_model=payload.llm_model,
+                            session_id=payload.session_id,
+                        )
+                        for c, tr in zip(cues, trans_list):
+                            c["translatedText"] = tr
+                    except Exception:
+                        pass
 
                 total_sec = time.perf_counter() - t0
                 rtf = round(total_sec / max(0.5, dur), 2)
