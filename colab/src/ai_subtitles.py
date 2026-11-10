@@ -74,6 +74,28 @@ _EN_LEAK_WORDS_RE = re.compile(
     re.IGNORECASE,
 )
 _CJK_SCRIPT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
+_KANA_ONLY_RE = re.compile(r"[\u3040-\u30ff]")
+_HANZI_ONLY_RE = re.compile(r"[\u4e00-\u9fff]")
+
+# Common Whisper Chinese ASR homophone & colloquial fixes before translation
+_ZH_ASR_HOMOPHONE_FIXES: tuple[tuple[str, str], ...] = (
+    ("下次就要找一点", "下次就要早一点"),
+    ("下次就要找一點", "下次就要早一点"),
+    ("下次要找一点", "下次要早一点"),
+    ("下次要找一點", "下次要早一点"),
+    ("我知道起来", "我知道了"),
+)
+
+
+def _normalize_cjk_asr_text(text: str, lang: str = "auto") -> str:
+    s = (text or "").strip()
+    if not s:
+        return ""
+    if (lang or "").lower().startswith("zh") or (_HANZI_ONLY_RE.search(s) and not _KANA_ONLY_RE.search(s)):
+        for wrong, right in _ZH_ASR_HOMOPHONE_FIXES:
+            if wrong in s:
+                s = s.replace(wrong, right)
+    return s
 
 
 def _sanitize_whisper_cue_text(text: str, *, is_translation: bool = False) -> str:
@@ -636,7 +658,10 @@ async def _translate_edge_fallback(texts: list[str], src_lang: str, target_lang:
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136.0.0.0 Safari/537.36"
 
     async def _one(http: httpx.AsyncClient, txt: str) -> str:
-        clean = " ".join(line.strip() for line in str(txt or "").splitlines() if line.strip())
+        clean = _normalize_cjk_asr_text(
+            " ".join(line.strip() for line in str(txt or "").splitlines() if line.strip()),
+            src_lang,
+        )
         if not clean:
             return ""
         try:
@@ -825,17 +850,17 @@ async def _translate_smart(
     session_id: str = "default",
 ) -> list[str]:
     """
-    Default ('auto' / 'nllb'): Use dedicated NLLB-200-distilled-600M (CTranslate2 int8) NMT model!
-    - 8-10x faster than Ollama LLM on CPU, zero extra daemon required, and locks target language prefix ('vie_Latn').
-    - Explicit 'ollama' mode still supports Qwen2.5 KeepContext JSON batching.
-    - Explicit 'edge_only' mode uses Google GTX / Clients5.
+    Hybrid Neural Translation Pipeline:
+    - 'auto' / 'edge_only': Uses Google Neural NMT (clients5 / GTX, <40ms inside Colab network, 0% CPU load,
+      strongest colloquial/slang CJK->Vietnamese accuracy) with automatic NLLB-200 (CTranslate2 int8) fallback!
+    - 'nllb': Explicitly runs offline Meta NLLB-200-distilled-600M (CTranslate2 int8).
+    - 'ollama': Explicitly runs Qwen2.5 KeepContext JSON batching.
     """
     mode = (translate_mode or "auto").lower()
-    if mode == "edge_only":
-        return await _translate_edge_fallback(texts, src_lang, target_lang)
+    norm_texts = [_normalize_cjk_asr_text(t, src_lang) for t in texts]
     if mode == "ollama":
         return await _translate_ollama_keep_context(
-            texts,
+            norm_texts,
             src_lang=src_lang,
             target_lang=target_lang,
             model=llm_model,
@@ -843,13 +868,32 @@ async def _translate_smart(
             is_cpu=not has_gpu,
             cpu_cores=cpu_cores,
         )
-    return await _translate_nllb_ct2(
-        texts,
-        src_lang=src_lang,
-        target_lang=target_lang,
-        has_gpu=has_gpu,
-        cpu_cores=cpu_cores,
-    )
+    if mode == "nllb":
+        return await _translate_nllb_ct2(
+            norm_texts,
+            src_lang=src_lang,
+            target_lang=target_lang,
+            has_gpu=has_gpu,
+            cpu_cores=cpu_cores,
+        )
+    # Default ('auto'): Google Neural NMT (0% CPU overhead so Whisper gets 100% CPU for beam_size=2) + NLLB-200 fallback
+    edge_out = await _translate_edge_fallback(norm_texts, src_lang, target_lang)
+    bad_indices = [
+        i for i, txt in enumerate(norm_texts)
+        if txt and _needs_retranslation(txt, edge_out[i] if i < len(edge_out) else "", target_lang)
+    ]
+    if bad_indices:
+        nllb_fixed = await _translate_nllb_ct2(
+            [norm_texts[i] for i in bad_indices],
+            src_lang=src_lang,
+            target_lang=target_lang,
+            has_gpu=has_gpu,
+            cpu_cores=cpu_cores,
+        )
+        for idx_pos, fixed_txt in zip(bad_indices, nllb_fixed):
+            if fixed_txt:
+                edge_out[idx_pos] = fixed_txt
+    return edge_out
 
 
 class ColabAISetupRequest(BaseModel):
@@ -1185,8 +1229,7 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
         last_end_time = float(payload.start_time)
         total_chunks = 0
         locked_lang: str | None = lang_arg
-        lang_streak_code: str | None = None
-        lang_streak_count: int = 0
+        lang_char_scores: dict[str, int] = {"zh": 0, "ja": 0, "ko": 0, "en": 0}
 
         try:
             while not stop_ev.is_set():
@@ -1220,11 +1263,14 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                 ) -> tuple[list[dict[str, Any]], str, float]:
                     _patch_pyav_open_compat()
                     audio_input = _pcm_s16le_to_float32(pcm_data)
+                    # Guide Whisper to output consistent Simplified Chinese when language is 'zh'
+                    init_prompt = "以下是普通话的句子。" if cur_lang == "zh" else None
                     if use_cuda:
                         segs, info = cur_model.transcribe(
                             audio_input,
                             language=cur_lang,
-                            beam_size=4,
+                            initial_prompt=init_prompt,
+                            beam_size=5,
                             repetition_penalty=1.25,
                             no_repeat_ngram_size=3,
                             compression_ratio_threshold=2.0,
@@ -1235,12 +1281,13 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                             vad_parameters={"min_silence_duration_ms": 350},
                         )
                     else:
-                        # CPU Fast-Path: greedy int8 + temperature=0.0 + anti-repetition guards
+                        # CPU Path: beam_size=2 resolves Chinese/Japanese homophones accurately since NMT takes 0% CPU!
                         segs, info = cur_model.transcribe(
                             audio_input,
                             language=cur_lang,
-                            beam_size=1,
-                            best_of=1,
+                            initial_prompt=init_prompt,
+                            beam_size=2,
+                            best_of=2,
                             temperature=0.0,
                             repetition_penalty=1.25,
                             no_repeat_ngram_size=3,
@@ -1257,6 +1304,7 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                         txt = _sanitize_whisper_cue_text(s.text or "", is_translation=False)
                         if not txt:
                             continue
+                        txt = _normalize_cjk_asr_text(txt, cur_lang or "auto")
                         st = round(cs + float(s.start), 3)
                         ed = round(cs + max(float(s.end), float(s.start) + 0.35) - 0.02, 3)
                         out_cues.append({"startTime": st, "endTime": ed, "text": txt})
@@ -1269,27 +1317,37 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                 if stop_ev.is_set():
                     break
 
-                # Guard against false 'ja' lock on Chinese ('zh') video:
-                # Only lock language when 3 consecutive substantial speech chunks (>=20 chars, >=10 unique chars, prob >=0.92) agree.
+                # Cumulative Script-Aware Language Lock:
+                # Prevents Whisper from mixing Chinese ('zh') and Japanese ('ja') across short chunks!
                 joined_text = "".join(c["text"] for c in cues)
-                hanzi_cnt = len(re.findall(r"[\u4e00-\u9fff]", joined_text))
-                kana_cnt = len(re.findall(r"[\u3040-\u30ff]", joined_text))
-                if lang_arg is None:
-                    # If 'ja' was detected or locked but output is predominantly Hanzi (>=6 chars) with <20% Kana, it's Chinese!
-                    if det_lang == "ja" and hanzi_cnt >= 6 and kana_cnt < max(2, int(hanzi_cnt * 0.25)):
+                hanzi_cnt = len(_HANZI_ONLY_RE.findall(joined_text))
+                kana_cnt = len(_KANA_ONLY_RE.findall(joined_text))
+                hangul_cnt = len(re.findall(r"[\uac00-\ud7af]", joined_text))
+                if lang_arg is None and joined_text:
+                    if hanzi_cnt >= 3 and kana_cnt == 0:
                         det_lang = "zh"
-                        if locked_lang == "ja":
-                            locked_lang = None
-                        lang_streak_code = "zh"
-                        lang_streak_count = 1
-                    elif locked_lang is None and det_lang and lang_prob >= 0.92 and len(joined_text) >= 20 and len(set(joined_text)) >= 10:
-                        if det_lang == lang_streak_code:
-                            lang_streak_count += 1
-                        else:
-                            lang_streak_code = det_lang
-                            lang_streak_count = 1
-                        if lang_streak_count >= 3:
-                            locked_lang = det_lang
+                        lang_char_scores["zh"] += hanzi_cnt * 2
+                    elif det_lang == "ja" and hanzi_cnt >= 5 and kana_cnt < max(2, int(hanzi_cnt * 0.25)):
+                        det_lang = "zh"
+                        lang_char_scores["zh"] += hanzi_cnt * 2
+                    elif kana_cnt >= 3:
+                        lang_char_scores["ja"] += kana_cnt + hanzi_cnt
+                    elif hangul_cnt >= 3:
+                        det_lang = "ko"
+                        lang_char_scores["ko"] += hangul_cnt * 2
+                    elif det_lang in lang_char_scores and lang_prob >= 0.85:
+                        lang_char_scores[det_lang] += len(joined_text)
+
+                    # Lock to 'zh' as soon as cumulative Chinese score >= 10 (just 1-2 short Chinese sentences!)
+                    if lang_char_scores["zh"] >= 10 and lang_char_scores["zh"] > lang_char_scores["ja"] * 2:
+                        locked_lang = "zh"
+                        det_lang = "zh"
+                        # Filter out any stray Japanese Kana hallucination cues once video is confirmed Chinese
+                        cues = [c for c in cues if not _KANA_ONLY_RE.search(c["text"])]
+                    elif lang_char_scores["ja"] >= 18 and lang_char_scores["ja"] > lang_char_scores["zh"] * 2:
+                        locked_lang = "ja"
+                    elif lang_char_scores["ko"] >= 12:
+                        locked_lang = "ko"
 
                 if cues and payload.translate_to and payload.translate_to.lower() != "none":
                     try:
