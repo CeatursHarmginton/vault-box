@@ -1081,6 +1081,30 @@ async def colab_ai_cancel(payload: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "cancelled": bool(ev)}
 
 
+def _find_silence_split_byte_offset(buf_bytes: bytearray | bytes) -> int:
+    """Find the quietest 120ms window in the last 3.0s of `buf_bytes` so we never slice mid-sentence."""
+    total_b = (len(buf_bytes) // 2) * 2
+    min_keep_b = int(4.5 * BYTES_PER_SECOND) // 2 * 2
+    if total_b <= min_keep_b + BYTES_PER_SECOND:
+        return total_b
+    win_b = int(0.12 * BYTES_PER_SECOND) // 2 * 2  # 120ms window
+    search_b = min(int(3.0 * BYTES_PER_SECOND) // 2 * 2, total_b - min_keep_b)
+    start_b = total_b - search_b
+    step_b = int(0.04 * BYTES_PER_SECOND) // 2 * 2  # 40ms step
+    best_pos = total_b
+    best_energy = float("inf")
+    mv = memoryview(buf_bytes)
+    for pos in range(total_b - win_b, start_b, -step_b):
+        arr = array.array("h")
+        arr.frombytes(mv[pos : pos + win_b])
+        # Sample every 4th frame inside window for ultra-fast energy estimate
+        energy = sum(s * s for s in arr[::4])
+        if energy < best_energy:
+            best_energy = energy
+            best_pos = pos + (win_b // 2) // 2 * 2
+    return best_pos
+
+
 @router.post("/subtitles/stream")
 async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> StreamingResponse:
     async def _gen() -> AsyncGenerator[str, None]:
@@ -1095,7 +1119,11 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
         cpu_cores = int(hw["cpu"]["cores"])
 
         want_translation = bool(payload.translate_to and payload.translate_to.lower() != "none")
-        want_ollama = want_translation and (payload.translate_mode or "auto").lower() != "edge"
+        mode_norm = (payload.translate_mode or "auto").lower()
+        want_ollama = want_translation and (
+            mode_norm in {"ollama", "llm", "ollama_json_batch"}
+            or (has_gpu and mode_norm not in {"edge", "edge_only", "nllb", "ct2"})
+        )
         ollama_ok, ollama_models = await _probe_ollama() if want_ollama else (True, [])
         need_whisper = not _faster_whisper_installed()
         need_ollama = want_ollama and (not ollama_ok or not ollama_models)
@@ -1122,11 +1150,11 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                 return
 
         req_model = (payload.whisper_model or "").strip()
-        # Protect CPU runtime if client sent 'auto' or left 'large-v3-turbo' from earlier GPU settings
-        if not has_gpu and req_model.lower() in {"", "auto", "large-v3", "large-v3-turbo", "large-v2", "large", "medium"}:
-            req_model = ""
-        is_auto_model = not req_model or req_model.lower() == "auto"
-        w_model_name = hw["recommendedWhisperModel"] if is_auto_model else req_model
+        if has_gpu and req_model.lower() in {"", "auto", "small", "base"}:
+            req_model = "large-v3-turbo"
+        elif not has_gpu and req_model.lower() in {"", "auto", "large-v3", "large-v3-turbo", "large-v2", "large", "medium"}:
+            req_model = "small"
+        w_model_name = req_model or hw["recommendedWhisperModel"]
 
         yield _sse("status", {
             "state": "loading_model",
@@ -1154,7 +1182,8 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
             "startTime": payload.start_time,
         })
 
-        # FFmpeg pinned to 1 thread so it never competes with CTranslate2 OpenMP threads on Colab CPU!
+        # FFmpeg pinned to 1 thread + PTS clock lock (`aresample=async=1000:first_pts=0`)
+        # so VFR/livestream MP4 packet gaps never cause subtitle timestamp drift!
         ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
         cmd: list[str] = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-threads", "1"]
         if payload.headers:
@@ -1162,11 +1191,13 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
             if hdr_lines:
                 cmd.extend(["-headers", hdr_lines])
         if payload.start_time > 0.5:
-            cmd.extend(["-ss", f"{payload.start_time:.3f}"])
+            cmd.extend(["-accurate_seek", "-ss", f"{payload.start_time:.3f}"])
         cmd.extend([
             "-i",
             payload.media_url,
             "-vn",
+            "-af",
+            "aresample=async=1000:first_pts=0",
             "-threads",
             "1",
             "-ac",
@@ -1185,10 +1216,10 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
             stderr=asyncio.subprocess.PIPE,
         )
 
-        # Shorter chunks on CPU (4s first chunk -> <1s time-to-first-subtitle; 8s steady chunks)
-        default_chunk_sec = 12 if is_cuda else 8
-        chunk_sec = max(5, min(25, int(payload.chunk_seconds or default_chunk_sec)))
-        first_sec = 4 if not is_cuda else min(6, chunk_sec)
+        # 16s steady chunks fill Whisper's 30s Mel Encoder efficiently (2x faster RTF) while splitting on silence!
+        default_chunk_sec = 16 if is_cuda else 15
+        chunk_sec = max(6, min(25, int(payload.chunk_seconds or default_chunk_sec)))
+        first_sec = 6
         lang_arg = None if not payload.language or payload.language.lower() == "auto" else payload.language.lower()[:2]
 
         # Read-ahead audio prefetch queue so CDN download & FFmpeg decode overlap 100% with CPU Whisper inference!
@@ -1197,11 +1228,13 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
         async def _pcm_producer() -> None:
             c_no = 0
             cur = float(payload.start_time)
+            carry = bytearray()
             try:
                 assert proc.stdout is not None
                 while not stop_ev.is_set():
                     want_bytes = (first_sec if c_no == 0 else chunk_sec) * BYTES_PER_SECOND
-                    buf = bytearray()
+                    buf = bytearray(carry)
+                    carry.clear()
                     while len(buf) < want_bytes and not stop_ev.is_set():
                         try:
                             part = await asyncio.wait_for(
@@ -1215,11 +1248,18 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                         buf.extend(part)
                     if stop_ev.is_set() or len(buf) < BYTES_PER_SAMPLE * 1600:
                         break
-                    dur = len(buf) / float(BYTES_PER_SECOND)
+                    if len(buf) >= int(want_bytes * 0.85):
+                        split_at = _find_silence_split_byte_offset(buf)
+                        chunk_bytes = bytes(buf[:split_at])
+                        carry.extend(buf[split_at:])
+                    else:
+                        even_len = (len(buf) // 2) * 2
+                        chunk_bytes = bytes(buf[:even_len])
+                    dur = len(chunk_bytes) / float(BYTES_PER_SECOND)
                     c_start = cur
                     cur += dur
                     c_no += 1
-                    await pcm_queue.put((c_no, c_start, dur, bytes(buf)))
+                    await pcm_queue.put((c_no, c_start, dur, chunk_bytes))
             finally:
                 await pcm_queue.put(None)
 
@@ -1271,6 +1311,8 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                             language=cur_lang,
                             initial_prompt=init_prompt,
                             beam_size=5,
+                            word_timestamps=True,
+                            max_initial_timestamp=1.0,
                             repetition_penalty=1.25,
                             no_repeat_ngram_size=3,
                             compression_ratio_threshold=2.0,
@@ -1278,10 +1320,10 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                             no_speech_threshold=0.6,
                             condition_on_previous_text=False,
                             vad_filter=True,
-                            vad_parameters={"min_silence_duration_ms": 350},
+                            vad_parameters={"threshold": 0.5, "min_silence_duration_ms": 250, "speech_pad_ms": 80},
                         )
                     else:
-                        # CPU Path: beam_size=2 resolves Chinese/Japanese homophones accurately since NMT takes 0% CPU!
+                        # CPU Path: beam_size=2 + word_timestamps=True for exact word onset/offset alignment!
                         segs, info = cur_model.transcribe(
                             audio_input,
                             language=cur_lang,
@@ -1289,6 +1331,8 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                             beam_size=2,
                             best_of=2,
                             temperature=0.0,
+                            word_timestamps=True,
+                            max_initial_timestamp=1.0,
                             repetition_penalty=1.25,
                             no_repeat_ngram_size=3,
                             compression_ratio_threshold=2.0,
@@ -1297,17 +1341,55 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                             condition_on_previous_text=False,
                             without_timestamps=False,
                             vad_filter=True,
-                            vad_parameters={"min_silence_duration_ms": 300, "speech_pad_ms": 200},
+                            vad_parameters={"threshold": 0.5, "min_silence_duration_ms": 250, "speech_pad_ms": 80},
                         )
                     out_cues = []
                     for s in segs:
-                        txt = _sanitize_whisper_cue_text(s.text or "", is_translation=False)
-                        if not txt:
-                            continue
-                        txt = _normalize_cjk_asr_text(txt, cur_lang or "auto")
-                        st = round(cs + float(s.start), 3)
-                        ed = round(cs + max(float(s.end), float(s.start) + 0.35) - 0.02, 3)
-                        out_cues.append({"startTime": st, "endTime": ed, "text": txt})
+                        words = getattr(s, "words", None) or []
+                        if words:
+                            # Group words into tight subtitle cues, splitting on pauses >= 0.48s or sentence punctuation
+                            cur_words: list[Any] = []
+                            for w in words:
+                                if cur_words:
+                                    gap = float(w.start) - float(cur_words[-1].end)
+                                    prev_txt = "".join(str(x.word or "") for x in cur_words).strip()
+                                    if gap >= 0.48 or (
+                                        len(prev_txt) >= 10
+                                        and re.search(r"[。！？!?，,.\s]$", prev_txt)
+                                        and gap >= 0.18
+                                    ):
+                                        c_txt = _sanitize_whisper_cue_text(prev_txt, is_translation=False)
+                                        if c_txt:
+                                            c_txt = _normalize_cjk_asr_text(c_txt, cur_lang or "auto")
+                                            st = round(cs + float(cur_words[0].start), 3)
+                                            ed = round(
+                                                cs + max(float(cur_words[-1].end), float(cur_words[0].start) + 0.4),
+                                                3,
+                                            )
+                                            out_cues.append({"startTime": st, "endTime": ed, "text": c_txt})
+                                        cur_words = []
+                                cur_words.append(w)
+                            if cur_words:
+                                last_txt = _sanitize_whisper_cue_text(
+                                    "".join(str(x.word or "") for x in cur_words).strip(),
+                                    is_translation=False,
+                                )
+                                if last_txt:
+                                    last_txt = _normalize_cjk_asr_text(last_txt, cur_lang or "auto")
+                                    st = round(cs + float(cur_words[0].start), 3)
+                                    ed = round(
+                                        cs + max(float(cur_words[-1].end), float(cur_words[0].start) + 0.4),
+                                        3,
+                                    )
+                                    out_cues.append({"startTime": st, "endTime": ed, "text": last_txt})
+                        else:
+                            txt = _sanitize_whisper_cue_text(s.text or "", is_translation=False)
+                            if not txt:
+                                continue
+                            txt = _normalize_cjk_asr_text(txt, cur_lang or "auto")
+                            st = round(cs + float(s.start), 3)
+                            ed = round(cs + max(float(s.end), float(s.start) + 0.35) - 0.02, 3)
+                            out_cues.append({"startTime": st, "endTime": ed, "text": txt})
                     det = getattr(info, "language", None) or (cur_lang or "en")
                     prob = float(getattr(info, "language_probability", 0.0) or 0.0)
                     return out_cues, str(det), prob
@@ -1369,45 +1451,22 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                 total_sec = time.perf_counter() - t0
                 rtf = round(total_sec / max(0.5, dur), 2)
 
-                # Adaptive CPU Real-Time Factor (RTF) Guard across combined (Whisper int8 + Qwen2.5-1.5B JSON Batch):
-                # 1) Auto-downshift Whisper 'small'/'medium' -> 'base' if combined RTF > 0.88x for 2 chunks
-                # 2) Recommend switching Colab Runtime to GPU if even 'base + 1.5b' exceeds RTF > 1.05x
-                if not is_cuda:
-                    if rtf > 0.88 and dur >= 3.5:
-                        slow_cpu_streak += 1
-                    else:
-                        slow_cpu_streak = 0
-
-                    if slow_cpu_streak >= 2:
-                        slow_cpu_streak = 0
-                        if is_auto_model and w_model_name not in {"base", "tiny"}:
-                            prev_name = w_model_name
-                            w_model_name = "base"
-                            try:
-                                model, actual_device = await _get_whisper_model("base", False, cpu_cores)
-                                yield _sse("cpu_notice", {
-                                    "level": "downshift",
-                                    "fromModel": prev_name,
-                                    "toModel": "base",
-                                    "rtf": rtf,
-                                    "message": (
-                                        f"Colab CPU đang tải nặng (RTF {rtf}x khi chạy Whisper + Qwen2.5-1.5B) — "
-                                        f"đã tự hạ Whisper từ '{prev_name}' xuống 'base (int8)' để giữ phụ đề kịp hình."
-                                    ),
-                                })
-                            except Exception:
-                                pass
-                        elif not warned_recommend_gpu and rtf > 1.05:
-                            warned_recommend_gpu = True
-                            yield _sse("cpu_notice", {
-                                "level": "recommend_gpu",
-                                "model": w_model_name,
-                                "rtf": rtf,
-                                "message": (
-                                    f"⚠ Colab CPU hiện xử lý chậm hơn tốc độ video (RTF {rtf}x trên '{w_model_name} + Qwen2.5-1.5B'). "
-                                    "Khuyên dùng: Đổi Runtime trên Colab sang GPU để chạy mượt với large-v3-turbo + Qwen2.5-7B!"
-                                ),
-                            })
+                # Never downgrade Whisper 'small' to 'base' (since 'small' only uses ~500MB RAM and 'base' hurts CJK accuracy).
+                if not is_cuda and not warned_recommend_gpu and rtf > 1.25 and dur >= 6.0:
+                    slow_cpu_streak += 1
+                    if slow_cpu_streak >= 3:
+                        warned_recommend_gpu = True
+                        yield _sse("cpu_notice", {
+                            "level": "recommend_gpu",
+                            "model": w_model_name,
+                            "rtf": rtf,
+                            "message": (
+                                f"⚠ Colab CPU đang xử lý ở RTF {rtf}x trên model '{w_model_name}'. "
+                                "Mẹo: Đổi Runtime trên Colab sang GPU (T4) nếu muốn chạy siêu tốc với large-v3-turbo!"
+                            ),
+                        })
+                else:
+                    slow_cpu_streak = 0
 
                 if cues:
                     yield _sse("cues", {
