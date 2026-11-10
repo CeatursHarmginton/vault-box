@@ -26,8 +26,10 @@ from .providers import PROVIDERS
 from .providers.base import ProviderFailure
 from .relay_client import start_colab_relay
 from .security import require_token
+from .ai_subtitles import router as ai_subtitles_router
 
 app = FastAPI(title="VaultBox Colab Transfer Worker", version="2.0.0")
+app.include_router(ai_subtitles_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

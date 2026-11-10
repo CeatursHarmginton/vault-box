@@ -5,8 +5,18 @@ import json
 import time
 from urllib.parse import quote, urlsplit, urlunsplit
 
-from .config import COLAB_RELAY_ROOM_ID, COLAB_RELAY_TOKEN, COLAB_RELAY_URL, ENV_NAME
+from .config import COLAB_RELAY_ROOM_ID, COLAB_RELAY_TOKEN, COLAB_RELAY_URL, ENV_NAME, PUBLIC_URL
 from .jobs.job_manager import JobManager
+from .ai_subtitles import (
+    ColabAISetupRequest,
+    ColabAISubtitleStreamRequest,
+    ColabAITranslateRequest,
+    colab_ai_cancel,
+    colab_ai_health,
+    colab_ai_setup,
+    colab_ai_subtitles_stream,
+    colab_ai_translate,
+)
 
 TERMINAL = {"completed", "failed", "cancelled", "error"}
 
@@ -91,6 +101,7 @@ async def _relay_loop(manager: JobManager) -> None:
                     "environment": ENV_NAME,
                     "envName": ENV_NAME,
                     "serverName": f"VaultBox {ENV_NAME} Worker",
+                    "publicUrl": PUBLIC_URL,
                 }))
                 await ws.send(json.dumps({
                     "type": "ready",
@@ -161,6 +172,8 @@ async def _relay_loop(manager: JobManager) -> None:
                                 job.payload.setdefault("target", {}).update((msg["payload"].get("target") or {}))
                             job.confirm_action = msg.get("action")
                             job.confirm_event.set()
+                    elif typ == "ai_request":
+                        asyncio.create_task(_handle_ws_ai_request(ws, msg))
         except asyncio.CancelledError:
             if heartbeat_task and not heartbeat_task.done():
                 heartbeat_task.cancel()
@@ -212,3 +225,33 @@ async def _monitor(ws, manager: JobManager, job_id: str) -> None:
         raise
     except Exception:
         return
+
+
+async def _handle_ws_ai_request(ws, msg: dict) -> None:
+    req_id = str(msg.get("requestId") or "")
+    action = str(msg.get("action") or "")
+    payload = dict(msg.get("payload") or {})
+    try:
+        if action == "health":
+            res = await colab_ai_health()
+            await ws.send(json.dumps({"type": "ai_response", "requestId": req_id, "data": res}))
+        elif action == "setup":
+            res = await colab_ai_setup(ColabAISetupRequest(**payload))
+            await ws.send(json.dumps({"type": "ai_response", "requestId": req_id, "data": res}))
+        elif action == "translate":
+            res = await colab_ai_translate(ColabAITranslateRequest(**payload))
+            await ws.send(json.dumps({"type": "ai_response", "requestId": req_id, "data": res}))
+        elif action == "subtitles_cancel":
+            res = await colab_ai_cancel(payload)
+            await ws.send(json.dumps({"type": "ai_response", "requestId": req_id, "data": res}))
+        elif action == "subtitles_stream":
+            stream_resp = await colab_ai_subtitles_stream(ColabAISubtitleStreamRequest(**payload))
+            async for chunk in stream_resp.body_iterator:
+                text = chunk.decode("utf-8") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
+                await ws.send(json.dumps({"type": "ai_stream_chunk", "requestId": req_id, "sse": text}))
+            await ws.send(json.dumps({"type": "ai_stream_done", "requestId": req_id}))
+    except Exception as exc:
+        try:
+            await ws.send(json.dumps({"type": "ai_error", "requestId": req_id, "message": str(exc)}))
+        except Exception:
+            pass
