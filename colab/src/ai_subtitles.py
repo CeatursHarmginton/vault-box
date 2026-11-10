@@ -34,6 +34,103 @@ BYTES_PER_SECOND = SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE
 
 THINK_TAG_RE = re.compile(r"<(think|reason|reasoning|thought)>.*?</\1>", re.IGNORECASE | re.DOTALL)
 
+_LANG_DISPLAY_NAMES: dict[str, str] = {
+    "vi": "Vietnamese (Tiếng Việt)",
+    "en": "English",
+    "zh": "Simplified Chinese (简体中文)",
+    "zh-cn": "Simplified Chinese (简体中文)",
+    "zh-tw": "Traditional Chinese (繁體中文)",
+    "ja": "Japanese (日本語)",
+    "ko": "Korean (한국어)",
+    "fr": "French (Français)",
+    "de": "German (Deutsch)",
+    "es": "Spanish (Español)",
+    "ru": "Russian (Русский)",
+    "th": "Thai (ภาษาไทย)",
+    "id": "Indonesian (Bahasa Indonesia)",
+}
+
+_WHISPER_HALLUCINATION_SUBSTRINGS = (
+    "ご視聴ありがとうございました",
+    "チャンネル登録",
+    "thank you for watching",
+    "subtitles by",
+    "amara.org",
+)
+
+_VI_DIACRITIC_RE = re.compile(
+    r"[àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ]",
+    re.IGNORECASE,
+)
+_VI_ASCII_WORDS_RE = re.compile(
+    r"\b(anh|em|toi|ban|khong|co|la|cua|di|roi|nhe|nha|ung|da|vang|alo|ok)\b",
+    re.IGNORECASE,
+)
+_EN_LEAK_WORDS_RE = re.compile(
+    r"\b(the|to|and|of|in|is|it|it's|its|that|this|for|with|on|as|are|was|be|at|by|from|or|an|"
+    r"have|has|had|not|but|what|all|were|when|we|there|can|you|your|my|me|he|she|they|them|his|her|"
+    r"make|money|call|been|over|half|hour|international|about|just|know|think|want|go|come|see|look|"
+    r"good|time|now|here|why|how|who|where|yes|no|oh|ah|hmm)\b",
+    re.IGNORECASE,
+)
+_CJK_SCRIPT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
+
+
+def _sanitize_whisper_cue_text(text: str, *, is_translation: bool = False) -> str:
+    """
+    Eliminates Whisper & LLM repetition hallucinations such as:
+    - Single character loops ('ん' x 200, 'Hmmmm...' x 200)
+    - Phrase/word loops ('さあ、お前は、お前は、お前は...' or 'Bạn, bạn, bạn...')
+    - Known Whisper silence/BGM hallucination watermarks
+    """
+    s = " ".join(line.strip() for line in str(text or "").splitlines() if line.strip()).strip()
+    if not s:
+        return ""
+    no_punct = re.sub(r"[\s、,，.。!！?？…~～\-]", "", s)
+    if not is_translation and len(no_punct) >= 8:
+        if len(set(no_punct)) <= 2 and re.fullmatch(r"[んーっあうおえhHmMａ-ｚＡ-Ｚ]+", no_punct):
+            return ""
+    if not is_translation:
+        low = s.lower()
+        if any(pat in low for pat in _WHISPER_HALLUCINATION_SUBSTRINGS):
+            return ""
+    # 1. Collapse single character repeated 4+ times -> 2 times
+    out = re.sub(r"(.)\1{3,}", r"\1\1", s)
+    # 2. Collapse repeated 1-25 char word/clause + optional punctuation repeated 3+ times
+    for _ in range(2):
+        out = re.sub(r"(.{1,25}?)(?:[、,，.。!！?？\s]+\1){2,}", r"\1", out, flags=re.IGNORECASE)
+        out = re.sub(r"(.{1,25}?[、,，.。!！?？\s]*)\1{2,}", r"\1", out, flags=re.IGNORECASE)
+    out = out.rstrip("、,， ").strip()
+    return out
+
+
+def _needs_retranslation(src_text: str, trans_text: str, target_lang: str) -> bool:
+    """
+    Detects when a small LLM (e.g. qwen2.5:1.5b) accidentally outputs English or leaves CJK
+    untranslated when target_lang is Vietnamese ('vi') or another target language.
+    """
+    clean_src = _sanitize_whisper_cue_text(src_text, is_translation=False)
+    clean_trans = _sanitize_whisper_cue_text(trans_text, is_translation=True)
+    if not clean_src:
+        return False
+    if not clean_trans:
+        return True
+    tl = (target_lang or "vi").strip().lower()
+    if tl.startswith("vi"):
+        if _CJK_SCRIPT_RE.search(clean_trans):
+            return True
+        if not _VI_DIACRITIC_RE.search(clean_trans):
+            if _EN_LEAK_WORDS_RE.search(clean_trans):
+                return True
+            if _CJK_SCRIPT_RE.search(clean_src) and not _VI_ASCII_WORDS_RE.search(clean_trans):
+                return True
+            ascii_words = re.findall(r"[A-Za-z]{2,}", clean_trans)
+            if len(ascii_words) >= 3 and not _VI_ASCII_WORDS_RE.search(clean_trans):
+                return True
+        if clean_trans.lower() == clean_src.lower() and len(clean_src) > 3 and not _VI_DIACRITIC_RE.search(clean_src):
+            return True
+    return False
+
 _whisper_models: dict[tuple[str, str], Any] = {}
 _model_lock = asyncio.Lock()
 _active_ai_sessions: dict[str, asyncio.Event] = {}
@@ -444,15 +541,22 @@ async def _translate_ollama_keep_context(
     history_max = 6 if is_cpu else 10
     history = _llm_histories.setdefault(f"{session_id}:{chosen_model}:{target_lang}", deque(maxlen=history_max))
 
-    cleaned_inputs = [" ".join(line.strip() for line in str(t).splitlines() if line.strip()) for t in texts]
+    cleaned_inputs = [_sanitize_whisper_cue_text(t, is_translation=False) for t in texts]
     indexed_payload = {str(i): txt for i, txt in enumerate(cleaned_inputs) if txt}
     if not indexed_payload:
         return ["" for _ in texts]
 
+    src_display = _LANG_DISPLAY_NAMES.get((src_lang or "").lower(), src_lang or "Auto-detected language")
+    target_display = _LANG_DISPLAY_NAMES.get((target_lang or "vi").lower(), target_lang or "Vietnamese (Tiếng Việt)")
+    lang_guard = (
+        " BẮT BUỘC dịch hoàn toàn sang Tiếng Việt có dấu tự nhiên, TUYỆT ĐỐI KHÔNG dịch sang tiếng Anh (NEVER output English)."
+        if (target_lang or "vi").lower().startswith("vi")
+        else f" Always translate into {target_display}."
+    )
     sys_prompt = (
         "You are a professional subtitle translator. Translate the JSON object of numbered subtitle lines "
-        f"from {src_lang or 'auto'} into {target_lang} naturally, keeping consistent pronouns and dialogue context. "
-        "Output ONLY a valid JSON object with the exact same string keys mapped to translated strings."
+        f"from {src_display} into {target_display} naturally, keeping consistent pronouns and dialogue context.{lang_guard} "
+        "Output ONLY a valid JSON object with the exact same numeric string keys mapped to translated strings."
     )
     user_msg = json.dumps(indexed_payload, ensure_ascii=False)
     messages = [{"role": "system", "content": sys_prompt}, *list(history), {"role": "user", "content": user_msg}]
@@ -487,9 +591,22 @@ async def _translate_ollama_keep_context(
             parsed = json.loads(reply_clean)
             if isinstance(parsed, dict):
                 out = [
-                    str(parsed.get(str(i)) or cleaned_inputs[i]).strip() if cleaned_inputs[i] else ""
+                    _sanitize_whisper_cue_text(str(parsed.get(str(i)) or ""), is_translation=True)
+                    if cleaned_inputs[i]
+                    else ""
                     for i in range(len(texts))
                 ]
+                # Verify every line is actually in target_lang (repair any English leak on 'vi' via Google Clients5/GTX)
+                bad_indices = [
+                    i for i in range(len(texts))
+                    if cleaned_inputs[i] and _needs_retranslation(cleaned_inputs[i], out[i], target_lang)
+                ]
+                if bad_indices:
+                    repaired = await _translate_edge_fallback(
+                        [cleaned_inputs[i] for i in bad_indices], src_lang, target_lang
+                    )
+                    for idx_pos, fixed_txt in zip(bad_indices, repaired):
+                        out[idx_pos] = _sanitize_whisper_cue_text(fixed_txt, is_translation=True) or fixed_txt
                 history.append({"role": "user", "content": user_msg})
                 history.append({
                     "role": "assistant",
@@ -858,6 +975,8 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
         last_end_time = float(payload.start_time)
         total_chunks = 0
         locked_lang: str | None = lang_arg
+        lang_streak_code: str | None = None
+        lang_streak_count: int = 0
 
         try:
             while not stop_ev.is_set():
@@ -896,17 +1015,28 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                             audio_input,
                             language=cur_lang,
                             beam_size=4,
+                            repetition_penalty=1.25,
+                            no_repeat_ngram_size=3,
+                            compression_ratio_threshold=2.0,
+                            log_prob_threshold=-0.9,
+                            no_speech_threshold=0.6,
+                            condition_on_previous_text=False,
                             vad_filter=True,
                             vad_parameters={"min_silence_duration_ms": 350},
                         )
                     else:
-                        # CPU Fast-Path: greedy int8 + temperature=0.0 eliminates 6x fallback retry stalls on BGM/noise!
+                        # CPU Fast-Path: greedy int8 + temperature=0.0 + anti-repetition guards
                         segs, info = cur_model.transcribe(
                             audio_input,
                             language=cur_lang,
                             beam_size=1,
                             best_of=1,
                             temperature=0.0,
+                            repetition_penalty=1.25,
+                            no_repeat_ngram_size=3,
+                            compression_ratio_threshold=2.0,
+                            log_prob_threshold=-0.9,
+                            no_speech_threshold=0.6,
                             condition_on_previous_text=False,
                             without_timestamps=False,
                             vad_filter=True,
@@ -914,7 +1044,7 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                         )
                     out_cues = []
                     for s in segs:
-                        txt = (s.text or "").strip()
+                        txt = _sanitize_whisper_cue_text(s.text or "", is_translation=False)
                         if not txt:
                             continue
                         st = round(cs + float(s.start), 3)
@@ -929,9 +1059,27 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                 if stop_ev.is_set():
                     break
 
-                # Lock detected language on CPU once high-confidence (>0.82) so subsequent chunks skip 30s mel language-ID overhead!
-                if not is_cuda and locked_lang is None and det_lang and lang_prob >= 0.82:
-                    locked_lang = det_lang
+                # Guard against false 'ja' lock on Chinese ('zh') video:
+                # Only lock language when 3 consecutive substantial speech chunks (>=20 chars, >=10 unique chars, prob >=0.92) agree.
+                joined_text = "".join(c["text"] for c in cues)
+                hanzi_cnt = len(re.findall(r"[\u4e00-\u9fff]", joined_text))
+                kana_cnt = len(re.findall(r"[\u3040-\u30ff]", joined_text))
+                if lang_arg is None:
+                    # If 'ja' was detected or locked but output is predominantly Hanzi (>=6 chars) with <20% Kana, it's Chinese!
+                    if det_lang == "ja" and hanzi_cnt >= 6 and kana_cnt < max(2, int(hanzi_cnt * 0.25)):
+                        det_lang = "zh"
+                        if locked_lang == "ja":
+                            locked_lang = None
+                        lang_streak_code = "zh"
+                        lang_streak_count = 1
+                    elif locked_lang is None and det_lang and lang_prob >= 0.92 and len(joined_text) >= 20 and len(set(joined_text)) >= 10:
+                        if det_lang == lang_streak_code:
+                            lang_streak_count += 1
+                        else:
+                            lang_streak_code = det_lang
+                            lang_streak_count = 1
+                        if lang_streak_count >= 3:
+                            locked_lang = det_lang
 
                 if cues and payload.translate_to and payload.translate_to.lower() != "none":
                     try:
