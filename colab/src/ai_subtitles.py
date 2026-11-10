@@ -584,6 +584,12 @@ async def colab_ai_setup(payload: ColabAISetupRequest) -> dict[str, Any]:
 
 @router.post("/translate")
 async def colab_ai_translate(payload: ColabAITranslateRequest) -> dict[str, Any]:
+    mode = (payload.translate_mode or "auto").lower()
+    if mode != "edge":
+        ollama_ok, ollama_models = await _probe_ollama()
+        if not ollama_ok or not ollama_models:
+            # Colab is in Transfer-only mode (AI models not installed); let VaultBox fallback cleanly without touching Colab
+            return {"ok": False, "reason": "ai_not_installed", "translations": []}
     hw = _detect_hardware_profile()
     translations = await _translate_smart(
         payload.texts,
