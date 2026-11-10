@@ -223,6 +223,47 @@ def _build_wav(pcm: bytes) -> bytes:
     return header + pcm
 
 
+def _patch_pyav_open_compat() -> None:
+    """
+    Compat shim for Google Colab's preinstalled PyAV (`av`):
+    Older PyAV builds do not accept `metadata_errors="ignore"` passed by
+    `faster_whisper.audio.decode_audio`. Strip `metadata_errors` if unsupported.
+    """
+    try:
+        import inspect
+        import av  # type: ignore[import-not-found]
+
+        orig_open = getattr(av, "open", None)
+        if callable(orig_open) and not getattr(orig_open, "_vb_patched", False):
+            sig = inspect.signature(orig_open)
+            has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if "metadata_errors" not in sig.parameters and not has_var_kw:
+                def _compat_open(*args: Any, **kwargs: Any) -> Any:
+                    kwargs.pop("metadata_errors", None)
+                    return orig_open(*args, **kwargs)
+
+                _compat_open._vb_patched = True  # type: ignore[attr-defined]
+                av.open = _compat_open
+    except Exception:
+        pass
+
+
+def _pcm_s16le_to_float32(raw_pcm: bytes) -> Any:
+    """
+    Convert 16kHz mono s16le PCM bytes directly into a 1-D numpy.float32 array in [-1.0, 1.0].
+    Passing a numpy.ndarray to faster_whisper.WhisperModel.transcribe() completely bypasses
+    `decode_audio` and `av.open(..., metadata_errors="ignore")`!
+    """
+    try:
+        import numpy as np
+
+        n_samples = len(raw_pcm) // 2
+        pcm_view = memoryview(raw_pcm)[: n_samples * 2]
+        return np.frombuffer(pcm_view, dtype="<i2").astype(np.float32) * (1.0 / 32768.0)
+    except Exception:
+        return io.BytesIO(_build_wav(raw_pcm))
+
+
 def _has_speech_energy(pcm: bytes, rms_threshold: float = 42.0) -> bool:
     """
     Ultra-fast (<0.2ms) 16-bit PCM RMS energy check to skip pure digital silence
@@ -264,6 +305,7 @@ async def _get_whisper_model(model_name: str, has_gpu: bool, cpu_threads: int) -
             return _whisper_models[cache_key], desired_device
 
         def _load() -> tuple[Any, str]:
+            _patch_pyav_open_compat()
             from faster_whisper import WhisperModel
 
             if has_gpu:
@@ -668,10 +710,10 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                 return
 
         req_model = (payload.whisper_model or "").strip()
-        is_auto_model = not req_model or req_model.lower() == "auto"
-        # Protect CPU runtime if user accidentally left 'large-v3-turbo' selected from an earlier GPU session
-        if not has_gpu and req_model in {"large-v3", "large-v3-turbo", "large-v2"} and is_auto_model:
+        # Protect CPU runtime if client sent 'auto' or left 'large-v3-turbo' from earlier GPU settings
+        if not has_gpu and req_model.lower() in {"", "auto", "large-v3", "large-v3-turbo", "large-v2", "large", "medium"}:
             req_model = ""
+        is_auto_model = not req_model or req_model.lower() == "auto"
         w_model_name = hw["recommendedWhisperModel"] if is_auto_model else req_model
 
         yield _sse("status", {
@@ -797,19 +839,20 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                 if not _has_speech_energy(raw_pcm):
                     continue
 
-                wav_bytes = _build_wav(raw_pcm)
                 t0 = time.perf_counter()
 
                 def _transcribe_sync(
-                    wb: bytes = wav_bytes,
+                    pcm_data: bytes = raw_pcm,
                     cs: float = c_start,
                     cur_model: Any = model,
                     use_cuda: bool = is_cuda,
                     cur_lang: str | None = locked_lang,
                 ) -> tuple[list[dict[str, Any]], str, float]:
+                    _patch_pyav_open_compat()
+                    audio_input = _pcm_s16le_to_float32(pcm_data)
                     if use_cuda:
                         segs, info = cur_model.transcribe(
-                            io.BytesIO(wb),
+                            audio_input,
                             language=cur_lang,
                             beam_size=4,
                             vad_filter=True,
@@ -818,7 +861,7 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                     else:
                         # CPU Fast-Path: greedy int8 + temperature=0.0 eliminates 6x fallback retry stalls on BGM/noise!
                         segs, info = cur_model.transcribe(
-                            io.BytesIO(wb),
+                            audio_input,
                             language=cur_lang,
                             beam_size=1,
                             best_of=1,
