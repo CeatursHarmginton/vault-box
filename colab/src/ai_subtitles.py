@@ -451,7 +451,7 @@ def _pcm_s16le_to_float32(raw_pcm: bytes) -> Any:
         return io.BytesIO(_build_wav(raw_pcm))
 
 
-def _has_speech_energy(pcm: bytes, rms_threshold: float = 42.0) -> bool:
+def _has_speech_energy(pcm: bytes, rms_threshold: float = 22.0) -> bool:
     """
     Ultra-fast (<0.2ms) 16-bit PCM RMS energy check to skip pure digital silence
     without waking up Silero VAD / Whisper CPU threads.
@@ -715,6 +715,7 @@ async def _translate_ollama_keep_context(
     session_id: str = "default",
     is_cpu: bool = False,
     cpu_cores: int = 2,
+    near_user: bool = False,
 ) -> list[str]:
     """
     Batched JSON context-aware Ollama subtitle translator.
@@ -725,6 +726,21 @@ async def _translate_ollama_keep_context(
     """
     if not texts:
         return []
+    if near_user and len(texts) > 2:
+        merged_out: list[str] = []
+        for idx in range(0, len(texts), 2):
+            sub_out = await _translate_ollama_keep_context(
+                texts[idx : idx + 2],
+                src_lang=src_lang,
+                target_lang=target_lang,
+                model=model,
+                session_id=session_id,
+                is_cpu=is_cpu,
+                cpu_cores=cpu_cores,
+                near_user=False,
+            )
+            merged_out.extend(sub_out)
+        return merged_out
     ollama_ok, models = await _probe_ollama()
     if not ollama_ok and shutil.which("ollama"):
         try:
@@ -783,7 +799,7 @@ async def _translate_ollama_keep_context(
     options: dict[str, Any] = {
         "temperature": 0.2,
         "num_ctx": 1536 if is_cpu else 2048,
-        "num_predict": 420,
+        "num_predict": 180 if len(texts) <= 2 else 420,
     }
     if is_cpu:
         options["num_thread"] = max(1, int(cpu_cores))
@@ -848,6 +864,7 @@ async def _translate_smart(
     translate_mode: str = "auto",
     llm_model: str = "auto",
     session_id: str = "default",
+    near_user: bool = False,
 ) -> list[str]:
     """
     Hybrid Neural Translation Pipeline:
@@ -867,6 +884,7 @@ async def _translate_smart(
             session_id=session_id,
             is_cpu=not has_gpu,
             cpu_cores=cpu_cores,
+            near_user=near_user,
         )
     if mode == "nllb":
         return await _translate_nllb_ct2(
@@ -918,6 +936,9 @@ class ColabAISubtitleStreamRequest(BaseModel):
     media_url: str
     headers: dict[str, str] = Field(default_factory=dict)
     start_time: float = 0.0
+    end_time: float = 0.0
+    fast_start: bool = True
+    phase: str = "forward"
     language: str = "auto"
     translate_to: str = "vi"
     translate_mode: str = "auto"  # "auto" | "edge" | "llm"
@@ -1081,28 +1102,91 @@ async def colab_ai_cancel(payload: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "cancelled": bool(ev)}
 
 
-def _find_silence_split_byte_offset(buf_bytes: bytearray | bytes) -> int:
+def _find_silence_split_byte_offset(buf_bytes: bytearray | bytes, min_keep_sec: float = 4.5) -> int:
     """Find the quietest 120ms window in the last 3.0s of `buf_bytes` so we never slice mid-sentence."""
+    split_pos, _ = _find_silence_split_with_overlap(buf_bytes, min_keep_sec=min_keep_sec)
+    return split_pos
+
+
+def _find_silence_split_with_overlap(
+    buf_bytes: bytearray | bytes,
+    min_keep_sec: float = 4.5,
+) -> tuple[int, int]:
+    """
+    Find the quietest 120ms window near the end of `buf_bytes`.
+    If continuous multi-speaker dialogue prevents a quiet split, return a 0.24s PCM overlap
+    so words straddling chunk boundaries are never clipped or dropped.
+    """
     total_b = (len(buf_bytes) // 2) * 2
-    min_keep_b = int(4.5 * BYTES_PER_SECOND) // 2 * 2
-    if total_b <= min_keep_b + BYTES_PER_SECOND:
-        return total_b
+    min_keep_b = int(min_keep_sec * BYTES_PER_SECOND) // 2 * 2
+    if total_b <= min_keep_b + int(0.8 * BYTES_PER_SECOND):
+        return total_b, 0
     win_b = int(0.12 * BYTES_PER_SECOND) // 2 * 2  # 120ms window
-    search_b = min(int(3.0 * BYTES_PER_SECOND) // 2 * 2, total_b - min_keep_b)
+    max_search_sec = 1.4 if total_b <= int(7.0 * BYTES_PER_SECOND) else 3.0
+    search_b = min(int(max_search_sec * BYTES_PER_SECOND) // 2 * 2, total_b - min_keep_b)
     start_b = total_b - search_b
     step_b = int(0.04 * BYTES_PER_SECOND) // 2 * 2  # 40ms step
     best_pos = total_b
     best_energy = float("inf")
+    best_count = 1
     mv = memoryview(buf_bytes)
     for pos in range(total_b - win_b, start_b, -step_b):
         arr = array.array("h")
         arr.frombytes(mv[pos : pos + win_b])
+        sampled = arr[::4]
+        if not sampled:
+            continue
         # Sample every 4th frame inside window for ultra-fast energy estimate
-        energy = sum(s * s for s in arr[::4])
+        energy = sum(s * s for s in sampled)
         if energy < best_energy:
             best_energy = energy
+            best_count = len(sampled)
             best_pos = pos + (win_b // 2) // 2 * 2
-    return best_pos
+    split_rms = math.sqrt(best_energy / max(1, best_count))
+    # Active speech/crosstalk at boundary -> keep 0.24s overlap into next chunk
+    overlap_b = (int(0.24 * BYTES_PER_SECOND) // 2 * 2) if split_rms > 95.0 else 0
+    if overlap_b >= best_pos:
+        overlap_b = 0
+    return best_pos, overlap_b
+
+
+def _norm_dedupe_key(text: str) -> str:
+    return re.sub(r"[\s\W_]+", "", (text or "").lower())
+
+
+def _dedupe_boundary_cues(
+    cues: list[dict[str, Any]],
+    prev_tail_cues: list[dict[str, Any]],
+    chunk_start: float,
+) -> list[dict[str, Any]]:
+    """Remove duplicate cues produced by the 0.24s multi-speaker boundary overlap while keeping recovered words."""
+    if not cues or not prev_tail_cues:
+        return cues
+    filtered: list[dict[str, Any]] = []
+    for cue in cues:
+        st = float(cue.get("startTime") or 0.0)
+        ed = float(cue.get("endTime") or 0.0)
+        key = _norm_dedupe_key(str(cue.get("text") or ""))
+        if not key:
+            continue
+        if st <= chunk_start + 0.55:
+            is_dup = False
+            for prev in prev_tail_cues:
+                p_st = float(prev.get("startTime") or 0.0)
+                p_ed = float(prev.get("endTime") or 0.0)
+                if st < p_ed + 0.12 and ed > p_st - 0.12:
+                    p_key = _norm_dedupe_key(str(prev.get("text") or ""))
+                    if p_key and (
+                        key == p_key
+                        or (len(key) >= 4 and key in p_key)
+                        or (len(p_key) >= 4 and p_key in key and ed <= p_ed + 0.25)
+                    ):
+                        is_dup = True
+                        break
+            if is_dup:
+                continue
+        filtered.append(cue)
+    return filtered
 
 
 @router.post("/subtitles/stream")
@@ -1113,6 +1197,7 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
             prev.set()
         stop_ev = asyncio.Event()
         _active_ai_sessions[payload.session_id] = stop_ev
+        phase_name = str(payload.phase or "forward")
 
         hw = _detect_hardware_profile()
         has_gpu = bool(hw["gpu"]["hasGpu"])
@@ -1132,6 +1217,7 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
             rec_llm = hw["recommendedLlmModel"]
             yield _sse("status", {
                 "state": "installing",
+                "phase": phase_name,
                 "engine": "colab_gpu" if has_gpu else "colab_cpu",
                 "gpuName": hw["gpu"]["gpuName"],
                 "cpuCores": cpu_cores,
@@ -1158,6 +1244,7 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
 
         yield _sse("status", {
             "state": "loading_model",
+            "phase": phase_name,
             "engine": "colab_gpu" if has_gpu else "colab_cpu",
             "gpuName": hw["gpu"]["gpuName"],
             "cpuCores": cpu_cores,
@@ -1173,123 +1260,187 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
 
         is_cuda = actual_device == "cuda"
         yield _sse("status", {
-            "state": "starting",
+            "state": "backfilling" if phase_name == "backfill" else "starting",
+            "phase": phase_name,
             "engine": "colab_gpu" if is_cuda else "colab_cpu",
             "device": actual_device,
             "gpuName": hw["gpu"]["gpuName"] if is_cuda else "",
             "cpuCores": cpu_cores,
             "model": w_model_name,
             "startTime": payload.start_time,
+            "endTime": payload.end_time,
         })
 
         # FFmpeg pinned to 1 thread + PTS clock lock (`aresample=async=1000:first_pts=0`)
         # so VFR/livestream MP4 packet gaps never cause subtitle timestamp drift!
         ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
-        cmd: list[str] = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-threads", "1"]
-        if payload.headers:
-            hdr_lines = "".join(f"{k}: {v}\r\n" for k, v in payload.headers.items() if k and v)
-            if hdr_lines:
-                cmd.extend(["-headers", hdr_lines])
-        if payload.start_time > 0.5:
-            cmd.extend(["-accurate_seek", "-ss", f"{payload.start_time:.3f}"])
-        cmd.extend([
-            "-i",
-            payload.media_url,
-            "-vn",
-            "-af",
-            "aresample=async=1000:first_pts=0",
-            "-threads",
-            "1",
-            "-ac",
-            "1",
-            "-ar",
-            str(SAMPLE_RATE),
-            "-f",
-            "s16le",
-            "-",
-        ])
+        start_t = max(0.0, float(payload.start_time or 0.0))
+        req_end_t = max(0.0, float(payload.end_time or 0.0))
+        has_end_limit = req_end_t > start_t + 0.2
+        total_req_dur = (req_end_t - start_t) if has_end_limit else 0.0
+        use_fast_clip = bool(payload.fast_start and phase_name != "backfill" and (not has_end_limit or total_req_dur > 20.0))
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        # 16s steady chunks fill Whisper's 30s Mel Encoder efficiently (2x faster RTF) while splitting on silence!
+        # 15-16s steady chunks fill Whisper's 30s Mel Encoder efficiently while fast near-user clip uses 3.5s -> 5.0s -> 7.5s
         default_chunk_sec = 16 if is_cuda else 15
         chunk_sec = max(6, min(25, int(payload.chunk_seconds or default_chunk_sec)))
-        first_sec = 6
         lang_arg = None if not payload.language or payload.language.lower() == "auto" else payload.language.lower()[:2]
 
+        active_procs: list[Any] = []
         # Read-ahead audio prefetch queue so CDN download & FFmpeg decode overlap 100% with CPU Whisper inference!
-        pcm_queue: asyncio.Queue[tuple[int, float, float, bytes] | None] = asyncio.Queue(maxsize=3)
+        pcm_queue: asyncio.Queue[tuple[int, float, float, bytes, bool] | None] = asyncio.Queue(maxsize=3)
+
+        async def _spawn_ffmpeg_window(win_start: float, win_dur: float, fast_probe: bool) -> Any:
+            cmd: list[str] = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-threads", "1"]
+            if fast_probe:
+                cmd.extend(["-probesize", "512k", "-analyzeduration", "1000000"])
+            if payload.headers:
+                hdr_lines = "".join(f"{k}: {v}\r\n" for k, v in payload.headers.items() if k and v)
+                if hdr_lines:
+                    cmd.extend(["-headers", hdr_lines])
+            if payload.media_url.startswith(("http://", "https://")):
+                cmd.extend(["-seekable", "1"])
+            if win_start > 0.25:
+                cmd.extend(["-accurate_seek", "-ss", f"{win_start:.3f}"])
+            cmd.extend(["-i", payload.media_url])
+            if win_dur > 0.0:
+                cmd.extend(["-t", f"{win_dur:.3f}"])
+            cmd.extend([
+                "-vn",
+                "-af",
+                "aresample=async=1000:first_pts=0",
+                "-threads",
+                "1",
+                "-ac",
+                "1",
+                "-ar",
+                str(SAMPLE_RATE),
+                "-f",
+                "s16le",
+                "-",
+            ])
+            p = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            active_procs.append(p)
+            return p
+
+        async def _kill_proc(p: Any) -> None:
+            if p and p.returncode is None:
+                try:
+                    p.kill()
+                    await p.wait()
+                except Exception:
+                    pass
 
         async def _pcm_producer() -> None:
             c_no = 0
-            cur = float(payload.start_time)
-            carry = bytearray()
+            cur = start_t
             try:
-                assert proc.stdout is not None
-                while not stop_ev.is_set():
-                    want_bytes = (first_sec if c_no == 0 else chunk_sec) * BYTES_PER_SECOND
-                    buf = bytearray(carry)
-                    carry.clear()
-                    while len(buf) < want_bytes and not stop_ev.is_set():
-                        try:
-                            part = await asyncio.wait_for(
-                                proc.stdout.read(min(65536, want_bytes - len(buf))),
-                                timeout=25.0,
-                            )
-                        except asyncio.TimeoutError:
-                            break
-                        if not part:
-                            break
-                        buf.extend(part)
-                    if stop_ev.is_set() or len(buf) < BYTES_PER_SAMPLE * 1600:
+                windows: list[tuple[bool, float]] = []
+                if use_fast_clip:
+                    windows.append((True, 16.0))
+                    windows.append((False, 0.0))
+                else:
+                    windows.append((False, total_req_dur))
+
+                for win_idx, (is_fast_win, planned_dur) in enumerate(windows):
+                    if stop_ev.is_set():
                         break
-                    if len(buf) >= int(want_bytes * 0.85):
-                        split_at = _find_silence_split_byte_offset(buf)
-                        chunk_bytes = bytes(buf[:split_at])
-                        carry.extend(buf[split_at:])
-                    else:
-                        even_len = (len(buf) // 2) * 2
-                        chunk_bytes = bytes(buf[:even_len])
-                    dur = len(chunk_bytes) / float(BYTES_PER_SECOND)
-                    c_start = cur
-                    cur += dur
-                    c_no += 1
-                    await pcm_queue.put((c_no, c_start, dur, chunk_bytes))
+                    if win_idx > 0 and has_end_limit and cur >= req_end_t - 0.2:
+                        break
+                    eff_dur = planned_dur
+                    if not is_fast_win and has_end_limit:
+                        eff_dur = max(0.25, req_end_t - cur)
+
+                    proc = await _spawn_ffmpeg_window(cur, eff_dur, fast_probe=is_fast_win)
+                    win_extracted_sec = 0.0
+                    carry = bytearray()
+                    win_chunk_idx = 0
+                    try:
+                        assert proc.stdout is not None
+                        while not stop_ev.is_set():
+                            if is_fast_win:
+                                target_s = 3.5 if win_chunk_idx == 0 else (5.0 if win_chunk_idx == 1 else 7.5)
+                                min_keep = 2.2 if win_chunk_idx == 0 else 3.2
+                            else:
+                                target_s = 6.0 if (c_no == 0 and phase_name != "backfill") else float(chunk_sec)
+                                min_keep = 4.5
+                            want_bytes = int(target_s * BYTES_PER_SECOND) // 2 * 2
+                            buf = bytearray(carry)
+                            carry.clear()
+                            while len(buf) < want_bytes and not stop_ev.is_set():
+                                try:
+                                    part = await asyncio.wait_for(
+                                        proc.stdout.read(min(65536, want_bytes - len(buf))),
+                                        timeout=25.0,
+                                    )
+                                except asyncio.TimeoutError:
+                                    break
+                                if not part:
+                                    break
+                                buf.extend(part)
+                            if stop_ev.is_set() or len(buf) < BYTES_PER_SAMPLE * 1600:
+                                break
+                            overlap_b = 0
+                            if len(buf) >= int(want_bytes * 0.85):
+                                split_at, overlap_b = _find_silence_split_with_overlap(buf, min_keep_sec=min_keep)
+                                chunk_bytes = bytes(buf[:split_at])
+                                carry.extend(buf[max(0, split_at - overlap_b) :])
+                            else:
+                                even_len = (len(buf) // 2) * 2
+                                chunk_bytes = bytes(buf[:even_len])
+                            dur = len(chunk_bytes) / float(BYTES_PER_SECOND)
+                            advance_sec = (len(chunk_bytes) - overlap_b) / float(BYTES_PER_SECOND)
+                            c_start = cur
+                            cur += max(0.1, advance_sec)
+                            win_extracted_sec += max(0.1, advance_sec)
+                            c_no += 1
+                            win_chunk_idx += 1
+                            await pcm_queue.put((c_no, c_start, dur, chunk_bytes, is_fast_win))
+                    finally:
+                        await _kill_proc(proc)
+
+                    # If fast 16s window hit genuine EOF (extracted > 0.3s but < 14.2s), no remainder stream is needed!
+                    if is_fast_win and 0.3 < win_extracted_sec < 14.2:
+                        break
             finally:
                 await pcm_queue.put(None)
 
         producer_task = asyncio.create_task(_pcm_producer())
         slow_cpu_streak = 0
         warned_recommend_gpu = False
-        last_end_time = float(payload.start_time)
+        last_end_time = start_t
         total_chunks = 0
         locked_lang: str | None = lang_arg
         lang_char_scores: dict[str, int] = {"zh": 0, "ja": 0, "ko": 0, "en": 0}
+        prev_tail_cues: list[dict[str, Any]] = []
 
         try:
             while not stop_ev.is_set():
                 item = await pcm_queue.get()
                 if item is None:
                     break
-                chunk_no, c_start, dur, raw_pcm = item
+                chunk_no, c_start, dur, raw_pcm, is_near_chunk = item
                 total_chunks = chunk_no
-                last_end_time = c_start + dur
+                last_end_time = max(last_end_time, c_start + dur)
+                if has_end_limit:
+                    last_end_time = min(last_end_time, req_end_t)
 
                 yield _sse("progress", {
                     "chunkNo": chunk_no,
                     "chunkStart": round(c_start, 2),
-                    "chunkEnd": round(last_end_time, 2),
+                    "chunkEnd": round(min(c_start + dur, req_end_t) if has_end_limit else (c_start + dur), 2),
+                    "phase": phase_name,
                     "device": actual_device,
                     "model": w_model_name,
                 })
 
                 # Fast RMS digital-silence skip (<0.2ms, 0% CPU)
                 if not _has_speech_energy(raw_pcm):
+                    prev_tail_cues = []
                     continue
 
                 t0 = time.perf_counter()
@@ -1305,59 +1456,71 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                     audio_input = _pcm_s16le_to_float32(pcm_data)
                     # Guide Whisper to output consistent Simplified Chinese when language is 'zh'
                     init_prompt = "以下是普通话的句子。" if cur_lang == "zh" else None
+                    # Multi-speaker / crosstalk resilient VAD & Whisper decoding thresholds:
+                    # - temperature=(0.0, 0.2) runs 100% greedy/beam at 0.0 on clean audio, and retries at 0.2
+                    #   ONLY when overlapping voices lower avg_logprob or raise compression_ratio (instead of dropping!).
+                    vad_params = {
+                        "threshold": 0.35,
+                        "min_speech_duration_ms": 120,
+                        "min_silence_duration_ms": 180,
+                        "speech_pad_ms": 220,
+                    }
                     if use_cuda:
                         segs, info = cur_model.transcribe(
                             audio_input,
                             language=cur_lang,
                             initial_prompt=init_prompt,
                             beam_size=5,
+                            temperature=(0.0, 0.2, 0.4),
                             word_timestamps=True,
-                            max_initial_timestamp=1.0,
-                            repetition_penalty=1.25,
-                            no_repeat_ngram_size=3,
-                            compression_ratio_threshold=2.0,
-                            log_prob_threshold=-0.9,
-                            no_speech_threshold=0.6,
+                            max_initial_timestamp=2.5,
+                            repetition_penalty=1.05,
+                            compression_ratio_threshold=2.4,
+                            log_prob_threshold=-1.15,
+                            no_speech_threshold=0.75,
                             condition_on_previous_text=False,
                             vad_filter=True,
-                            vad_parameters={"threshold": 0.5, "min_silence_duration_ms": 250, "speech_pad_ms": 80},
+                            vad_parameters=vad_params,
                         )
                     else:
-                        # CPU Path: beam_size=2 + word_timestamps=True for exact word onset/offset alignment!
+                        # CPU Path: beam_size=2 + word_timestamps=True + fallback temperature=(0.0, 0.2)
                         segs, info = cur_model.transcribe(
                             audio_input,
                             language=cur_lang,
                             initial_prompt=init_prompt,
                             beam_size=2,
                             best_of=2,
-                            temperature=0.0,
+                            temperature=(0.0, 0.2),
                             word_timestamps=True,
-                            max_initial_timestamp=1.0,
-                            repetition_penalty=1.25,
-                            no_repeat_ngram_size=3,
-                            compression_ratio_threshold=2.0,
-                            log_prob_threshold=-0.9,
-                            no_speech_threshold=0.6,
+                            max_initial_timestamp=2.5,
+                            repetition_penalty=1.05,
+                            compression_ratio_threshold=2.4,
+                            log_prob_threshold=-1.15,
+                            no_speech_threshold=0.75,
                             condition_on_previous_text=False,
                             without_timestamps=False,
                             vad_filter=True,
-                            vad_parameters={"threshold": 0.5, "min_silence_duration_ms": 250, "speech_pad_ms": 80},
+                            vad_parameters=vad_params,
                         )
                     out_cues = []
                     for s in segs:
                         words = getattr(s, "words", None) or []
                         if words:
-                            # Group words into tight subtitle cues, splitting on pauses >= 0.48s or sentence punctuation
+                            # Group words into tight subtitle cues, splitting on pauses >= 0.38s, speaker turns, or punctuation
                             cur_words: list[Any] = []
                             for w in words:
+                                w_raw = str(w.word or "")
                                 if cur_words:
                                     gap = float(w.start) - float(cur_words[-1].end)
                                     prev_txt = "".join(str(x.word or "") for x in cur_words).strip()
-                                    if gap >= 0.48 or (
-                                        len(prev_txt) >= 10
-                                        and re.search(r"[。！？!?，,.\s]$", prev_txt)
-                                        and gap >= 0.18
-                                    ):
+                                    speaker_turn = w_raw.lstrip().startswith(("-", "—", "–"))
+                                    punct_break = (
+                                        len(prev_txt) >= 8
+                                        and bool(re.search(r"[。！？!?，,.\-—\s]$", prev_txt))
+                                        and gap >= 0.14
+                                    )
+                                    long_turn = (len(cur_words) >= 14 or len(prev_txt) >= 48) and gap >= 0.10
+                                    if gap >= 0.38 or speaker_turn or punct_break or long_turn:
                                         c_txt = _sanitize_whisper_cue_text(prev_txt, is_translation=False)
                                         if c_txt:
                                             c_txt = _normalize_cjk_asr_text(c_txt, cur_lang or "auto")
@@ -1366,7 +1529,12 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                                                 cs + max(float(cur_words[-1].end), float(cur_words[0].start) + 0.4),
                                                 3,
                                             )
-                                            out_cues.append({"startTime": st, "endTime": ed, "text": c_txt})
+                                            out_cues.append({
+                                                "startTime": st,
+                                                "endTime": ed,
+                                                "text": c_txt,
+                                                "_wordAligned": True,
+                                            })
                                         cur_words = []
                                 cur_words.append(w)
                             if cur_words:
@@ -1381,7 +1549,12 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                                         cs + max(float(cur_words[-1].end), float(cur_words[0].start) + 0.4),
                                         3,
                                     )
-                                    out_cues.append({"startTime": st, "endTime": ed, "text": last_txt})
+                                    out_cues.append({
+                                        "startTime": st,
+                                        "endTime": ed,
+                                        "text": last_txt,
+                                        "_wordAligned": True,
+                                    })
                         else:
                             txt = _sanitize_whisper_cue_text(s.text or "", is_translation=False)
                             if not txt:
@@ -1398,6 +1571,13 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
 
                 if stop_ev.is_set():
                     break
+
+                if cues:
+                    cues = _dedupe_boundary_cues(cues, prev_tail_cues, c_start)
+                    if has_end_limit:
+                        cues = [c for c in cues if float(c.get("startTime") or 0.0) < req_end_t + 0.08]
+                    if cues:
+                        prev_tail_cues = cues[-3:]
 
                 # Cumulative Script-Aware Language Lock:
                 # Prevents Whisper from mixing Chinese ('zh') and Japanese ('ja') across short chunks!
@@ -1431,24 +1611,45 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                     elif lang_char_scores["ko"] >= 12:
                         locked_lang = "ko"
 
-                if cues and payload.translate_to and payload.translate_to.lower() != "none":
-                    try:
-                        trans_list = await _translate_smart(
-                            [c["text"] for c in cues],
-                            src_lang=det_lang,
-                            target_lang=payload.translate_to,
-                            has_gpu=is_cuda,
-                            cpu_cores=cpu_cores,
-                            translate_mode=payload.translate_mode,
-                            llm_model=payload.llm_model,
-                            session_id=payload.session_id,
-                        )
-                        for c, tr in zip(cues, trans_list):
-                            c["translatedText"] = tr
-                    except Exception:
-                        pass
+                asr_sec = time.perf_counter() - t0
+                # For near-user fast chunks, emit cues in micro-batches (<= 2 cues) so the line at user's timestamp shows up immediately!
+                batch_step = 2 if (is_near_chunk and chunk_no <= 2 and len(cues) > 2) else max(1, len(cues))
+                emitted_any = False
+                for b_idx in range(0, len(cues), batch_step):
+                    if stop_ev.is_set():
+                        break
+                    sub_cues = cues[b_idx : b_idx + batch_step]
+                    if want_translation and sub_cues:
+                        try:
+                            trans_list = await _translate_smart(
+                                [c["text"] for c in sub_cues],
+                                src_lang=det_lang,
+                                target_lang=payload.translate_to,
+                                has_gpu=is_cuda,
+                                cpu_cores=cpu_cores,
+                                translate_mode=payload.translate_mode,
+                                llm_model=payload.llm_model,
+                                session_id=payload.session_id,
+                                near_user=is_near_chunk,
+                            )
+                            for c, tr in zip(sub_cues, trans_list):
+                                c["translatedText"] = tr
+                        except Exception:
+                            pass
+                    if sub_cues:
+                        rtf_val = round((time.perf_counter() - t0) / max(0.5, dur), 2)
+                        yield _sse("cues", {
+                            "chunkNo": chunk_no,
+                            "phase": phase_name,
+                            "language": det_lang,
+                            "device": actual_device,
+                            "model": w_model_name,
+                            "rtf": rtf_val,
+                            "cues": sub_cues,
+                        })
+                        emitted_any = True
 
-                total_sec = time.perf_counter() - t0
+                total_sec = time.perf_counter() - t0 if emitted_any else asr_sec
                 rtf = round(total_sec / max(0.5, dur), 2)
 
                 # Never downgrade Whisper 'small' to 'base' (since 'small' only uses ~500MB RAM and 'base' hurts CJK accuracy).
@@ -1468,20 +1669,11 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                 else:
                     slow_cpu_streak = 0
 
-                if cues:
-                    yield _sse("cues", {
-                        "chunkNo": chunk_no,
-                        "language": det_lang,
-                        "device": actual_device,
-                        "model": w_model_name,
-                        "rtf": rtf,
-                        "cues": cues,
-                    })
-
             if not stop_ev.is_set():
                 yield _sse("completed", {
                     "chunks": total_chunks,
                     "endTime": round(last_end_time, 2),
+                    "phase": phase_name,
                     "device": actual_device,
                     "model": w_model_name,
                 })
@@ -1491,12 +1683,8 @@ async def colab_ai_subtitles_stream(payload: ColabAISubtitleStreamRequest) -> St
                 producer_task.cancel()
             if _active_ai_sessions.get(payload.session_id) is stop_ev:
                 _active_ai_sessions.pop(payload.session_id, None)
-            if proc.returncode is None:
-                try:
-                    proc.kill()
-                    await proc.wait()
-                except Exception:
-                    pass
+            for p in active_procs:
+                await _kill_proc(p)
 
     return StreamingResponse(
         _gen(),
