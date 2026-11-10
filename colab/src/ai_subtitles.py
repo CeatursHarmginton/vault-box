@@ -547,12 +547,26 @@ async def colab_ai_setup(payload: ColabAISetupRequest) -> dict[str, Any]:
         ollama_ok, models = await _probe_ollama()
         if not ollama_ok:
             if not shutil.which("ollama") and os.name != "nt":
+                if not shutil.which("zstd"):
+                    prep_proc = await asyncio.create_subprocess_shell(
+                        "apt-get update -qq && apt-get install -y -qq zstd pciutils",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await prep_proc.communicate()
                 install_proc = await asyncio.create_subprocess_shell(
                     "curl -fsSL https://ollama.com/install.sh | sh",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
                 await install_proc.communicate()
+                if not shutil.which("ollama"):
+                    fb_proc = await asyncio.create_subprocess_shell(
+                        "curl -fsSL https://ollama.com/download/ollama-linux-amd64.tar.zst | zstd -d | tar -xf - -C /usr/local",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await fb_proc.communicate()
                 logs.append("Installed Ollama binary")
             if shutil.which("ollama"):
                 env = os.environ.copy()
@@ -564,7 +578,7 @@ async def colab_ai_setup(payload: ColabAISetupRequest) -> dict[str, Any]:
                     env=env,
                     start_new_session=True,
                 )
-                await asyncio.sleep(2.5)
+                await asyncio.sleep(3.0)
                 logs.append("Started ollama serve")
         ollama_ok, models = await _probe_ollama()
         if ollama_ok and target_ollama_model and target_ollama_model not in models:
