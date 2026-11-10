@@ -137,6 +137,9 @@ async def _relay_loop(manager: JobManager) -> None:
                     elif typ == "cancel":
                         manager.cancel(job_id)
                     elif typ == "update_options":
+                        if msg.get("ai_request"):
+                            asyncio.create_task(_handle_ws_ai_request(ws, msg))
+                            continue
                         job = manager.get(job_id)
                         if job:
                             raw_opts = msg.get("options") if isinstance(msg.get("options"), dict) else (msg.get("payload") or {})
