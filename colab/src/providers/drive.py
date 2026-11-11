@@ -282,43 +282,60 @@ class DriveProvider(BaseProvider):
                             cookies[k] = v.strip()
 
     async def _refresh_web_session(self, credentials: dict[str, Any]) -> bool:
-        """Refresh browser-session cookies inside the Colab job only."""
-        try:
-            # Use isolated client so cookies from account A don't bleed into account B
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                for url, auth in (
-                    (f"{DRIVE_WEB_ORIGIN}/drive/my-drive", True),
-                    (f"{DRIVE_USERCONTENT}/auth_warmup", False),
-                ):
-                    try:
-                        resp = await self._send_request(
-                            client,
-                            "GET",
-                            url,
-                            headers=self._web_headers(credentials, auth=auth),
-                            follow_redirects=True,
-                            timeout=15.0,
-                        )
-                        self._update_cookies_from_response(credentials, resp)
-                    except Exception:
-                        pass
+        """Refresh browser-session cookies inside the Colab job only (single-flight per credentials)."""
+        refresh_state = owner_store(f"{self.name}:web_refresh", credentials)
+        inflight = refresh_state.get("task")
+        if isinstance(inflight, asyncio.Task) and not inflight.done():
+            try:
+                return await asyncio.shield(inflight)
+            except Exception:
+                return False
 
-                key = self._web_key(credentials)
-                resp = await self._send_request(
-                    client,
-                    "GET",
-                    f"{DRIVE_WEB_FILES_API}/about",
-                    headers=self._web_headers(credentials),
-                    params={"key": key, "$unique": "gc"} if key else {},
-                    timeout=15.0,
-                )
-                self._update_cookies_from_response(credentials, resp)
-                resp_url = str(getattr(resp, "url", "") or "")
-                if "accounts.google.com" in resp_url or "ServiceLogin" in resp_url:
-                    return False
-                return resp.status_code < 400
-        except Exception:
-            return False
+        async def _do_refresh() -> bool:
+            try:
+                # Use isolated client so cookies from account A don't bleed into account B
+                async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                    for url, auth in (
+                        (f"{DRIVE_WEB_ORIGIN}/drive/my-drive", True),
+                        (f"{DRIVE_USERCONTENT}/auth_warmup", False),
+                    ):
+                        try:
+                            resp = await self._send_request(
+                                client,
+                                "GET",
+                                url,
+                                headers=self._web_headers(credentials, auth=auth),
+                                follow_redirects=True,
+                                timeout=15.0,
+                            )
+                            self._update_cookies_from_response(credentials, resp)
+                        except Exception:
+                            pass
+
+                    key = self._web_key(credentials)
+                    resp = await self._send_request(
+                        client,
+                        "GET",
+                        f"{DRIVE_WEB_FILES_API}/about",
+                        headers=self._web_headers(credentials),
+                        params={"key": key, "$unique": "gc"} if key else {},
+                        timeout=15.0,
+                    )
+                    self._update_cookies_from_response(credentials, resp)
+                    resp_url = str(getattr(resp, "url", "") or "")
+                    if "accounts.google.com" in resp_url or "ServiceLogin" in resp_url:
+                        return False
+                    return resp.status_code < 400
+            except Exception:
+                return False
+
+        task = asyncio.create_task(_do_refresh())
+        refresh_state["task"] = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if refresh_state.get("task") is task:
+                refresh_state.pop("task", None)
 
     async def _web_request(self, credentials: dict[str, Any], method: str, url: str, **kwargs: Any) -> httpx.Response:
         client = self._client()
@@ -909,9 +926,20 @@ class DriveProvider(BaseProvider):
         with local_path.open("rb") as fh:
             while offset < size:
                 progress.check_cancelled()
+                data_offset = offset
                 data = await asyncio.to_thread(_read_at, fh, offset, min(CHUNK, size - offset))
+                if not data:
+                    break
                 end = offset + len(data) - 1
                 for attempt in range(5):
+                    if offset >= size:
+                        return {"id": "", "name": name}
+                    if offset != data_offset:
+                        data_offset = offset
+                        data = await asyncio.to_thread(_read_at, fh, offset, min(CHUNK, size - offset))
+                        if not data:
+                            break
+                        end = offset + len(data) - 1
                     try:
                         chunk_headers = self._web_headers(credentials, {
                             "content-length": str(len(data)),
@@ -940,21 +968,41 @@ class DriveProvider(BaseProvider):
                             if attempt < 4:
                                 await self._refresh_web_session(credentials)
                                 await asyncio.sleep(min(2 ** attempt, 4))
-                                offset = await self._query_resumable_offset(client, credentials, session, size)
+                                new_offset = await self._query_resumable_offset(client, credentials, session, size)
+                                if new_offset >= size:
+                                    progress.add_bytes(max(0, size - offset), size, "upload", str(local_path))
+                                    return {"id": "", "name": name}
+                                if new_offset > offset:
+                                    progress.add_bytes(new_offset - offset, size, "upload", str(local_path))
+                                offset = new_offset
                                 if offset == 0:
                                     session = await new_session()
                                 continue
                             raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked")
-                        if resp.status_code >= 500 or resp.status_code in (400, 408, 429):
+                        if resp.status_code >= 500 or resp.status_code in (400, 404, 408, 410, 429):
                             if attempt < 4:
                                 await asyncio.sleep(min(2 ** attempt, 8))
-                                offset = await self._query_resumable_offset(client, credentials, session, size)
+                                new_offset = await self._query_resumable_offset(client, credentials, session, size)
+                                if new_offset >= size:
+                                    progress.add_bytes(max(0, size - offset), size, "upload", str(local_path))
+                                    return {"id": "", "name": name}
+                                if new_offset > offset:
+                                    progress.add_bytes(new_offset - offset, size, "upload", str(local_path))
+                                offset = new_offset
+                                if offset == 0 and resp.status_code in (400, 404, 410):
+                                    session = await new_session()
                                 continue
                         raise ProviderFailure("UPLOAD_FAILED", resp.text[:500], {"status": resp.status_code})
                     except (httpx.HTTPError, OSError) as net_err:
                         if attempt < 4:
                             await asyncio.sleep(min(2 ** attempt, 8))
-                            offset = await self._query_resumable_offset(client, credentials, session, size)
+                            new_offset = await self._query_resumable_offset(client, credentials, session, size)
+                            if new_offset >= size:
+                                progress.add_bytes(max(0, size - offset), size, "upload", str(local_path))
+                                return {"id": "", "name": name}
+                            if new_offset > offset:
+                                progress.add_bytes(new_offset - offset, size, "upload", str(local_path))
+                            offset = new_offset
                             continue
                         raise ProviderFailure("UPLOAD_FAILED", f"Network error during upload: {net_err}")
         raise ProviderFailure("UPLOAD_FAILED", "Drive web resumable upload ended early")

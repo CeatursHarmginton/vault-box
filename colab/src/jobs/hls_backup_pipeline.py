@@ -474,6 +474,158 @@ async def _find_and_load_best_manifest(
     return best_data
 
 
+class _HlsItemTelemetry:
+    """Tracks live per-stream progress in job.active_files, job.file_sizes, and job.item_timings."""
+
+    def __init__(self, job: Any, source: dict[str, Any], file_item: dict[str, Any], raw_name: str) -> None:
+        self.job = job
+        relay = file_item.get("relay") if isinstance(file_item.get("relay"), dict) else {}
+        meta = file_item.get("meta") if isinstance(file_item.get("meta"), dict) else {}
+        orig_prov = str(file_item.get("provider") or meta.get("provider") or source.get("provider") or "").lower()
+        orig_acc = str(
+            file_item.get("accountId")
+            or file_item.get("account_id")
+            or meta.get("accountId")
+            or meta.get("account_id")
+            or source.get("accountId")
+            or source.get("account_id")
+            or ""
+        )
+        self.orig_uid = str(
+            relay.get("sourcePath")
+            or relay.get("sourceId")
+            or file_item.get("id")
+            or file_item.get("path")
+            or file_item.get("url")
+            or file_item.get("name")
+            or raw_name
+        )
+        self.track_key = f"{orig_prov}:{orig_acc}:{self.orig_uid}"
+        self.raw_name = raw_name
+        self.started_at = time.time()
+        self._last_tick_at = self.started_at
+        self._last_tick_bytes = 0
+        self.entry: dict[str, Any] = {
+            "name": raw_name,
+            "phase": "download",
+            "stage": "Initializing HLS pipeline",
+            "is_hls": True,
+            "started_at": self.started_at,
+            "segments_done": 0,
+            "segments_total": 0,
+            "segments_skipped": 0,
+            "parts_uploaded": 0,
+            "parts_total": 0,
+            "current_part": "",
+            "bytes_done": 0,
+            "size": 0,
+            "speed": 0.0,
+        }
+        active_files = getattr(job, "active_files", None)
+        if isinstance(active_files, dict):
+            active_files[self.track_key] = self.entry
+            if self.orig_uid and self.orig_uid != self.track_key:
+                active_files[self.orig_uid] = self.entry
+
+    def update(
+        self,
+        *,
+        output_name: str | None = None,
+        phase: str | None = None,
+        stage: str | None = None,
+        segments_done: int | None = None,
+        segments_total: int | None = None,
+        segments_skipped: int | None = None,
+        parts_uploaded: int | None = None,
+        parts_total: int | None = None,
+        current_part: str | None = None,
+        bytes_done: int | None = None,
+        size: int | None = None,
+    ) -> None:
+        now = time.time()
+        if output_name:
+            self.entry["name"] = output_name
+        if phase:
+            self.entry["phase"] = phase
+        if stage is not None:
+            self.entry["stage"] = stage
+        if segments_done is not None:
+            self.entry["segments_done"] = max(0, int(segments_done))
+        if segments_total is not None:
+            self.entry["segments_total"] = max(0, int(segments_total))
+        if segments_skipped is not None:
+            self.entry["segments_skipped"] = max(0, int(segments_skipped))
+        if parts_uploaded is not None:
+            self.entry["parts_uploaded"] = max(0, int(parts_uploaded))
+        if parts_total is not None:
+            self.entry["parts_total"] = max(0, int(parts_total))
+        if current_part is not None:
+            self.entry["current_part"] = current_part
+        if bytes_done is not None:
+            b_done = max(0, int(bytes_done))
+            if self._last_tick_bytes == 0 and b_done > 0 and (now - self.started_at) < 2.0:
+                # Baseline from pre-existing resumed parts without spiking artificial speed
+                self._last_tick_bytes = b_done
+                self._last_tick_at = now
+            else:
+                dt = now - self._last_tick_at
+                if dt >= 0.8 and b_done >= self._last_tick_bytes:
+                    inst_spd = (b_done - self._last_tick_bytes) / dt
+                    prev_spd = float(self.entry.get("speed") or 0.0)
+                    self.entry["speed"] = round(inst_spd if prev_spd <= 0 else (prev_spd * 0.4 + inst_spd * 0.6), 1)
+                    self._last_tick_at = now
+                    self._last_tick_bytes = b_done
+            self.entry["bytes_done"] = b_done
+        if size is not None and size > 0:
+            self.entry["size"] = int(size)
+        if hasattr(self.job, "updated_at"):
+            self.job.updated_at = now
+
+    def record_completion(
+        self,
+        *,
+        final_bytes: int,
+        segments_total: int,
+        segments_done: int,
+        segments_skipped: int,
+        parts_count: int,
+        output_name: str,
+        space_saved: bool = False,
+    ) -> None:
+        file_sizes = getattr(self.job, "file_sizes", None)
+        if isinstance(file_sizes, dict) and final_bytes > 0:
+            file_sizes[self.track_key] = int(final_bytes)
+            if self.orig_uid:
+                file_sizes[self.orig_uid] = int(final_bytes)
+            if output_name:
+                file_sizes[output_name] = int(final_bytes)
+        timings = getattr(self.job, "item_timings", None)
+        if isinstance(timings, dict):
+            extra = {
+                "segmentsTotal": int(segments_total),
+                "segmentsDone": int(segments_done),
+                "segmentsSkipped": int(segments_skipped),
+                "partsCount": int(parts_count),
+                "finalBytes": int(final_bytes),
+                "outputName": output_name,
+                "spaceSaved": bool(space_saved),
+            }
+            for tk in (self.track_key, self.orig_uid):
+                if not tk:
+                    continue
+                if isinstance(timings.get(tk), dict):
+                    timings[tk].update(extra)
+                elif tk == self.track_key:
+                    timings[tk] = {"startTime": self.started_at, "status": "active", "name": output_name or self.raw_name, **extra}
+
+    def cleanup(self) -> None:
+        active_files = getattr(self.job, "active_files", None)
+        if isinstance(active_files, dict):
+            active_files.pop(self.track_key, None)
+            if self.orig_uid:
+                active_files.pop(self.orig_uid, None)
+
+
 async def run_resumable_backup_pipeline(
     job: JobState,
     dirs: dict[str, Path],
@@ -492,6 +644,28 @@ async def run_resumable_backup_pipeline(
     - Supports multi-session resumption by skipping already uploaded parts
     - Assembles final MP4 using FFmpeg concat stream copy
     """
+    init_url = str(file_item.get("path") or file_item.get("id") or file_item.get("url") or "")
+    init_name = str(file_item.get("name") or unquote(Path(urlparse(init_url).path).name) or "stream_video.mp4")
+    telemetry = _HlsItemTelemetry(job, source, file_item, init_name)
+    try:
+        return await _run_resumable_backup_pipeline_core(
+            job, dirs, source, target, options, src_provider, dst_provider, file_item, telemetry
+        )
+    finally:
+        telemetry.cleanup()
+
+
+async def _run_resumable_backup_pipeline_core(
+    job: JobState,
+    dirs: dict[str, Path],
+    source: dict[str, Any],
+    target: dict[str, Any],
+    options: dict[str, Any],
+    src_provider: Any,
+    dst_provider: Any,
+    file_item: dict[str, Any],
+    telemetry: _HlsItemTelemetry,
+) -> Path:
     job.log("[Backup-Resume] Khởi động chiến lược truyền tải: Sao lưu phân đoạn để Resume")
     source_url = str(file_item.get("path") or file_item.get("id") or file_item.get("url") or "")
     raw_name = str(file_item.get("name") or unquote(Path(urlparse(source_url).path).name) or "stream_video.mp4")
@@ -514,10 +688,40 @@ async def run_resumable_backup_pipeline(
         except Exception as j_err:
             job.log(f"[Backup-Resume] Lưu ý khi đọc file sniffer JSON: {j_err}")
 
-    target_folder = str((target.get("folder") or {}).get("id") or (target.get("folder") or {}).get("path") or "/")
-    if target_folder.startswith("id:"):
-        target_folder = target_folder[3:].strip()
-    target_creds = target.get("credentials") or {}
+    initial_dst_prov_name = str(target.get("provider") or "").lower()
+
+    def _live_target_creds() -> dict[str, Any]:
+        creds = target.get("credentials")
+        return creds if isinstance(creds, dict) else {}
+
+    def _live_target_folder() -> str:
+        raw_f = str((target.get("folder") or {}).get("id") or (target.get("folder") or {}).get("path") or "/")
+        if raw_f.startswith("id:"):
+            raw_f = raw_f[3:].strip()
+        return raw_f or "/"
+
+    def _live_dst_provider() -> Any:
+        prov_key = str(target.get("provider") or "").lower()
+        if prov_key and prov_key != initial_dst_prov_name:
+            return PROVIDERS.get(prov_key, dst_provider)
+        if dst_provider is not None:
+            return dst_provider
+        return PROVIDERS.get(prov_key, dst_provider)
+
+    def _live_account_key() -> tuple[str, str, str]:
+        creds = _live_target_creds()
+        acc = str(
+            target.get("accountId")
+            or target.get("account_id")
+            or creds.get("account_id")
+            or creds.get("accountId")
+            or creds.get("account")
+            or ""
+        )
+        return (str(target.get("provider") or "").lower(), acc, _live_target_folder())
+
+    target_folder = _live_target_folder()
+    target_creds = _live_target_creds()
 
     chunk_segments = int(options.get("backup_chunk_segments") or DEFAULT_CHUNK_SEGMENTS)
     chunk_mb = int(options.get("backup_chunk_mb") or DEFAULT_CHUNK_MB)
@@ -547,6 +751,7 @@ async def run_resumable_backup_pipeline(
 
     folder_manifest_data: dict[str, Any] | None = None
     backup_folder_id: str | None = None
+    backup_folder_scope: tuple[str, str, str] = _live_account_key()
     completed_parts: list[dict[str, Any]] = []
     last_synced_seg = -1
     existing_remote_part_names: set[str] = set()
@@ -633,10 +838,14 @@ async def run_resumable_backup_pipeline(
         parts_local_dir.mkdir(parents=True, exist_ok=True)
         segs_local_dir.mkdir(parents=True, exist_ok=True)
 
+    telemetry.update(output_name=final_video_name, phase="download", stage="Preparing backup workspace")
+
     is_auto_skip = bool(options.get("auto_skip") or options.get("autoSkip"))
-    if is_auto_skip and hasattr(dst_provider, "list_files"):
+    if is_auto_skip and hasattr(_live_dst_provider(), "list_files"):
         try:
-            remote_target_listing = await dst_provider.list_files(target_creds, target_folder)
+            from .transfer_job import wait_for_retry_gate
+            await wait_for_retry_gate(job)
+            remote_target_listing = await _live_dst_provider().list_files(_live_target_creds(), _live_target_folder())
             remote_target_items = remote_target_listing.get("items") or remote_target_listing.get("files") or []
             target_cand_names = {
                 final_video_name.lower(),
@@ -907,6 +1116,7 @@ async def run_resumable_backup_pipeline(
             job.log(f"[Backup-Resume] Đang tự động làm mới link, cookie và IP qua LinksProvider từ trang web: {page_url[:80]}...")
             await _attempt_resolve_stream(page_url)
 
+        telemetry.update(phase="download", stage="Analyzing HLS playlist")
         job.log(f"[Backup-Resume] Đang phân tích luồng HLS: {resolved_url[:80]}...")
         media_url, all_segments, fetch_err = await _fetch_playlist_with_fallback()
 
@@ -930,12 +1140,18 @@ async def run_resumable_backup_pipeline(
 
         # 2. Check remote target backup folder for existing manifest or parts (Multi-session check)
         try:
-            remote_files = await dst_provider.list_files(target_creds, target_folder)
+            from .transfer_job import wait_for_retry_gate
+            await wait_for_retry_gate(job)
+            live_dst = _live_dst_provider()
+            live_creds = _live_target_creds()
+            live_folder = _live_target_folder()
+            remote_files = await live_dst.list_files(live_creds, live_folder)
             sub_items = remote_files.get("items") or []
             backup_item = next((it for it in sub_items if (it.get("name") == backup_folder_name and (it.get("type") == "folder" or it.get("is_folder")))), None)
             if backup_item:
                 backup_folder_id = backup_item.get("id") or backup_item.get("path")
-                parts_listing = await dst_provider.list_files(target_creds, backup_folder_id)
+                backup_folder_scope = _live_account_key()
+                parts_listing = await live_dst.list_files(live_creds, backup_folder_id)
                 sub_parts = parts_listing.get("items") or []
                 for it in sub_parts:
                     name = str(it.get("name") or "")
@@ -948,7 +1164,7 @@ async def run_resumable_backup_pipeline(
                 manifest_loaded = bool(folder_manifest_data)
                 if not manifest_loaded:
                     try:
-                        manifest_data = await _find_and_load_best_manifest(dst_provider, target_creds, sub_parts, job_work_dir, job)
+                        manifest_data = await _find_and_load_best_manifest(live_dst, live_creds, sub_parts, job_work_dir, job)
                         if manifest_data:
                             for cp in manifest_data.get("completed_parts") or []:
                                 p_name = cp.get("file_name") or ""
@@ -1026,17 +1242,41 @@ async def run_resumable_backup_pipeline(
     cur_batch_paths: list[Path] = []
     accumulated_bytes = 0
     total_downloaded_segs = 0
+    session_downloaded_bytes = 0
+    initial_synced_segs = sum(cp.get("segment_count", 0) for cp in completed_parts)
+    initial_synced_bytes = sum(cp.get("bytes", 0) for cp in completed_parts)
+    in_flight_part_names: list[str] = []
+    est_parts_total = max(len(completed_parts), (total_segments + max(1, chunk_segments) - 1) // max(1, chunk_segments)) if total_segments > 0 else 0
+    telemetry.update(
+        output_name=final_video_name,
+        phase="upload" if is_already_complete else "download",
+        stage="Ready for Final Assembly" if is_already_complete else "Downloading HLS segments",
+        segments_done=min(total_segments, initial_synced_segs + skipped_segments_count),
+        segments_total=total_segments,
+        segments_skipped=skipped_segments_count,
+        parts_uploaded=len(completed_parts),
+        parts_total=est_parts_total,
+        bytes_done=initial_synced_bytes,
+        size=estimated_total_bytes if estimated_total_bytes > 0 else initial_synced_bytes,
+    )
 
     async def _resolve_backup_folder_id() -> str | None:
-        nonlocal backup_folder_id
+        nonlocal backup_folder_id, backup_folder_scope
+        cur_scope = _live_account_key()
+        if backup_folder_scope != cur_scope:
+            backup_folder_id = None
+            backup_folder_scope = cur_scope
         if backup_folder_id:
             return backup_folder_id
         try:
-            remote_files = await dst_provider.list_files(target_creds, target_folder)
+            from .transfer_job import wait_for_retry_gate
+            await wait_for_retry_gate(job)
+            remote_files = await _live_dst_provider().list_files(_live_target_creds(), _live_target_folder())
             sub_items = remote_files.get("items") or []
             b_item = next((it for it in sub_items if (it.get("name") == backup_folder_name and (it.get("type") == "folder" or it.get("is_folder")))), None)
             if b_item:
                 backup_folder_id = b_item.get("id") or b_item.get("path")
+                backup_folder_scope = _live_account_key()
                 return backup_folder_id
         except Exception:
             pass
@@ -1048,9 +1288,11 @@ async def run_resumable_backup_pipeline(
         if not bf_id:
             return
         try:
+            live_dst = _live_dst_provider()
+            live_creds = _live_target_creds()
             cand_items = items_to_check
             if cand_items is None:
-                listing = await dst_provider.list_files(target_creds, bf_id)
+                listing = await live_dst.list_files(live_creds, bf_id)
                 cand_items = listing.get("items") or []
             for it in cand_items:
                 fname = str(it.get("name") or "")
@@ -1060,10 +1302,10 @@ async def run_resumable_backup_pipeline(
                 is_dup = (fname.startswith("_resume_manifest") and fname.endswith(".json") and fname != "_resume_manifest.json") or (keep_id and str(fid) != str(keep_id) and fname == "_resume_manifest.json") or (not keep_id and fname.startswith("_resume_manifest") and fname.endswith(".json"))
                 if is_dup:
                     try:
-                        if hasattr(dst_provider, "delete_item"):
-                            await dst_provider.delete_item(target_creds, it)
-                        elif hasattr(dst_provider, "delete_file"):
-                            await dst_provider.delete_file(target_creds, it)
+                        if hasattr(live_dst, "delete_item"):
+                            await live_dst.delete_item(live_creds, it)
+                        elif hasattr(live_dst, "delete_file"):
+                            await live_dst.delete_file(live_creds, it)
                     except Exception:
                         pass
         except Exception:
@@ -1110,61 +1352,81 @@ async def run_resumable_backup_pipeline(
             "raw_item": {k: v for k, v in file_item.items() if k not in ("credentials",)},
         }
         manifest_path = job_work_dir / "_resume_manifest.json"
-        job_work_dir.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        from .transfer_job import _invoke_wait_for_retry_account, wait_for_retry_gate
+        for manifest_try in range(2):
+            manifest_gen = await wait_for_retry_gate(job)
+            job_work_dir.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        bf_id = await _resolve_backup_folder_id()
-        existing_manifests = []
-        if bf_id:
-            try:
-                listing = await dst_provider.list_files(target_creds, bf_id)
-                for it in listing.get("items") or []:
-                    fname = str(it.get("name") or "")
-                    if fname == "_resume_manifest.json" or (fname.startswith("_resume_manifest") and fname.endswith(".json")):
-                        existing_manifests.append(it)
-            except Exception:
-                pass
+            live_dst = _live_dst_provider()
+            live_creds = _live_target_creds()
+            live_folder = _live_target_folder()
 
-        exact_manifest = next((it for it in existing_manifests if str(it.get("name") or "") == "_resume_manifest.json"), None)
-        target_manifest = exact_manifest or (existing_manifests[0] if existing_manifests else None)
-
-        # Force replace mode in options for providers that check options["replace"] (e.g. TeraBox rtype=3)
-        orig_replace = (job.payload.get("options") or {}).get("replace")
-        if "options" not in job.payload:
-            job.payload["options"] = {}
-        job.payload["options"]["replace"] = True
-
-        replaced = False
-        try:
-            if target_manifest and hasattr(dst_provider, "replace_file"):
+            bf_id = await _resolve_backup_folder_id()
+            existing_manifests = []
+            if bf_id:
                 try:
-                    await dst_provider.replace_file(target_creds, manifest_path, target_manifest, job)
-                    replaced = True
-                except Exception as rep_err:
-                    job.log(f"[Manifest] replace_file: {rep_err}, falling back to upload_file with replace=True")
+                    listing = await live_dst.list_files(live_creds, bf_id)
+                    for it in listing.get("items") or []:
+                        fname = str(it.get("name") or "")
+                        if fname == "_resume_manifest.json" or (fname.startswith("_resume_manifest") and fname.endswith(".json")):
+                            existing_manifests.append(it)
+                except Exception:
+                    pass
 
-            if not replaced:
-                manifest_ref = {
-                    "id": target_folder,
-                    "path": target_folder,
-                    "relative_path": f"{backup_folder_name}/_resume_manifest.json",
-                }
-                upload_res = await dst_provider.upload_file(target_creds, manifest_path, manifest_ref, job)
-                uploaded_fid = (upload_res.get("id") or upload_res.get("path")) if isinstance(upload_res, dict) else None
-                await _clean_duplicate_manifests(existing_manifests, keep_id=uploaded_fid)
-        except Exception as exc:
-            job.log(f"[Manifest] Cảnh báo: Không thể upload manifest: {exc}")
-        finally:
-            if orig_replace is None:
-                job.payload["options"].pop("replace", None)
-            else:
-                job.payload["options"]["replace"] = orig_replace
-            manifest_path.unlink(missing_ok=True)
+            exact_manifest = next((it for it in existing_manifests if str(it.get("name") or "") == "_resume_manifest.json"), None)
+            target_manifest = exact_manifest or (existing_manifests[0] if existing_manifests else None)
+
+            # Force replace mode in options for providers that check options["replace"] (e.g. TeraBox rtype=3)
+            orig_replace = (job.payload.get("options") or {}).get("replace")
+            if "options" not in job.payload:
+                job.payload["options"] = {}
+            job.payload["options"]["replace"] = True
+
+            replaced = False
+            should_retry_manifest = False
+            try:
+                if target_manifest and hasattr(live_dst, "replace_file"):
+                    try:
+                        await live_dst.replace_file(live_creds, manifest_path, target_manifest, job)
+                        replaced = True
+                    except Exception as rep_err:
+                        job.log(f"[Manifest] replace_file: {rep_err}, falling back to upload_file with replace=True")
+
+                if not replaced:
+                    manifest_ref = {
+                        "id": live_folder,
+                        "path": live_folder,
+                        "relative_path": f"{backup_folder_name}/_resume_manifest.json",
+                    }
+                    upload_res = await live_dst.upload_file(live_creds, manifest_path, manifest_ref, job)
+                    uploaded_fid = (upload_res.get("id") or upload_res.get("path")) if isinstance(upload_res, dict) else None
+                    await _clean_duplicate_manifests(existing_manifests, keep_id=uploaded_fid)
+            except ProviderFailure as pf_exc:
+                if manifest_try == 0 and pf_exc.code in ("INVALID_PROVIDER_CREDENTIALS", "PROVIDER_TOKEN_EXPIRED", "UPLOAD_FAILED"):
+                    try:
+                        await _invoke_wait_for_retry_account(job, target, pf_exc, attempt_gen=manifest_gen)
+                        should_retry_manifest = True
+                    except Exception as retry_err:
+                        job.log(f"[Manifest] Cảnh báo: Không thể upload manifest: {retry_err}")
+                else:
+                    job.log(f"[Manifest] Cảnh báo: Không thể upload manifest: {pf_exc}")
+            except Exception as exc:
+                job.log(f"[Manifest] Cảnh báo: Không thể upload manifest: {exc}")
+            finally:
+                if orig_replace is None:
+                    job.payload["options"].pop("replace", None)
+                else:
+                    job.payload["options"]["replace"] = orig_replace
+                manifest_path.unlink(missing_ok=True)
+
+            if not should_retry_manifest:
+                break
 
         try:
             bf_id = await _resolve_backup_folder_id()
             if bf_id:
-                fresh_listing = await dst_provider.list_files(target_creds, bf_id)
+                fresh_listing = await _live_dst_provider().list_files(_live_target_creds(), bf_id)
                 fresh_items = fresh_listing.get("items") or []
                 exact_m = next((it for it in fresh_items if str(it.get("name") or "") == "_resume_manifest.json"), None)
                 active_id = (exact_m.get("id") or exact_m.get("path")) if exact_m else None
@@ -1192,39 +1454,46 @@ async def run_resumable_backup_pipeline(
             return
 
         job.log(f"[Trace] Phân đoạn mới: {p_name} ({p_meta['segment_count']} segments, {size_mb:.1f} MB) -> Đang upload lên Cloud đích...")
+        in_flight_part_names.append(p_name)
+        telemetry.update(
+            current_part=p_name,
+            parts_uploaded=len(completed_parts),
+            parts_total=max(est_parts_total, len(completed_parts) + len(in_flight_part_names)),
+            stage=f"Downloading • Uploading {p_name}",
+        )
+
+        from .transfer_job import _invoke_wait_for_retry_account, wait_for_retry_gate
 
         max_upload_retries = 3
         last_upload_err: Exception | None = None
         upload_attempt = 0
+        auto_refreshed_once = False
         while upload_attempt < max_upload_retries:
             upload_attempt += 1
+            attempt_gen = await wait_for_retry_gate(job)
             try:
-                target_creds = target.get("credentials") or {}
-                cur_folder = str((target.get("folder") or {}).get("id") or (target.get("folder") or {}).get("path") or "/")
-                if cur_folder.startswith("id:"):
-                    cur_folder = cur_folder[3:].strip()
-                target_folder = cur_folder
-                if dst_provider is None:
-                    dst_provider = PROVIDERS.get(str(target.get("provider") or "").lower(), dst_provider)
+                target_creds = _live_target_creds()
+                target_folder = _live_target_folder()
+                active_dst = _live_dst_provider()
                 target_ref = {
                     "id": target_folder,
                     "path": target_folder,
                     "relative_path": f"{backup_folder_name}/{p_name}",
                 }
-                res = await dst_provider.upload_file(target_creds, part_file, target_ref, job)
-                job.error = None
+                res = await active_dst.upload_file(target_creds, part_file, target_ref, job)
+                if not getattr(job, "_waiting_for_account", False):
+                    job.error = None
                 break  # success
             except ProviderFailure as up_err:
                 last_upload_err = up_err
+                err_text = str(up_err).lower()
                 is_auth = (
                     up_err.code in ("INVALID_PROVIDER_CREDENTIALS", "PROVIDER_TOKEN_EXPIRED")
-                    or "session expired" in str(up_err).lower()
-                    or "revoked" in str(up_err).lower()
+                    or "session expired" in err_text
+                    or "revoked" in err_text
+                    or "relogin" in err_text
                 )
-                is_retryable = is_auth or (
-                    up_err.code == "UPLOAD_FAILED"
-                    and int((up_err.details or {}).get("status") or 0) in (0, 401, 403, 429, 500, 502, 503)
-                )
+                is_retryable = is_auth or up_err.code == "UPLOAD_FAILED"
 
                 if not is_retryable:
                     raise
@@ -1232,29 +1501,27 @@ async def run_resumable_backup_pipeline(
                 # When is_auth is True or retries are exhausted, prompt user for fresh account/credentials
                 if is_auth or upload_attempt >= max_upload_retries:
                     refreshed = False
-                    if not is_auth and hasattr(dst_provider, "_refresh_web_session"):
+                    active_dst = _live_dst_provider()
+                    if not is_auth and not auto_refreshed_once and hasattr(active_dst, "_refresh_web_session"):
+                        auto_refreshed_once = True
                         try:
-                            refreshed = await dst_provider._refresh_web_session(target_creds)
+                            refreshed = await active_dst._refresh_web_session(_live_target_creds())
                         except Exception:
                             refreshed = False
-                    if not refreshed:
-                        from .transfer_job import _wait_for_retry_account
-                        old_acc = str(target.get("accountId") or target.get("account_id") or (target.get("credentials") or {}).get("account_id") or "")
-                        old_prov = str(target.get("provider") or "").lower()
-                        await _wait_for_retry_account(job, target, up_err)
-                        target_creds = target.get("credentials") or {}
-                        new_acc = str(target.get("accountId") or target.get("account_id") or target_creds.get("account_id") or "")
-                        new_prov = str(target.get("provider") or "").lower()
-                        dst_provider = PROVIDERS.get(new_prov, dst_provider)
-                        cur_folder = str((target.get("folder") or {}).get("id") or (target.get("folder") or {}).get("path") or "/")
-                        if cur_folder.startswith("id:"):
-                            cur_folder = cur_folder[3:].strip()
-                        target_folder = cur_folder
-                        if new_acc != old_acc or (new_prov and new_prov != old_prov):
-                            backup_folder_id = None
-                        upload_attempt = 0
-                        job.log(f"[Upload-Retry] Đã nhận thông tin xác thực mới từ hệ thống. Tiếp tục upload {p_name}...")
+                    if refreshed:
+                        upload_attempt = max(0, max_upload_retries - 1)
+                        job.log(f"[Upload-Retry] Đã tự làm mới phiên web thành công. Thử lại upload {p_name}...")
                         continue
+                    old_scope = _live_account_key()
+                    await _invoke_wait_for_retry_account(job, target, up_err, attempt_gen=attempt_gen)
+                    target_creds = _live_target_creds()
+                    target_folder = _live_target_folder()
+                    if _live_account_key() != old_scope:
+                        backup_folder_id = None
+                    upload_attempt = 0
+                    auto_refreshed_once = False
+                    job.log(f"[Upload-Retry] Đã nhận thông tin xác thực mới từ hệ thống. Tiếp tục upload {p_name}...")
+                    continue
 
                 job.log(
                     f"[Upload-Retry] Upload {p_name} thất bại (lần {upload_attempt}/{max_upload_retries}): {up_err}. "
@@ -1264,7 +1531,17 @@ async def run_resumable_backup_pipeline(
             except (httpx.HTTPError, OSError) as net_err:
                 last_upload_err = net_err
                 if upload_attempt >= max_upload_retries:
-                    raise ProviderFailure("UPLOAD_FAILED", f"Network error uploading {p_name}: {net_err}")
+                    net_fail = ProviderFailure("UPLOAD_FAILED", f"Network error uploading {p_name}: {net_err}")
+                    old_scope = _live_account_key()
+                    await _invoke_wait_for_retry_account(job, target, net_fail, attempt_gen=attempt_gen)
+                    target_creds = _live_target_creds()
+                    target_folder = _live_target_folder()
+                    if _live_account_key() != old_scope:
+                        backup_folder_id = None
+                    upload_attempt = 0
+                    auto_refreshed_once = False
+                    job.log(f"[Upload-Retry] Đã nhận thông tin xác thực mới sau lỗi mạng. Tiếp tục upload {p_name}...")
+                    continue
                 job.log(f"[Upload-Retry] Lỗi mạng upload {p_name} (lần {upload_attempt}/{max_upload_retries}): {net_err}. Thử lại...")
                 await asyncio.sleep(min(2 ** (upload_attempt - 1), 8))
         else:
@@ -1273,6 +1550,13 @@ async def run_resumable_backup_pipeline(
         job.log(f"[Trace] Upload thành công: {p_name}")
         completed_parts.append(p_meta)
         existing_remote_part_names.add(p_name)
+        if p_name in in_flight_part_names:
+            in_flight_part_names.remove(p_name)
+        telemetry.update(
+            parts_uploaded=len(completed_parts),
+            parts_total=max(est_parts_total, len(completed_parts) + len(in_flight_part_names)),
+            current_part=in_flight_part_names[-1] if in_flight_part_names else "",
+        )
         if isinstance(res, dict):
             remote_part_map[p_name] = res
 
@@ -1450,9 +1734,33 @@ async def run_resumable_backup_pipeline(
                         ) from last_seg_err
                 else:
                     accumulated_bytes += seg_sz
+                    session_downloaded_bytes += seg_sz
                     cur_batch_segments.append(seg)
                     cur_batch_paths.append(seg_file)
                     total_downloaded_segs += 1
+
+                if (total_downloaded_segs + skipped_segments_count) % 5 == 0 or seg["index"] == total_segments - 1:
+                    segs_now = min(total_segments, initial_synced_segs + total_downloaded_segs + skipped_segments_count)
+                    bytes_now = initial_synced_bytes + session_downloaded_bytes
+                    est_total_now = (
+                        int(bytes_now * (total_segments / max(1, segs_now)))
+                        if segs_now >= 3 and total_segments > 0 and bytes_now > 0
+                        else max(estimated_total_bytes, bytes_now)
+                    )
+                    est_parts_total = max(est_parts_total, len(completed_parts) + len(in_flight_part_names), (total_segments + max(1, chunk_segments) - 1) // max(1, chunk_segments))
+                    cur_up_part = in_flight_part_names[-1] if in_flight_part_names else ""
+                    telemetry.update(
+                        phase="download",
+                        stage=f"Downloading • Uploading {cur_up_part}" if cur_up_part else "Downloading HLS segments",
+                        segments_done=segs_now,
+                        segments_total=total_segments,
+                        segments_skipped=skipped_segments_count,
+                        parts_uploaded=len(completed_parts),
+                        parts_total=est_parts_total,
+                        current_part=cur_up_part,
+                        bytes_done=bytes_now,
+                        size=max(bytes_now, est_total_now),
+                    )
 
                 # Progress logging every 50 segments
                 if (total_downloaded_segs + skipped_segments_count) % 50 == 0 or seg["index"] == total_segments - 1:
@@ -1553,12 +1861,25 @@ async def run_resumable_backup_pipeline(
 
             # Wait for remaining background uploads after all segments downloaded
             if active_upload_tasks:
+                telemetry.update(
+                    phase="upload",
+                    stage=f"Uploading remaining parts ({len(active_upload_tasks)})",
+                    segments_done=total_segments,
+                    segments_total=total_segments,
+                    segments_skipped=skipped_segments_count,
+                )
                 job.log(f"[Upload-Pipe] Đợi {len(active_upload_tasks)} upload task(s) còn lại hoàn tất...")
                 results = await asyncio.gather(*active_upload_tasks, return_exceptions=True)
+                active_upload_tasks.clear()
                 for r in results:
-                    if isinstance(r, Exception):
+                    if isinstance(r, BaseException):
                         raise r
         finally:
+            pending_uploads = [t for t in active_upload_tasks if not t.done()]
+            for t in pending_uploads:
+                t.cancel()
+            if pending_uploads:
+                await asyncio.gather(*pending_uploads, return_exceptions=True)
             await dl_client.aclose()
 
 
@@ -1577,7 +1898,8 @@ async def run_resumable_backup_pipeline(
 
     # If skip_final_assembly is active (due to space > 50% free disk, Kaggle limit, or option):
     if skip_final_assembly:
-        total_synced_mb = sum(cp.get("bytes", 0) for cp in completed_parts) / (1024 * 1024)
+        total_synced_bytes = sum(cp.get("bytes", 0) for cp in completed_parts)
+        total_synced_mb = total_synced_bytes / (1024 * 1024)
         skipped_str = f", {len(skipped_segment_indices)} segment đã bỏ qua" if skipped_segment_indices else ""
         job.log(
             f"[Backup-Resume] [Space-Saver] 100% segments ({total_segments} segments{skipped_str}, {len(completed_parts)} parts, ~{total_synced_mb:.1f} MB) "
@@ -1585,10 +1907,32 @@ async def run_resumable_backup_pipeline(
             f"Bỏ qua bước ghép video (Final Assembly) trên runtime để tiết kiệm không gian đĩa và tránh lỗi tràn bộ nhớ (Errno 28)."
         )
         await _upload_manifest()
+        telemetry.record_completion(
+            final_bytes=total_synced_bytes,
+            segments_total=total_segments,
+            segments_done=max(0, total_segments - len(skipped_segment_indices)),
+            segments_skipped=len(skipped_segment_indices),
+            parts_count=len(completed_parts),
+            output_name=backup_folder_name,
+            space_saved=True,
+        )
         shutil.rmtree(job_work_dir, ignore_errors=True)
         return job_work_dir / backup_folder_name
 
     # 5. Final Assembly: Concatenate all parts into final MP4
+    total_parts_bytes = sum(cp.get("bytes", 0) for cp in completed_parts)
+    telemetry.update(
+        phase="upload",
+        stage="Final Assembly: verifying parts",
+        segments_done=total_segments,
+        segments_total=total_segments,
+        segments_skipped=len(skipped_segment_indices),
+        parts_uploaded=len(completed_parts),
+        parts_total=len(completed_parts),
+        current_part="",
+        bytes_done=total_parts_bytes,
+        size=max(total_parts_bytes, estimated_total_bytes),
+    )
     skipped_str = f" ({len(skipped_segment_indices)} segment lỗi đã được bỏ qua)" if skipped_segment_indices else ""
     job.log(f"[Final-Assembly] Hoàn tất 100% segments ({total_segments} segments{skipped_str})! Bắt đầu ghép file hoàn chỉnh: {final_video_name}...")
     final_output_path = job_work_dir / final_video_name
@@ -1610,9 +1954,10 @@ async def run_resumable_backup_pipeline(
         else:
             missing_parts.append(cp)
 
-    parts_provider = src_provider if (is_backup_folder_input and not is_source_links) else dst_provider
-    parts_creds = (source.get("credentials") or {}) if (is_backup_folder_input and not is_source_links) else target_creds
-    provider_label = "Cloud nguồn" if (is_backup_folder_input and not is_source_links) else "Cloud đích"
+    is_src_parts = bool(is_backup_folder_input and not is_source_links)
+    parts_provider = src_provider if is_src_parts else _live_dst_provider()
+    parts_creds = (source.get("credentials") or {}) if is_src_parts else _live_target_creds()
+    provider_label = "Cloud nguồn" if is_src_parts else "Cloud đích"
 
     local_summary = ", ".join(local_ready_parts) if len(local_ready_parts) <= 5 else f"{len(local_ready_parts)} parts"
     job.log(
@@ -1624,11 +1969,21 @@ async def run_resumable_backup_pipeline(
     total_missing_bytes = sum(cp.get("bytes", 0) for cp in missing_parts)
     current_free_disk = _get_disk_free(job_work_dir)
     if total_missing_bytes > 0 and (total_missing_bytes * 2 > current_free_disk or total_missing_bytes > current_free_disk * 0.5):
-        total_synced_mb = sum(cp.get("bytes", 0) for cp in completed_parts) / (1024 * 1024)
+        total_synced_bytes = sum(cp.get("bytes", 0) for cp in completed_parts)
+        total_synced_mb = total_synced_bytes / (1024 * 1024)
         job.log(
             f"[Final-Assembly] [Space-Saver] Dung lượng các part cần tải lại (~{total_missing_bytes // (1024*1024)} MB) "
             f"vượt quá không gian đĩa an toàn ({current_free_disk // (1024*1024)} MB). "
             f"Bỏ qua bước ghép video để bảo vệ hệ thống. Toàn bộ {len(completed_parts)} parts (~{total_synced_mb:.1f} MB) đã có đủ trên Cloud tại '{backup_folder_name}'."
+        )
+        telemetry.record_completion(
+            final_bytes=total_synced_bytes,
+            segments_total=total_segments,
+            segments_done=max(0, total_segments - len(skipped_segment_indices)),
+            segments_skipped=len(skipped_segment_indices),
+            parts_count=len(completed_parts),
+            output_name=backup_folder_name,
+            space_saved=True,
         )
         shutil.rmtree(job_work_dir, ignore_errors=True)
         return job_work_dir / backup_folder_name
@@ -1661,6 +2016,11 @@ async def run_resumable_backup_pipeline(
             part_downloaded = False
             for part_dl_attempt in range(5):
                 try:
+                    if not is_src_parts:
+                        from .transfer_job import wait_for_retry_gate
+                        await wait_for_retry_gate(job)
+                        parts_provider = _live_dst_provider()
+                        parts_creds = _live_target_creds()
                     await parts_provider.download_file(parts_creds, part_remote_item, parts_local_dir, job)
                     if not local_p.is_file():
                         candidates = list(parts_local_dir.glob(f"*{p_name}*"))
@@ -1696,6 +2056,7 @@ async def run_resumable_backup_pipeline(
         str(final_output_path),
     ]
 
+    telemetry.update(phase="upload", stage="Merging MP4 via FFmpeg")
     job.log(f"[Final-Assembly] Thực thi FFmpeg lossless stream copy...")
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -1718,47 +2079,64 @@ async def run_resumable_backup_pipeline(
                 final_size = final_output_path.stat().st_size
         except Exception as thumb_exc:
             job.log(f"[Thumbnail] Lưu ý xử lý video sau khi ghép: {thumb_exc}")
+    telemetry.update(
+        phase="upload",
+        stage="Uploading final MP4 to Cloud",
+        bytes_done=final_size,
+        size=final_size,
+    )
     job.log(f"[Final-Assembly] Ghép thành công video hoàn chỉnh ({final_size} bytes). Đang upload lên Cloud đích...")
 
     # Upload final MP4 to main target folder
+    from .transfer_job import _invoke_wait_for_retry_account, wait_for_retry_gate
     while True:
-        target_creds = target.get("credentials") or {}
-        cur_folder = str((target.get("folder") or {}).get("id") or (target.get("folder") or {}).get("path") or "/")
-        if cur_folder.startswith("id:"):
-            cur_folder = cur_folder[3:].strip()
-        target_folder = cur_folder
-        if dst_provider is None:
-            dst_provider = PROVIDERS.get(str(target.get("provider") or "").lower(), dst_provider)
+        attempt_gen = await wait_for_retry_gate(job)
+        target_creds = _live_target_creds()
+        target_folder = _live_target_folder()
+        active_dst = _live_dst_provider()
         target_final_ref = {
             "id": target_folder,
             "path": target_folder,
             "relative_path": final_video_name,
         }
         try:
-            await dst_provider.upload_file(target_creds, final_output_path, target_final_ref, job)
-            job.error = None
+            await active_dst.upload_file(target_creds, final_output_path, target_final_ref, job)
+            if not getattr(job, "_waiting_for_account", False):
+                job.error = None
             break
         except ProviderFailure as up_err:
             if up_err.code not in ("UPLOAD_FAILED", "INVALID_PROVIDER_CREDENTIALS", "PROVIDER_TOKEN_EXPIRED"):
                 raise
-            from .transfer_job import _wait_for_retry_account
-            old_prov = str(target.get("provider") or "").lower()
-            await _wait_for_retry_account(job, target, up_err)
-            new_prov = str(target.get("provider") or "").lower()
-            if new_prov and new_prov != old_prov:
-                dst_provider = PROVIDERS.get(new_prov, dst_provider)
+            old_scope = _live_account_key()
+            await _invoke_wait_for_retry_account(job, target, up_err, attempt_gen=attempt_gen)
+            if _live_account_key() != old_scope:
+                backup_folder_id = None
     job.log(f"[Done] Đã lưu thành phẩm {final_video_name} vào thư mục đích trên Cloud!")
+    telemetry.record_completion(
+        final_bytes=final_size,
+        segments_total=total_segments,
+        segments_done=max(0, total_segments - len(skipped_segment_indices)),
+        segments_skipped=len(skipped_segment_indices),
+        parts_count=len(completed_parts),
+        output_name=final_video_name,
+        space_saved=False,
+    )
 
     # 6. Cleanup backup folder if auto_clean is enabled
     if auto_clean:
         try:
-            clean_provider = src_provider if (is_backup_folder_input and not is_source_links) else dst_provider
-            clean_creds = (source.get("credentials") or {}) if (is_backup_folder_input and not is_source_links) else target_creds
-            job.log(f"[Cleanup] Tự động dọn dẹp thư mục phân mảnh tạm trên {'Cloud nguồn' if (is_backup_folder_input and not is_source_links) else 'Cloud đích'}: {backup_folder_name}...")
-            target_base = str(target_folder or "/").rstrip("/")
-            del_path = (str(file_item.get("path") or "") if (is_backup_folder_input and not is_source_links) else "") or f"{target_base}/{backup_folder_name}"
+            is_src_clean = bool(is_backup_folder_input and not is_source_links)
+            if not is_src_clean:
+                await wait_for_retry_gate(job)
+            clean_provider = src_provider if is_src_clean else _live_dst_provider()
+            clean_creds = (source.get("credentials") or {}) if is_src_clean else _live_target_creds()
+            clean_folder = target_folder if is_src_clean else _live_target_folder()
+            clean_bf_id = backup_folder_id if is_src_clean else (await _resolve_backup_folder_id())
+            job.log(f"[Cleanup] Tự động dọn dẹp thư mục phân mảnh tạm trên {'Cloud nguồn' if is_src_clean else 'Cloud đích'}: {backup_folder_name}...")
+            target_base = str(clean_folder or "/").rstrip("/")
+            del_path = (str(file_item.get("path") or "") if is_src_clean else "") or f"{target_base}/{backup_folder_name}"
             del_ref = {
-                "id": backup_folder_id,
+                "id": clean_bf_id,
                 "path": del_path,
                 "name": backup_folder_name,
                 "type": "folder",

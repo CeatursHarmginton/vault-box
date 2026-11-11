@@ -84,7 +84,12 @@ class JobState:
             dur = round(duration, 2)
         else:
             dur = max(0.1, round(now - start_t, 2))
+        extra_fields = {
+            k: v for k, v in existing.items()
+            if k not in ("startTime", "endTime", "duration", "status", "name")
+        }
         timing = {
+            **extra_fields,
             "startTime": start_t,
             "endTime": now,
             "duration": dur,
@@ -176,6 +181,8 @@ class JobState:
 
     def set(self, *, status: str | None = None, step: str | None = None, current_file: str | None = None) -> None:
         changed = False
+        if status and getattr(self, "_waiting_for_account", False) and status in {"running", "downloading", "uploading", "extracting", "pending"}:
+            status = None
         if status and status != self.status:
             self.status = status
             changed = True

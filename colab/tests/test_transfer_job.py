@@ -5363,4 +5363,308 @@ def test_duplicate_filenames_partial_skip_records_completed_and_failed_distinctl
     assert transfer_job_mod._is_item_already_completed(job, payload["source"], items[2]) is False
 
 
+def test_drive_web_resumable_upload_final_partial_chunk_reset_to_zero_recalculates_range(tmp_path, monkeypatch):
+    """Regression test for Scotty HTTP 400 body/Content-Range mismatch when the final
+    partial chunk (< CHUNK) hits 401/403 and _query_resumable_offset resets offset to 0."""
+    from unittest.mock import MagicMock
+    from src.providers import drive as drive_mod
+
+    chunk_sz = drive_mod.CHUNK
+    tail_sz = 524_288
+    total_sz = chunk_sz + tail_sz
+
+    part_file = tmp_path / "part_0008.ts"
+    payload_bytes = (b"A" * chunk_sz) + (b"B" * tail_sz)
+    part_file.write_bytes(payload_bytes)
+
+    provider = drive_mod.DriveProvider()
+    creds = {
+        "account_id": "acc_1",
+        "auth_mode": "web_session",
+        "cookies": {"SID": "sid_1", "SAPISID": "sapisid_old"},
+    }
+
+    session_counter = 0
+    put_calls = []
+
+    async def fake_sleep(_delay):
+        return None
+
+    async def fake_web_request(c, method, url, **kwargs):
+        nonlocal session_counter
+        session_counter += 1
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"Location": f"https://upload.example.com/session/{session_counter}"}
+        return resp
+
+    async def fake_refresh(c):
+        c["cookies"]["SAPISID"] = "sapisid_refreshed"
+        return True
+
+    async def fake_query_offset(client, c, session_uri, size):
+        # Resumable upload session expired/invalidated -> restart from byte 0
+        return 0
+
+    async def fake_send_request(client, method, url, *, headers=None, content=b"", **kwargs):
+        hdrs = {k.lower(): v for k, v in (headers or {}).items()}
+        c_range = hdrs.get("content-range", "")
+        c_len = int(hdrs.get("content-length", "0"))
+        put_calls.append((url, c_range, c_len, len(content), content[:1]))
+
+        # Enforce Google Scotty's exact Content-Range validation!
+        assert c_len == len(content)
+        byte_spec, total_spec = c_range.replace("bytes ", "").split("/")
+        start_b, end_b = (int(x) for x in byte_spec.split("-"))
+        assert int(total_spec) == total_sz
+        assert end_b - start_b + 1 == len(content), (
+            f"Body length {len(content)} != Content-Range {c_range} ({end_b - start_b + 1})"
+        )
+
+        resp = MagicMock()
+        resp.headers = {}
+        resp.cookies = {}
+        if url.endswith("/session/1") and start_b == 0:
+            resp.status_code = 308
+            resp.headers = {"Range": f"bytes=0-{chunk_sz - 1}"}
+            return resp
+        if url.endswith("/session/1") and start_b == chunk_sz:
+            # Final partial chunk fails with 403 -> triggers refresh + reset to offset 0 on session/2
+            resp.status_code = 403
+            resp.text = "Forbidden"
+            return resp
+        if url.endswith("/session/2") and start_b == 0:
+            resp.status_code = 308
+            resp.headers = {"Range": f"bytes=0-{chunk_sz - 1}"}
+            return resp
+        if url.endswith("/session/2") and start_b == chunk_sz:
+            resp.status_code = 200
+            resp.json = lambda: {"id": "uploaded_part_id", "title": "part_0008.ts"}
+            return resp
+        raise AssertionError(f"Unexpected PUT call: {url} {c_range}")
+
+    monkeypatch.setattr(drive_mod.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(provider, "_web_request", fake_web_request)
+    monkeypatch.setattr(provider, "_refresh_web_session", fake_refresh)
+    monkeypatch.setattr(provider, "_query_resumable_offset", fake_query_offset)
+    monkeypatch.setattr(provider, "_send_request", fake_send_request)
+
+    job = JobState("test-scotty-partial-chunk-reset", {})
+    res = asyncio.run(provider._web_upload_resumable(creds, part_file, "parent_dir", "part_0008.ts", "video/mp2t", job))
+
+    assert res == {"id": "uploaded_part_id", "name": "part_0008.ts"}
+    assert put_calls == [
+        ("https://upload.example.com/session/1", f"bytes 0-{chunk_sz - 1}/{total_sz}", chunk_sz, chunk_sz, b"A"),
+        ("https://upload.example.com/session/1", f"bytes {chunk_sz}-{total_sz - 1}/{total_sz}", tail_sz, tail_sz, b"B"),
+        ("https://upload.example.com/session/2", f"bytes 0-{chunk_sz - 1}/{total_sz}", chunk_sz, chunk_sz, b"A"),
+        ("https://upload.example.com/session/2", f"bytes {chunk_sz}-{total_sz - 1}/{total_sz}", tail_sz, tail_sz, b"B"),
+    ]
+
+
+def test_drive_refresh_web_session_single_flight_coalesces_concurrent_workers(monkeypatch):
+    from unittest.mock import MagicMock
+    from src.providers import drive as drive_mod
+
+    provider = drive_mod.DriveProvider()
+    shared_creds = {
+        "account_id": "acc_1",
+        "auth_mode": "web_session",
+        "cookies": {"SID": "sid_1", "SAPISID": "old_sapisid"},
+    }
+    network_calls = 0
+
+    async def fake_send_request(client, method, url, **kwargs):
+        nonlocal network_calls
+        network_calls += 1
+        await asyncio.sleep(0.03)
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"set-cookie": "SAPISID=rotated_sapisid; Path=/; Secure"}
+        resp.cookies = {"SAPISID": "rotated_sapisid"}
+        return resp
+
+    monkeypatch.setattr(provider, "_send_request", fake_send_request)
+
+    async def run_all():
+        return await asyncio.gather(*(provider._refresh_web_session(shared_creds) for _ in range(4)))
+
+    results = asyncio.run(run_all())
+    assert results == [True, True, True, True]
+    # 1 single-flight refresh sequence issues 3 warmup/about requests total (instead of 4 * 3 = 12)
+    assert network_calls == 3
+    assert shared_creds["cookies"]["SAPISID"] == "rotated_sapisid"
+
+
+def test_concurrent_multi_hls_backup_resume_web_session_expiry_recovers_once(tmp_path, monkeypatch):
+    """When multiple HLS streams run in parallel under backup_resume and the Drive web_session
+    expires mid-transfer (with staggered worker failures before and after retry_lock release),
+    resending the web session once must recover ALL concurrent streams without re-entering
+    waiting_target_account or losing in-place credentials references."""
+    from unittest.mock import MagicMock
+    from src.jobs import hls_backup_pipeline as hls_mod
+
+    dirs = {
+        "root": tmp_path / "job",
+        "input": tmp_path / "job" / "input",
+        "work": tmp_path / "job" / "work",
+        "output": tmp_path / "job" / "output",
+    }
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+
+    shared_creds = {
+        "account_id": "acc_1",
+        "auth_mode": "web_session",
+        "cookies": {"SID": "sid_1", "SAPISID": "expired_sapisid"},
+    }
+    orig_creds_id = id(shared_creds)
+
+    async def fake_resolve_media_segments(client, url, headers=None):
+        segs = [{"index": i, "duration": 2.0, "url": f"{url}/seg_{i}.ts"} for i in range(4)]
+        return url, segs
+
+    async def fake_download_single_segment(client, seg, dest_path, headers, sem, progress=None, max_retries=10, proxy=None):
+        async with sem:
+            await asyncio.sleep(0.01)
+            # Simulate active downloaders updating job status concurrently while another worker waits for retry_upload
+            if progress is not None:
+                progress.set(status="running", step="downloading")
+            dest_path.write_bytes(b"T" * 1024)
+            return 1024
+
+    async def fake_proc(*cmd, **kwargs):
+        out_path = Path(cmd[-1])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"MP4_FINAL_DATA")
+        mock = MagicMock()
+        mock.returncode = 0
+
+        async def fake_comm():
+            return b"", b""
+
+        mock.communicate = fake_comm
+        return mock
+
+    class FakeLinksSource:
+        pass
+
+    stagger_gate = asyncio.Event()
+
+    class FakeDriveTarget:
+        def __init__(self):
+            self.uploaded_final = []
+            self.uploaded_parts = []
+            self.expired_call_idx = 0
+
+        async def list_files(self, credentials, folder_id):
+            return {"items": []}
+
+        async def upload_file(self, credentials, local_path: Path, target_ref, progress: JobState):
+            assert id(credentials) == orig_creds_id
+            rel = str(target_ref.get("relative_path") or local_path.name)
+            sapisid = (credentials.get("cookies") or {}).get("SAPISID")
+            if sapisid != "fresh_sapisid":
+                self.expired_call_idx += 1
+                idx = self.expired_call_idx
+                if idx == 3:
+                    # Staggered in-flight failure that finishes AFTER user already confirmed retry_upload!
+                    # Simulates a concurrent worker finishing slow HTTP retries on the old session attempt.
+                    await stagger_gate.wait()
+                    await asyncio.sleep(0.05)
+                raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked")
+
+            await asyncio.sleep(0.01)
+            if rel.endswith(".ts"):
+                self.uploaded_parts.append((rel, target_ref.get("id")))
+            elif rel.endswith(".mp4"):
+                self.uploaded_final.append((rel, target_ref.get("id")))
+            return {"id": f"id_{local_path.name}", "name": local_path.name}
+
+        async def delete_item(self, credentials, ref):
+            return None
+
+    fake_dst = FakeDriveTarget()
+    monkeypatch.setattr(transfer_job_mod, "job_dirs", lambda job_id: dirs)
+    monkeypatch.setattr(hls_mod, "resolve_media_segments", fake_resolve_media_segments)
+    monkeypatch.setattr(hls_mod, "download_single_segment", fake_download_single_segment)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_proc)
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/ffmpeg")
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "links", FakeLinksSource())
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "drive", fake_dst)
+
+    items = [
+        {"id": "https://cdn.example.com/v1/index.m3u8", "path": "https://cdn.example.com/v1/index.m3u8", "name": "stream_1.mp4", "type": "file"},
+        {"id": "https://cdn.example.com/v2/index.m3u8", "path": "https://cdn.example.com/v2/index.m3u8", "name": "stream_2.mp4", "type": "file"},
+        {"id": "https://cdn.example.com/v3/index.m3u8", "path": "https://cdn.example.com/v3/index.m3u8", "name": "stream_3.mp4", "type": "file"},
+    ]
+    payload = {
+        "source": {"provider": "links", "items": items},
+        "target": {
+            "provider": "drive",
+            "accountId": "acc_1",
+            "account_id": "acc_1",
+            "folder": {"id": "folder_target_1", "path": "/TargetFolder"},
+            "credentials": shared_creds,
+        },
+        "options": {
+            "transfer_strategy": "backup_resume",
+            "download_concurrency": 3,
+            "backup_chunk_segments": 2,
+            "cleanupAfterFinish": True,
+        },
+    }
+    job = JobState("test-multi-hls-web-session-retry", payload)
+    confirm_count = 0
+    saw_status_clobber = False
+
+    async def monitor_and_confirm():
+        nonlocal confirm_count, saw_status_clobber
+        for _ in range(400):
+            if getattr(job, "_waiting_for_account", False) and job.status != "waiting_target_account":
+                saw_status_clobber = True
+            if job.status == "waiting_target_account":
+                # Hold briefly while concurrent downloaders call job.set(status="running")
+                await asyncio.sleep(0.05)
+                if job.status != "waiting_target_account":
+                    saw_status_clobber = True
+                confirm_count += 1
+                transfer_job_mod.apply_retry_target_update(
+                    job,
+                    {
+                        "provider": "drive",
+                        "accountId": "acc_1",
+                        "account_id": "acc_1",
+                        "credentials": {
+                            "account_id": "acc_1",
+                            "auth_mode": "web_session",
+                            "cookies": {"SID": "sid_1", "SAPISID": "fresh_sapisid"},
+                        },
+                    },
+                )
+                assert id(job.payload["target"]["credentials"]) == orig_creds_id
+                job.confirm_action = "retry_upload"
+                job.confirm_event.set()
+                stagger_gate.set()
+            if job.status in ("completed", "failed", "cancelled"):
+                break
+            await asyncio.sleep(0.01)
+
+    async def run_both():
+        await asyncio.gather(run_transfer(job), monitor_and_confirm())
+
+    asyncio.run(run_both())
+
+    assert saw_status_clobber is False
+    assert confirm_count == 1
+    assert shared_creds["cookies"]["SAPISID"] == "fresh_sapisid"
+    assert job.status == "completed", job.error
+    assert job.error is None
+    assert job.files_uploaded == 3
+    assert job.failed_items == []
+    assert len(job.completed_items) == 3
+    assert sorted(name for name, _ in fake_dst.uploaded_final) == ["stream_1.mp4", "stream_2.mp4", "stream_3.mp4"]
+    assert all(fid == "folder_target_1" for _, fid in fake_dst.uploaded_final)
+
+
+
 

@@ -660,17 +660,19 @@ async def run_transfer(job: JobState) -> None:
                     result = await _upload_outputs_with_retry(job, target, options, dst, upload_root, upload_item)
                 else:
                     while True:
+                        attempt_gen = await wait_for_retry_gate(job)
                         try:
                             active_dst = PROVIDERS.get(str(target.get("provider") or "").lower(), dst)
                             result = await active_dst.upload_folder(target.get("credentials") or {}, upload_root, _upload_target(target.get("folder") or {}, "", options), job)
-                            job.error = None
+                            if not getattr(job, "_waiting_for_account", False):
+                                job.error = None
                             break
                         except ProviderFailure as exc:
                             if exc.code not in {"UPLOAD_FAILED", "INVALID_PROVIDER_CREDENTIALS", "PROVIDER_TOKEN_EXPIRED"}:
                                 raise
                             if _fallback_auto_upload_new_to_replace(job, options, exc):
                                 continue
-                            await _wait_for_retry_account(job, target, exc)
+                            await _invoke_wait_for_retry_account(job, target, exc, attempt_gen=attempt_gen)
                             continue
         _mark_remaining_items_completed(job, source)
         job.log(f"Done: Downloaded {job.files_downloaded}/{job.files_to_download} file(s), Uploaded {job.files_uploaded}/{job.files_to_upload} file(s) (skipped {job.files_skipped} file(s))")
@@ -1635,9 +1637,11 @@ async def _run_backup_resume_batches(
             job.check_cancelled()
             if is_stream:
                 job.start_item(item_k, name=item_name)
+                attempt_gen = get_retry_generation(job)
                 try:
+                    live_dst = PROVIDERS.get(str(target.get("provider") or "").lower(), dst)
                     final_file = await run_resumable_backup_pipeline(
-                        job, item_dirs, source, target, options, src, dst, item
+                        job, item_dirs, source, target, options, src, live_dst, item
                     )
                     if final_file is not None:
                         # Fully completed: all segments backed up + merged + uploaded
@@ -1681,7 +1685,8 @@ async def _run_backup_resume_batches(
                         job.log(f"[Backup-Resume] Upload bị lỗi xác thực ({exc}). Đang yêu cầu làm mới session/tài khoản đích...")
                         try:
                             auth_fail = exc if isinstance(exc, ProviderFailure) else ProviderFailure("INVALID_PROVIDER_CREDENTIALS", str(exc))
-                            await _wait_for_retry_account(job, target, auth_fail)
+                            await _invoke_wait_for_retry_account(job, target, auth_fail, attempt_gen=attempt_gen)
+                            attempt_gen = get_retry_generation(job)
                             active_dst = PROVIDERS.get(str(target.get("provider") or "").lower(), dst)
 
                             # Re-create temp dirs
@@ -1809,6 +1814,11 @@ def _finish_items(job: JobState, source: dict[str, Any], items: list[dict[str, A
         key = (str(ref.get("provider") or ""), str(ref.get("accountId") or ref.get("account_id") or ""), str(ref.get("id") or ""))
         job.finish_item(item_k, status="done", name=name)
         timing = job.item_timings.get(item_k) or {}
+        extra_meta = {
+            mk: timing[mk]
+            for mk in ("segmentsTotal", "segmentsDone", "segmentsSkipped", "partsCount", "finalBytes", "outputName", "spaceSaved")
+            if mk in timing and timing[mk] is not None
+        }
         if key not in seen_completed:
             job.completed_items.append({
                 **ref,
@@ -1816,6 +1826,7 @@ def _finish_items(job: JobState, source: dict[str, Any], items: list[dict[str, A
                 "startTime": timing.get("startTime"),
                 "endTime": timing.get("endTime"),
                 "duration": timing.get("duration"),
+                **extra_meta,
             })
             seen_completed.add(key)
     job.save_state()
@@ -2116,13 +2127,21 @@ class _ItemSkippedFailure(ProviderFailure):
     def __init__(self, message: str = "Upload skipped"):
         super().__init__("ITEM_SKIPPED", message)
 
-async def _recover_upload(job: JobState, target: dict[str, Any], options: dict[str, Any], exc: ProviderFailure, gate: _UploadGate | None, attempt_gen: int) -> bool:
+async def _recover_upload(
+    job: JobState,
+    target: dict[str, Any],
+    options: dict[str, Any],
+    exc: ProviderFailure,
+    gate: _UploadGate | None,
+    attempt_gen: int,
+    job_attempt_gen: int | None = None,
+) -> bool:
     """Run one recovery round. Returns True when the caller should retry the file."""
     if gate is None:
         if _fallback_auto_upload_new_to_replace(job, options, exc):
             return True
         try:
-            await _wait_for_retry_account(job, target, exc)
+            await _invoke_wait_for_retry_account(job, target, exc, attempt_gen=job_attempt_gen)
             return True
         except _ItemSkippedFailure:
             return False
@@ -2135,7 +2154,7 @@ async def _recover_upload(job: JobState, target: dict[str, Any], options: dict[s
             return True  # recovered by another worker while this upload was in flight.
         try:
             if not _fallback_auto_upload_new_to_replace(job, options, exc):
-                await _wait_for_retry_account(job, target, exc)
+                await _invoke_wait_for_retry_account(job, target, exc, attempt_gen=job_attempt_gen)
         except _ItemSkippedFailure:
             return False
         except BaseException as err:
@@ -2156,6 +2175,7 @@ async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options
             if gate.abort is not None:
                 return
             attempt_gen = gate.generation
+        job_attempt_gen = await wait_for_retry_gate(job)
         active_dst = PROVIDERS.get(str(target.get("provider") or "").lower(), dst)
         folder = _item_target_folder(target.get("folder") or {}, item) if options.get("replace") else (target.get("folder") or {})
         target_ref = _upload_target(folder, rel, options)
@@ -2166,7 +2186,8 @@ async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options
             else:
                 await active_dst.upload_file(target.get("credentials") or {}, path, target_ref, job)
             job.files_uploaded += 1
-            job.error = None
+            if not getattr(job, "_waiting_for_account", False):
+                job.error = None
             job._upload_log_done = getattr(job, "_upload_log_done", 0) + 1
             total_up = getattr(job, "files_to_upload", 0) or getattr(job, "_upload_log_total", 0) or job._upload_log_done or 1
             job.log(f"[{job._upload_log_done}/{total_up}] Uploaded: {path.name}")
@@ -2199,7 +2220,7 @@ async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options
                 if exc.code not in {"UPLOAD_FAILED", "INVALID_PROVIDER_CREDENTIALS", "PROVIDER_TOKEN_EXPIRED"}:
                     raise
             try:
-                recovered = await _recover_upload(job, target, options, exc, gate, attempt_gen)
+                recovered = await _recover_upload(job, target, options, exc, gate, attempt_gen, job_attempt_gen=job_attempt_gen)
             except _ItemSkippedFailure:
                 recovered = False
             if recovered:
@@ -2227,6 +2248,7 @@ async def _upload_one_with_retry(job: JobState, target: dict[str, Any], options:
     job.start_file(path.name, phase="upload", size=file_sz)
     try:
         while True:
+            attempt_gen = await wait_for_retry_gate(job)
             try:
                 active_dst = PROVIDERS.get(str(target.get("provider") or "").lower(), dst)
                 source = (job.payload.get("source") or {}).get("items") or []
@@ -2235,7 +2257,8 @@ async def _upload_one_with_retry(job: JobState, target: dict[str, Any], options:
                 job.files_uploaded = 1
                 job.uploaded_files.add(path.name)
                 job.save_state()
-                job.error = None
+                if not getattr(job, "_waiting_for_account", False):
+                    job.error = None
                 job.finish_file(path.name, phase="upload", size=file_sz)
                 job.finish_item(path.name, status="done", name=path.name)
                 if not options.get("extract"):
@@ -2269,7 +2292,7 @@ async def _upload_one_with_retry(job: JobState, target: dict[str, Any], options:
                     job.log(f"[1/1] Skipped (duplicate): {path.name}")
                     return {"ok": True, "uploaded": 0, "skipped": 1, "items": []}
                 try:
-                    await _wait_for_retry_account(job, target, exc)
+                    await _invoke_wait_for_retry_account(job, target, exc, attempt_gen=attempt_gen)
                 except _ItemSkippedFailure:
                     source = (job.payload.get("source") or {}).get("items") or []
                     if source:
@@ -2284,10 +2307,12 @@ async def _upload_one_with_retry(job: JobState, target: dict[str, Any], options:
 
 async def _upload_outputs_with_retry(job: JobState, target: dict[str, Any], options: dict[str, Any], dst: Any, upload_root: Path, item: dict[str, Any]) -> None:
     while True:
+        attempt_gen = await wait_for_retry_gate(job)
         try:
             active_dst = PROVIDERS.get(str(target.get("provider") or "").lower(), dst)
             await _upload_outputs(job, target, options, active_dst, upload_root, item)
-            job.error = None
+            if not getattr(job, "_waiting_for_account", False):
+                job.error = None
             return
         except _ItemSkippedFailure as exc:
             job.log(f"[SKIP] Upload outputs skipped: {exc.message}")
@@ -2298,7 +2323,7 @@ async def _upload_outputs_with_retry(job: JobState, target: dict[str, Any], opti
             if _fallback_auto_upload_new_to_replace(job, options, exc):
                 continue
             try:
-                await _wait_for_retry_account(job, target, exc)
+                await _invoke_wait_for_retry_account(job, target, exc, attempt_gen=attempt_gen)
             except _ItemSkippedFailure:
                 job.log(f"[SKIP] Upload outputs skipped: {exc.message}")
                 return
@@ -2326,67 +2351,210 @@ def _item_is_failed(job: JobState, source: dict[str, Any], item: dict[str, Any])
     key = (str(ref.get("provider") or ""), str(ref.get("accountId") or ref.get("account_id") or ""), str(ref.get("id") or ""))
     return any((str(f.get("provider") or ""), str(f.get("accountId") or f.get("account_id") or ""), str(f.get("id") or "")) == key for f in job.failed_items)
 
-async def _wait_for_retry_account(job: JobState, target: dict[str, Any], exc: ProviderFailure) -> None:
+def _extract_target_account(t: dict[str, Any] | None) -> str:
+    if not isinstance(t, dict):
+        return ""
+    creds = t.get("credentials") if isinstance(t.get("credentials"), dict) else {}
+    return str(
+        t.get("accountId")
+        or t.get("account_id")
+        or creds.get("account_id")
+        or creds.get("accountId")
+        or creds.get("account")
+        or ""
+    )
+
+
+def get_retry_generation(job: JobState) -> int:
+    return int(getattr(job, "_retry_generation", 0) or 0)
+
+
+def _get_retry_gate(job: JobState) -> asyncio.Event:
+    gate = getattr(job, "_retry_gate", None)
+    if gate is None:
+        gate = asyncio.Event()
+        gate.set()
+        job._retry_gate = gate
+    return gate
+
+
+async def wait_for_retry_gate(job: JobState) -> int:
+    await _get_retry_gate(job).wait()
+    job.check_cancelled()
+    return get_retry_generation(job)
+
+
+def apply_retry_target_update(
+    job: JobState,
+    incoming_target: dict[str, Any] | None = None,
+    *,
+    target_ref: dict[str, Any] | None = None,
+    orig_creds_ref: dict[str, Any] | None = None,
+    old_acc_override: str | None = None,
+    old_prov_override: str | None = None,
+    old_folder_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload_target = job.payload.setdefault("target", {}) if isinstance(getattr(job, "payload", None), dict) else {}
+    base_target = target_ref if isinstance(target_ref, dict) else payload_target
+
+    old_acc = old_acc_override if old_acc_override is not None else _extract_target_account(base_target)
+    old_prov = (
+        old_prov_override.lower()
+        if old_prov_override is not None
+        else str(base_target.get("provider") or "").lower()
+    )
+    old_folder = (
+        dict(old_folder_override)
+        if isinstance(old_folder_override, dict)
+        else dict(base_target.get("folder") or {})
+    )
+    orig_creds = orig_creds_ref if isinstance(orig_creds_ref, dict) else (
+        base_target.get("credentials") if isinstance(base_target.get("credentials"), dict) else None
+    )
+
+    inc = dict(incoming_target or {})
+    merged = dict(payload_target)
+    for k, v in inc.items():
+        if k == "folder" and not v and "folder" in merged and "folder" not in (incoming_target or {}):
+            continue
+        merged[k] = v
+
+    new_creds = inc.get("credentials") if isinstance(inc.get("credentials"), dict) else (
+        merged.get("credentials") if isinstance(merged.get("credentials"), dict) else {}
+    )
+    new_acc = _extract_target_account(inc) or _extract_target_account(merged)
+    new_prov = str(inc.get("provider") or merged.get("provider") or old_prov).lower()
+
+    account_changed = bool(old_acc and new_acc and new_acc != old_acc)
+    provider_changed = bool(old_prov and new_prov and new_prov != old_prov)
+    same_session_refresh = (not account_changed and not provider_changed) and (
+        (bool(old_acc) and bool(new_acc) and old_acc == new_acc)
+        or (isinstance(orig_creds, dict) and (orig_creds.get("auth_mode") == "web_session" or new_creds.get("auth_mode") == "web_session"))
+        or (not old_acc and not new_acc)
+    )
+
+    if account_changed or provider_changed:
+        if merged.get("folder") == old_folder:
+            merged["folder"] = {}
+        if isinstance(new_creds, dict):
+            merged["credentials"] = dict(new_creds)
+    else:
+        if not inc.get("folder") and old_folder and not merged.get("folder"):
+            merged["folder"] = dict(old_folder)
+        if same_session_refresh and isinstance(orig_creds, dict) and isinstance(new_creds, dict) and new_creds:
+            new_creds_copy = dict(new_creds)
+            orig_creds.clear()
+            orig_creds.update(new_creds_copy)
+            merged["credentials"] = orig_creds
+
+    if isinstance(payload_target, dict) and payload_target is not merged:
+        payload_target.clear()
+        payload_target.update(merged)
+    if isinstance(target_ref, dict) and target_ref is not payload_target:
+        target_ref.clear()
+        target_ref.update(merged)
+    return merged
+
+
+async def _wait_for_retry_account(
+    job: JobState,
+    target: dict[str, Any],
+    exc: ProviderFailure,
+    *,
+    attempt_gen: int | None = None,
+) -> None:
     retry_lock = getattr(job, "_retry_lock", None)
     if retry_lock is None:
         retry_lock = asyncio.Lock()
         job._retry_lock = retry_lock
-    if retry_lock.locked():
-        async with retry_lock:
+
+    was_locked = retry_lock.locked()
+    async with retry_lock:
+        gen_advanced = attempt_gen is not None and get_retry_generation(job) != attempt_gen
+        if gen_advanced or (attempt_gen is None and was_locked):
             job.check_cancelled()
+            if job.confirm_action == "cancel":
+                raise JobCancelled()
+            if not gen_advanced:
+                if IS_KAGGLE and job.confirm_action is None:
+                    raise _ItemSkippedFailure(exc.message)
+                if job.confirm_action != "retry_upload":
+                    raise exc
+            cur_payload_target = job.payload.get("target") if isinstance(getattr(job, "payload", None), dict) else None
+            if isinstance(cur_payload_target, dict) and target is not cur_payload_target:
+                target.clear()
+                target.update(cur_payload_target)
+            return
+
+        if was_locked and not gen_advanced:
+            job.check_cancelled()
+            if job.confirm_action == "cancel":
+                raise JobCancelled()
+            if IS_KAGGLE and job.confirm_action is None:
+                raise _ItemSkippedFailure(exc.message)
+
+        orig_creds_ref = target.get("credentials") if isinstance(target.get("credentials"), dict) else None
+        old_acc = _extract_target_account(target)
+        old_prov = str(target.get("provider") or "").lower()
+        old_folder = dict(target.get("folder") or {})
+
+        gate = _get_retry_gate(job)
+        gate.clear()
+        job._waiting_for_account = True
+        try:
+            job.error = {"code": exc.code, "message": exc.message, "details": exc.details}
+            job.log(f"Upload failed: {exc.message}. Waiting for another target account{' (auto-skipping in 30s)...' if IS_KAGGLE else '...'}")
+            job.confirm_action = None
+            job.confirm_event.clear()
+            job.set(status="waiting_target_account", step="uploading")
+            deadline = (time.monotonic() + 30.0) if IS_KAGGLE else None
+            while not job.confirm_event.is_set():
+                job.check_cancelled()
+                if deadline is not None and time.monotonic() >= deadline:
+                    job.log("[Auto-Skip] No replacement account provided within 30s. Skipping failed file and continuing...")
+                    job._waiting_for_account = False
+                    job.set(status="running", step="uploading")
+                    raise _ItemSkippedFailure(exc.message)
+                await asyncio.sleep(0.05)
             if job.confirm_action == "cancel":
                 raise JobCancelled()
             if job.confirm_action != "retry_upload":
                 raise exc
-            new_target = dict(job.payload.get("target") or {})
-            target.clear()
-            target.update(new_target)
-            return
 
-    async with retry_lock:
-        old_acc = str(
-            target.get("accountId")
-            or target.get("account_id")
-            or (target.get("credentials") or {}).get("account_id")
-            or ""
-        )
-        old_prov = str(target.get("provider") or "").lower()
-        old_folder = dict(target.get("folder") or {})
+            incoming = job.payload.get("target") if isinstance(getattr(job, "payload", None), dict) else {}
+            apply_retry_target_update(
+                job,
+                incoming if isinstance(incoming, dict) else {},
+                target_ref=target,
+                orig_creds_ref=orig_creds_ref,
+                old_acc_override=old_acc,
+                old_prov_override=old_prov,
+                old_folder_override=old_folder,
+            )
+            job._retry_generation = get_retry_generation(job) + 1
+            job._waiting_for_account = False
+            job.error = None
+            job.set(status="running", step="uploading")
+        finally:
+            job._waiting_for_account = False
+            gate.set()
 
-        job.error = {"code": exc.code, "message": exc.message, "details": exc.details}
-        job.log(f"Upload failed: {exc.message}. Waiting for another target account{' (auto-skipping in 30s)...' if IS_KAGGLE else '...'}")
-        job.confirm_action = None
-        job.confirm_event.clear()
-        job.set(status="waiting_target_account", step="uploading")
-        deadline = (time.monotonic() + 30.0) if IS_KAGGLE else None
-        while not job.confirm_event.is_set():
-            job.check_cancelled()
-            if deadline is not None and time.monotonic() >= deadline:
-                job.log(f"[Auto-Skip] No replacement account provided within 30s. Skipping failed file and continuing...")
-                job.set(status="running", step="uploading")
-                raise _ItemSkippedFailure(exc.message)
-            await asyncio.sleep(0.05)
-        if job.confirm_action == "cancel":
-            raise JobCancelled()
-        if job.confirm_action != "retry_upload":
-            raise exc
-        new_target = dict(job.payload.get("target") or {})
-        new_acc = str(
-            new_target.get("accountId")
-            or new_target.get("account_id")
-            or (new_target.get("credentials") or {}).get("account_id")
-            or ""
-        )
-        new_prov = str(new_target.get("provider") or old_prov).lower()
-        if (old_acc and new_acc and new_acc != old_acc) or (old_prov and new_prov and new_prov != old_prov):
-            if new_target.get("folder") == old_folder:
-                new_target["folder"] = {}
-                if isinstance(job.payload.get("target"), dict):
-                    job.payload["target"]["folder"] = {}
-        target.clear()
-        target.update(new_target)
-        job.error = None
-        job.set(status="running", step="uploading")
+
+_DEFAULT_WAIT_FOR_RETRY_ACCOUNT = _wait_for_retry_account
+
+
+async def _invoke_wait_for_retry_account(
+    job: JobState,
+    target: dict[str, Any],
+    exc: ProviderFailure,
+    *,
+    attempt_gen: int | None = None,
+) -> None:
+    fn = _wait_for_retry_account
+    if attempt_gen is not None and fn is _DEFAULT_WAIT_FOR_RETRY_ACCOUNT:
+        await fn(job, target, exc, attempt_gen=attempt_gen)
+    else:
+        await fn(job, target, exc)
 
 def _wait_for_confirmation(job: JobState, count: int) -> str:
     job.set(status="waiting_confirmation", step="optimized")

@@ -225,7 +225,8 @@ async def transfer_confirm(job_id: str, payload: dict[str, Any]) -> dict[str, An
     if action == "retry_upload":
         target = payload.get("target") or {}
         if target.get("credentials"):
-            job.payload.setdefault("target", {}).update(target)
+            from .jobs.transfer_job import apply_retry_target_update
+            apply_retry_target_update(job, target)
             job.log(f"Retry upload with target account: {target.get('accountId') or target.get('account_id') or '-'}")
     job.confirm_action = action
     job.confirm_event.set()

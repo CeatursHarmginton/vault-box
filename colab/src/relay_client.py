@@ -171,8 +171,16 @@ async def _relay_loop(manager: JobManager) -> None:
                                     "environment": ENV_NAME,
                                 }))
                                 continue
-                            if msg.get("action") == "retry_upload" and isinstance(msg.get("payload"), dict):
-                                job.payload.setdefault("target", {}).update((msg["payload"].get("target") or {}))
+                            if msg.get("action") == "retry_upload":
+                                inc_target = (
+                                    msg.get("target")
+                                    if isinstance(msg.get("target"), dict)
+                                    else ((msg.get("payload") or {}).get("target") if isinstance(msg.get("payload"), dict) else {})
+                                )
+                                if isinstance(inc_target, dict) and inc_target.get("credentials"):
+                                    from .jobs.transfer_job import apply_retry_target_update
+                                    apply_retry_target_update(job, inc_target)
+                                    job.log(f"Retry upload with target account: {inc_target.get('accountId') or inc_target.get('account_id') or '-'}")
                             job.confirm_action = msg.get("action")
                             job.confirm_event.set()
                     elif typ == "ai_request":
