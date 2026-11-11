@@ -626,6 +626,45 @@ class _HlsItemTelemetry:
                 active_files.pop(self.orig_uid, None)
 
 
+def _get_hls_upload_semaphore(
+    job: JobState,
+    target: dict[str, Any],
+    options: dict[str, Any],
+) -> asyncio.Semaphore:
+    """Return a job-scoped semaphore capping concurrent HLS part/final uploads."""
+    live_target = (
+        (job.payload.get("target") if isinstance(getattr(job, "payload", None), dict) else None)
+        or target
+        or {}
+    )
+    t_prov = str(live_target.get("provider") or "").strip().lower()
+    t_creds = live_target.get("credentials") or {}
+    is_drive_web = t_prov == "drive" and (
+        t_creds.get("auth_mode") == "web_session"
+        or bool(t_creds.get("cookies"))
+        or str(t_creds.get("access_token") or t_creds.get("web_access_token") or "").lower().startswith("sapisidhash")
+    )
+    raw_limit = (
+        options.get("upload_concurrency")
+        or options.get("uploadConcurrency")
+        or options.get("hls_upload_concurrency")
+        or 3
+    )
+    try:
+        ul_limit = max(1, min(6, int(raw_limit)))
+    except (TypeError, ValueError):
+        ul_limit = 3
+    if is_drive_web:
+        ul_limit = max(1, min(2, ul_limit))
+    sem_key = (is_drive_web, ul_limit)
+    cached = getattr(job, "_hls_upload_sem_entry", None)
+    if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == sem_key:
+        return cached[1]
+    sem = asyncio.Semaphore(ul_limit)
+    job._hls_upload_sem_entry = (sem_key, sem)  # type: ignore[attr-defined]
+    return sem
+
+
 async def run_resumable_backup_pipeline(
     job: JobState,
     dirs: dict[str, Path],
@@ -1315,124 +1354,134 @@ async def _run_resumable_backup_pipeline_core(
         """Delete the existing _resume_manifest*.json files from remote to prevent duplicates."""
         await _clean_duplicate_manifests()
 
+    manifest_lock = asyncio.Lock()
+
     async def _upload_manifest() -> None:
         """Build and upload _resume_manifest.json to remote backup folder (with replace)."""
-        is_done = ((sum(cp.get("segment_count", 0) for cp in completed_parts) + len(skipped_segment_indices)) >= total_segments) if total_segments else False
-        manifest = {
-            "version": 1,
-            "transfer_strategy": "backup_resume",
-            "original_url": resolved_url or source_url,
-            "page_url": page_url or file_item.get("page_url") or (file_item.get("meta") or {}).get("page_url") or "",
-            "page_title": file_item.get("page_title") or (file_item.get("meta") or {}).get("page_title") or "",
-            "headers": {k: v for k, v in headers.items() if k.lower() in ("user-agent", "referer", "cookie", "origin")},
-            "cookies": cookies_str,
-            "decryption_key": file_item.get("decryption_key") or (file_item.get("meta") or {}).get("decryption_key"),
-            "source_provider": source.get("provider"),
-            "target_filename": final_video_name,
-            "chunk_size_segments": chunk_segments,
-            "chunk_size_mb": chunk_mb,
-            "chunk_and_mode": chunk_and_mode,
-            "chunk_condition_mode": "and" if chunk_and_mode else "or",
-            "total_segments_expected": total_segments,
-            "completed_parts": sorted(completed_parts, key=lambda x: x["part_index"]),
-            "last_synced_segment": max((cp["end_seg"] for cp in completed_parts), default=-1),
-            "skipped_segments": list(skipped_segment_indices),
-            "skipped_segments_count": len(skipped_segment_indices),
-            "is_complete": is_done,
-            "all_parts_uploaded": is_done,
-            "final_assembly_skipped": bool(skip_final_assembly),
-            "meta": {
-                **(file_item.get("meta") or {}),
-                "page_url": page_url or file_item.get("page_url") or "",
-                "page_title": file_item.get("page_title") or (file_item.get("meta") or {}).get("page_title") or "",
+        async with manifest_lock:
+            is_done = ((sum(cp.get("segment_count", 0) for cp in completed_parts) + len(skipped_segment_indices)) >= total_segments) if total_segments else False
+            manifest = {
+                "version": 1,
+                "transfer_strategy": "backup_resume",
                 "original_url": resolved_url or source_url,
+                "page_url": page_url or file_item.get("page_url") or (file_item.get("meta") or {}).get("page_url") or "",
+                "page_title": file_item.get("page_title") or (file_item.get("meta") or {}).get("page_title") or "",
                 "headers": {k: v for k, v in headers.items() if k.lower() in ("user-agent", "referer", "cookie", "origin")},
                 "cookies": cookies_str,
-            },
-            "raw_item": {k: v for k, v in file_item.items() if k not in ("credentials",)},
-        }
-        manifest_path = job_work_dir / "_resume_manifest.json"
-        from .transfer_job import _invoke_wait_for_retry_account, wait_for_retry_gate
-        for manifest_try in range(2):
-            manifest_gen = await wait_for_retry_gate(job)
-            job_work_dir.mkdir(parents=True, exist_ok=True)
-            manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+                "decryption_key": file_item.get("decryption_key") or (file_item.get("meta") or {}).get("decryption_key"),
+                "source_provider": source.get("provider"),
+                "target_filename": final_video_name,
+                "chunk_size_segments": chunk_segments,
+                "chunk_size_mb": chunk_mb,
+                "chunk_and_mode": chunk_and_mode,
+                "chunk_condition_mode": "and" if chunk_and_mode else "or",
+                "total_segments_expected": total_segments,
+                "completed_parts": sorted(completed_parts, key=lambda x: x["part_index"]),
+                "last_synced_segment": max((cp["end_seg"] for cp in completed_parts), default=-1),
+                "skipped_segments": list(skipped_segment_indices),
+                "skipped_segments_count": len(skipped_segment_indices),
+                "is_complete": is_done,
+                "all_parts_uploaded": is_done,
+                "final_assembly_skipped": bool(skip_final_assembly),
+                "meta": {
+                    **(file_item.get("meta") or {}),
+                    "page_url": page_url or file_item.get("page_url") or "",
+                    "page_title": file_item.get("page_title") or (file_item.get("meta") or {}).get("page_title") or "",
+                    "original_url": resolved_url or source_url,
+                    "headers": {k: v for k, v in headers.items() if k.lower() in ("user-agent", "referer", "cookie", "origin")},
+                    "cookies": cookies_str,
+                },
+                "raw_item": {k: v for k, v in file_item.items() if k not in ("credentials",)},
+            }
+            manifest_path = job_work_dir / "_resume_manifest.json"
+            from .transfer_job import _invoke_wait_for_retry_account, wait_for_retry_gate
+            for manifest_try in range(2):
+                manifest_gen = await wait_for_retry_gate(job)
+                job_work_dir.mkdir(parents=True, exist_ok=True)
+                manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
-            live_dst = _live_dst_provider()
-            live_creds = _live_target_creds()
-            live_folder = _live_target_folder()
+                live_dst = _live_dst_provider()
+                live_creds = _live_target_creds()
+                live_folder = _live_target_folder()
 
-            bf_id = await _resolve_backup_folder_id()
-            existing_manifests = []
-            if bf_id:
+                bf_id = await _resolve_backup_folder_id()
+                existing_manifests = []
+                if bf_id:
+                    try:
+                        listing = await live_dst.list_files(live_creds, bf_id)
+                        for it in listing.get("items") or []:
+                            fname = str(it.get("name") or "")
+                            if fname == "_resume_manifest.json" or (fname.startswith("_resume_manifest") and fname.endswith(".json")):
+                                existing_manifests.append(it)
+                    except Exception:
+                        pass
+
+                exact_manifest = next((it for it in existing_manifests if str(it.get("name") or "") == "_resume_manifest.json"), None)
+                target_manifest = exact_manifest or (existing_manifests[0] if existing_manifests else None)
+
+                # Force replace mode safely across concurrent streams via job-level depth counter
+                if "options" not in job.payload:
+                    job.payload["options"] = {}
+                rep_depth = int(getattr(job, "_manifest_replace_depth", 0))
+                if rep_depth == 0:
+                    job._manifest_orig_replace = job.payload["options"].get("replace")  # type: ignore[attr-defined]
+                job._manifest_replace_depth = rep_depth + 1  # type: ignore[attr-defined]
+                job.payload["options"]["replace"] = True
+
+                replaced = False
+                should_retry_manifest = False
                 try:
-                    listing = await live_dst.list_files(live_creds, bf_id)
-                    for it in listing.get("items") or []:
-                        fname = str(it.get("name") or "")
-                        if fname == "_resume_manifest.json" or (fname.startswith("_resume_manifest") and fname.endswith(".json")):
-                            existing_manifests.append(it)
-                except Exception:
-                    pass
+                    if target_manifest and hasattr(live_dst, "replace_file"):
+                        try:
+                            await live_dst.replace_file(live_creds, manifest_path, target_manifest, job)
+                            replaced = True
+                        except Exception as rep_err:
+                            job.log(f"[Manifest] replace_file: {rep_err}, falling back to upload_file with replace=True")
 
-            exact_manifest = next((it for it in existing_manifests if str(it.get("name") or "") == "_resume_manifest.json"), None)
-            target_manifest = exact_manifest or (existing_manifests[0] if existing_manifests else None)
+                    if not replaced:
+                        manifest_ref = {
+                            "id": live_folder,
+                            "path": live_folder,
+                            "relative_path": f"{backup_folder_name}/_resume_manifest.json",
+                        }
+                        upload_res = await live_dst.upload_file(live_creds, manifest_path, manifest_ref, job)
+                        uploaded_fid = (upload_res.get("id") or upload_res.get("path")) if isinstance(upload_res, dict) else None
+                        await _clean_duplicate_manifests(existing_manifests, keep_id=uploaded_fid)
+                except ProviderFailure as pf_exc:
+                    if manifest_try == 0 and pf_exc.code in ("INVALID_PROVIDER_CREDENTIALS", "PROVIDER_TOKEN_EXPIRED", "UPLOAD_FAILED"):
+                        try:
+                            await _invoke_wait_for_retry_account(job, target, pf_exc, attempt_gen=manifest_gen)
+                            should_retry_manifest = True
+                        except Exception as retry_err:
+                            job.log(f"[Manifest] Cảnh báo: Không thể upload manifest: {retry_err}")
+                    else:
+                        job.log(f"[Manifest] Cảnh báo: Không thể upload manifest: {pf_exc}")
+                except Exception as exc:
+                    job.log(f"[Manifest] Cảnh báo: Không thể upload manifest: {exc}")
+                finally:
+                    new_depth = max(0, int(getattr(job, "_manifest_replace_depth", 1)) - 1)
+                    job._manifest_replace_depth = new_depth  # type: ignore[attr-defined]
+                    if new_depth == 0:
+                        saved_rep = getattr(job, "_manifest_orig_replace", None)
+                        if saved_rep is None:
+                            job.payload["options"].pop("replace", None)
+                        else:
+                            job.payload["options"]["replace"] = saved_rep
+                    manifest_path.unlink(missing_ok=True)
 
-            # Force replace mode in options for providers that check options["replace"] (e.g. TeraBox rtype=3)
-            orig_replace = (job.payload.get("options") or {}).get("replace")
-            if "options" not in job.payload:
-                job.payload["options"] = {}
-            job.payload["options"]["replace"] = True
+                if not should_retry_manifest:
+                    break
 
-            replaced = False
-            should_retry_manifest = False
             try:
-                if target_manifest and hasattr(live_dst, "replace_file"):
-                    try:
-                        await live_dst.replace_file(live_creds, manifest_path, target_manifest, job)
-                        replaced = True
-                    except Exception as rep_err:
-                        job.log(f"[Manifest] replace_file: {rep_err}, falling back to upload_file with replace=True")
-
-                if not replaced:
-                    manifest_ref = {
-                        "id": live_folder,
-                        "path": live_folder,
-                        "relative_path": f"{backup_folder_name}/_resume_manifest.json",
-                    }
-                    upload_res = await live_dst.upload_file(live_creds, manifest_path, manifest_ref, job)
-                    uploaded_fid = (upload_res.get("id") or upload_res.get("path")) if isinstance(upload_res, dict) else None
-                    await _clean_duplicate_manifests(existing_manifests, keep_id=uploaded_fid)
-            except ProviderFailure as pf_exc:
-                if manifest_try == 0 and pf_exc.code in ("INVALID_PROVIDER_CREDENTIALS", "PROVIDER_TOKEN_EXPIRED", "UPLOAD_FAILED"):
-                    try:
-                        await _invoke_wait_for_retry_account(job, target, pf_exc, attempt_gen=manifest_gen)
-                        should_retry_manifest = True
-                    except Exception as retry_err:
-                        job.log(f"[Manifest] Cảnh báo: Không thể upload manifest: {retry_err}")
-                else:
-                    job.log(f"[Manifest] Cảnh báo: Không thể upload manifest: {pf_exc}")
-            except Exception as exc:
-                job.log(f"[Manifest] Cảnh báo: Không thể upload manifest: {exc}")
-            finally:
-                if orig_replace is None:
-                    job.payload["options"].pop("replace", None)
-                else:
-                    job.payload["options"]["replace"] = orig_replace
-                manifest_path.unlink(missing_ok=True)
-
-            if not should_retry_manifest:
-                break
-
-        try:
-            bf_id = await _resolve_backup_folder_id()
-            if bf_id:
-                fresh_listing = await _live_dst_provider().list_files(_live_target_creds(), bf_id)
-                fresh_items = fresh_listing.get("items") or []
-                exact_m = next((it for it in fresh_items if str(it.get("name") or "") == "_resume_manifest.json"), None)
-                active_id = (exact_m.get("id") or exact_m.get("path")) if exact_m else None
-                await _clean_duplicate_manifests(fresh_items, keep_id=active_id)
-        except Exception:
-            pass
+                bf_id = await _resolve_backup_folder_id()
+                if bf_id:
+                    fresh_listing = await _live_dst_provider().list_files(_live_target_creds(), bf_id)
+                    fresh_items = fresh_listing.get("items") or []
+                    exact_m = next((it for it in fresh_items if str(it.get("name") or "") == "_resume_manifest.json"), None)
+                    active_id = (exact_m.get("id") or exact_m.get("path")) if exact_m else None
+                    await _clean_duplicate_manifests(fresh_items, keep_id=active_id)
+            except Exception:
+                pass
 
     async def _upload_part_worker(part_file: Path, p_meta: dict[str, Any]) -> None:
         """Upload a single part to remote destination, update manifest, and track local part.
@@ -1472,15 +1521,16 @@ async def _run_resumable_backup_pipeline_core(
             upload_attempt += 1
             attempt_gen = await wait_for_retry_gate(job)
             try:
-                target_creds = _live_target_creds()
-                target_folder = _live_target_folder()
-                active_dst = _live_dst_provider()
-                target_ref = {
-                    "id": target_folder,
-                    "path": target_folder,
-                    "relative_path": f"{backup_folder_name}/{p_name}",
-                }
-                res = await active_dst.upload_file(target_creds, part_file, target_ref, job)
+                async with _get_hls_upload_semaphore(job, target, options):
+                    target_creds = _live_target_creds()
+                    target_folder = _live_target_folder()
+                    active_dst = _live_dst_provider()
+                    target_ref = {
+                        "id": target_folder,
+                        "path": target_folder,
+                        "relative_path": f"{backup_folder_name}/{p_name}",
+                    }
+                    res = await active_dst.upload_file(target_creds, part_file, target_ref, job)
                 if not getattr(job, "_waiting_for_account", False):
                     job.error = None
                 break  # success
@@ -1601,6 +1651,13 @@ async def _run_resumable_backup_pipeline_core(
         try:
             for seg in remaining_segments:
                 job.check_cancelled()
+                if getattr(job, "_waiting_for_account", False) and active_upload_tasks:
+                    done_set, _ = await asyncio.wait(active_upload_tasks, return_when=asyncio.FIRST_COMPLETED)
+                    for t in done_set:
+                        exc = t.exception()
+                        if exc:
+                            raise exc
+                    active_upload_tasks = [t for t in active_upload_tasks if not t.done()]
                 live_opts = (job.payload.get("options") if isinstance(getattr(job, "payload", None), dict) else None) or options
                 if isinstance(live_opts, dict):
                     try:
@@ -1818,7 +1875,7 @@ async def _run_resumable_backup_pipeline_core(
                         _emergency_cleanup_disk(job_work_dir, parts_local_dir, existing_remote_part_names)
                         job.log(f"[Backup-Resume] [Space-Saver] Cập nhật dung lượng: {dyn_reason}. Chuyển sang chế độ không giữ part và bỏ qua Final Assembly.")
 
-                    # Launch upload as background task — download continues immediately
+                    # Launch upload as background task — apply backpressure so slow/paused uploads do not pile up
                     task = asyncio.create_task(_upload_part_worker(part_path, part_meta))
                     active_upload_tasks.append(task)
                     part_idx += 1
@@ -1830,6 +1887,16 @@ async def _run_resumable_backup_pipeline_core(
                         if exc:
                             raise exc
                     active_upload_tasks = [t for t in active_upload_tasks if not t.done()]
+
+                    max_inflight_parts = 1 if getattr(job, "_waiting_for_account", False) else 2
+                    while len(active_upload_tasks) >= max_inflight_parts:
+                        done_set, _ = await asyncio.wait(active_upload_tasks, return_when=asyncio.FIRST_COMPLETED)
+                        for t in done_set:
+                            exc = t.exception()
+                            if exc:
+                                raise exc
+                        active_upload_tasks = [t for t in active_upload_tasks if not t.done()]
+                        max_inflight_parts = 1 if getattr(job, "_waiting_for_account", False) else 2
 
             if cur_batch_segments:
                 while any(cp["part_index"] == part_idx for cp in completed_parts):
@@ -2089,28 +2156,48 @@ async def _run_resumable_backup_pipeline_core(
 
     # Upload final MP4 to main target folder
     from .transfer_job import _invoke_wait_for_retry_account, wait_for_retry_gate
+    final_attempt = 0
     while True:
+        final_attempt += 1
         attempt_gen = await wait_for_retry_gate(job)
-        target_creds = _live_target_creds()
-        target_folder = _live_target_folder()
-        active_dst = _live_dst_provider()
-        target_final_ref = {
-            "id": target_folder,
-            "path": target_folder,
-            "relative_path": final_video_name,
-        }
         try:
-            await active_dst.upload_file(target_creds, final_output_path, target_final_ref, job)
+            async with _get_hls_upload_semaphore(job, target, options):
+                target_creds = _live_target_creds()
+                target_folder = _live_target_folder()
+                active_dst = _live_dst_provider()
+                target_final_ref = {
+                    "id": target_folder,
+                    "path": target_folder,
+                    "relative_path": final_video_name,
+                }
+                await active_dst.upload_file(target_creds, final_output_path, target_final_ref, job)
             if not getattr(job, "_waiting_for_account", False):
                 job.error = None
             break
         except ProviderFailure as up_err:
             if up_err.code not in ("UPLOAD_FAILED", "INVALID_PROVIDER_CREDENTIALS", "PROVIDER_TOKEN_EXPIRED"):
                 raise
+            is_auth_final = up_err.code in ("INVALID_PROVIDER_CREDENTIALS", "PROVIDER_TOKEN_EXPIRED")
+            if not is_auth_final and final_attempt < 3:
+                job.log(f"[Final-Upload] Upload {final_video_name} tạm lỗi (lần {final_attempt}/3): {up_err}. Đang thử lại...")
+                await asyncio.sleep(min(2 ** (final_attempt - 1), 8))
+                continue
             old_scope = _live_account_key()
             await _invoke_wait_for_retry_account(job, target, up_err, attempt_gen=attempt_gen)
             if _live_account_key() != old_scope:
                 backup_folder_id = None
+            final_attempt = 0
+        except (httpx.HTTPError, OSError) as net_err:
+            if final_attempt < 3:
+                job.log(f"[Final-Upload] Lỗi mạng upload {final_video_name} (lần {final_attempt}/3): {net_err}. Đang thử lại...")
+                await asyncio.sleep(min(2 ** (final_attempt - 1), 8))
+                continue
+            net_fail = ProviderFailure("UPLOAD_FAILED", f"Network error uploading {final_video_name}: {net_err}")
+            old_scope = _live_account_key()
+            await _invoke_wait_for_retry_account(job, target, net_fail, attempt_gen=attempt_gen)
+            if _live_account_key() != old_scope:
+                backup_folder_id = None
+            final_attempt = 0
     job.log(f"[Done] Đã lưu thành phẩm {final_video_name} vào thư mục đích trên Cloud!")
     telemetry.record_completion(
         final_bytes=final_size,

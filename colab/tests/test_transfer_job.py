@@ -5367,6 +5367,7 @@ def test_drive_web_resumable_upload_final_partial_chunk_reset_to_zero_recalculat
     """Regression test for Scotty HTTP 400 body/Content-Range mismatch when the final
     partial chunk (< CHUNK) hits 401/403 and _query_resumable_offset resets offset to 0."""
     from unittest.mock import MagicMock
+    import pytest
     from src.providers import drive as drive_mod
 
     chunk_sz = drive_mod.CHUNK
@@ -5463,6 +5464,7 @@ def test_drive_web_resumable_upload_final_partial_chunk_reset_to_zero_recalculat
 
 def test_drive_refresh_web_session_single_flight_coalesces_concurrent_workers(monkeypatch):
     from unittest.mock import MagicMock
+    import pytest
     from src.providers import drive as drive_mod
 
     provider = drive_mod.DriveProvider()
@@ -5501,6 +5503,7 @@ def test_concurrent_multi_hls_backup_resume_web_session_expiry_recovers_once(tmp
     resending the web session once must recover ALL concurrent streams without re-entering
     waiting_target_account or losing in-place credentials references."""
     from unittest.mock import MagicMock
+    import pytest
     from src.jobs import hls_backup_pipeline as hls_mod
 
     dirs = {
@@ -5664,6 +5667,185 @@ def test_concurrent_multi_hls_backup_resume_web_session_expiry_recovers_once(tmp
     assert len(job.completed_items) == 3
     assert sorted(name for name, _ in fake_dst.uploaded_final) == ["stream_1.mp4", "stream_2.mp4", "stream_3.mp4"]
     assert all(fid == "folder_target_1" for _, fid in fake_dst.uploaded_final)
+
+
+def test_drive_web_request_prevents_signin_cookie_poisoning_and_distinguishes_rate_limit_403(monkeypatch):
+    """Verify DriveProvider:
+    1) Never overwrites valid cookies from accounts.google.com/v3/signin redirects or Max-Age=0 headers.
+    2) Attaches public DRIVE_WEB_API_KEY on clients6.google.com requests so SAPISIDHASH calls succeed.
+    3) Raises UPLOAD_FAILED (retryable) instead of INVALID_PROVIDER_CREDENTIALS when a 403 occurs while
+       _refresh_web_session confirms the Drive session is still alive.
+    """
+    from unittest.mock import MagicMock
+    import pytest
+
+    provider = DriveProvider()
+    creds = {
+        "auth_mode": "web_session",
+        "access_token": "SAPISIDHASH",
+        "cookies": {"SID": "live_sid", "SAPISID": "live_sapisid", "__Secure-1PSIDTS": "live_psidts"},
+        "api_keys": {"clients6.google.com": "BOGUS_CAPTURED_V2BETA_KEY"},
+    }
+
+    # 1) Redirect to accounts.google.com/v3/signin/ and Max-Age=0 deletion must NOT poison cookies
+    signin_resp = MagicMock()
+    signin_resp.status_code = 302
+    signin_resp.url = "https://drive.google.com/drive/my-drive"
+    signin_resp.headers = {
+        "location": "https://accounts.google.com/v3/signin/identifier",
+        "set-cookie": "SID=poisoned; Path=/; Secure",
+    }
+    provider._update_cookies_from_response(creds, signin_resp)
+    assert creds["cookies"]["SID"] == "live_sid"
+
+    delete_resp = MagicMock()
+    delete_resp.status_code = 200
+    delete_resp.url = "https://drive.google.com/drive/my-drive"
+    delete_resp.headers = {
+        "set-cookie": "__Secure-1PSIDTS=deleted; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/",
+    }
+    provider._update_cookies_from_response(creds, delete_resp)
+    assert creds["cookies"]["__Secure-1PSIDTS"] == "live_psidts"
+
+    # 2) clients6.google.com receives DRIVE_WEB_API_KEY and transient 403 with healthy session -> UPLOAD_FAILED
+    seen_params = []
+
+    class FakeClient:
+        async def post(self, url, **kwargs):
+            seen_params.append(dict(kwargs.get("params") or {}))
+            resp = MagicMock()
+            resp.status_code = 403
+            resp.url = url
+            resp.headers = {}
+            resp.text = '{"error":{"code":403,"message":"User rate limit exceeded","errors":[{"reason":"userRateLimitExceeded"}]}}'
+            return resp
+
+    async def healthy_refresh(_c):
+        return True
+
+    async def no_sleep(_d):
+        return None
+
+    monkeypatch.setattr(provider, "_client", lambda: FakeClient())
+    monkeypatch.setattr(provider, "_refresh_web_session", healthy_refresh)
+    monkeypatch.setattr(drive_mod.asyncio, "sleep", no_sleep)
+
+    with pytest.raises(ProviderFailure) as exc_info:
+        asyncio.run(provider._web_request(creds, "POST", f"{drive_mod.DRIVE_WEB_UPLOAD_API}/files", params={"uploadType": "resumable"}))
+
+    assert exc_info.value.code == "UPLOAD_FAILED"
+    assert seen_params[0].get("key") == drive_mod.DRIVE_WEB_API_KEY
+
+
+def test_multi_hls_drive_web_caps_concurrent_uploads_and_recovers_transient_403(tmp_path, monkeypatch):
+    """4 parallel HLS streams targeting Drive web_session must cap concurrent cloud uploads to <= 2
+    and cleanly recover from transient UPLOAD_FAILED bursts without false credential prompts."""
+    from unittest.mock import MagicMock
+    import pytest
+    from src.jobs import hls_backup_pipeline as hls_mod
+
+    dirs = {
+        "root": tmp_path / "job",
+        "input": tmp_path / "job" / "input",
+        "work": tmp_path / "job" / "work",
+        "output": tmp_path / "job" / "output",
+    }
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+
+    async def fake_resolve_media_segments(client, url, headers=None):
+        segs = [{"index": i, "duration": 2.0, "url": f"{url}/seg_{i}.ts"} for i in range(6)]
+        return url, segs
+
+    async def fake_download_single_segment(client, seg, dest_path, headers, sem, progress=None, max_retries=10, proxy=None):
+        async with sem:
+            await asyncio.sleep(0.004)
+            dest_path.write_bytes(b"S" * 512)
+            return 512
+
+    async def fake_proc(*cmd, **kwargs):
+        out_path = Path(cmd[-1])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"MP4_OK")
+        mock = MagicMock()
+        mock.returncode = 0
+
+        async def fake_comm():
+            return b"", b""
+
+        mock.communicate = fake_comm
+        return mock
+
+    class FakeLinksSource:
+        pass
+
+    class FakeDriveWebTarget:
+        def __init__(self):
+            self.active_part_uploads = 0
+            self.max_active_part_uploads = 0
+            self.transient_failures = 0
+            self.uploaded_final = []
+
+        async def list_files(self, credentials, folder_id):
+            return {"items": []}
+
+        async def upload_file(self, credentials, local_path: Path, target_ref, progress: JobState):
+            rel = str(target_ref.get("relative_path") or local_path.name)
+            is_manifest = rel.endswith("_resume_manifest.json")
+            if not is_manifest:
+                self.active_part_uploads += 1
+                self.max_active_part_uploads = max(self.max_active_part_uploads, self.active_part_uploads)
+            try:
+                await asyncio.sleep(0.02)
+                if rel.endswith(".ts") and self.transient_failures < 2:
+                    self.transient_failures += 1
+                    raise ProviderFailure("UPLOAD_FAILED", "Drive web request rejected (403): rateLimitExceeded", {"status": 403})
+                if rel.endswith(".mp4"):
+                    self.uploaded_final.append(rel)
+                return {"id": f"id_{local_path.name}", "name": local_path.name}
+            finally:
+                if not is_manifest:
+                    self.active_part_uploads -= 1
+
+        async def delete_item(self, credentials, ref):
+            return None
+
+    fake_dst = FakeDriveWebTarget()
+    monkeypatch.setattr(transfer_job_mod, "job_dirs", lambda job_id: dirs)
+    monkeypatch.setattr(hls_mod, "resolve_media_segments", fake_resolve_media_segments)
+    monkeypatch.setattr(hls_mod, "download_single_segment", fake_download_single_segment)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_proc)
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/ffmpeg")
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "links", FakeLinksSource())
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "drive", fake_dst)
+
+    items = [
+        {"id": f"https://cdn.example.com/s{k}/index.m3u8", "path": f"https://cdn.example.com/s{k}/index.m3u8", "name": f"v{k}.mp4", "type": "file"}
+        for k in range(1, 5)
+    ]
+    payload = {
+        "source": {"provider": "links", "items": items},
+        "target": {
+            "provider": "drive",
+            "accountId": "gd_web",
+            "folder": {"id": "folder_1"},
+            "credentials": {"account_id": "gd_web", "auth_mode": "web_session", "cookies": {"SAPISID": "ok"}},
+        },
+        "options": {
+            "transfer_strategy": "backup_resume",
+            "download_concurrency": 4,
+            "backup_chunk_segments": 2,
+            "cleanupAfterFinish": True,
+        },
+    }
+    job = JobState("test-4stream-drive-web-cap", payload)
+    asyncio.run(run_transfer(job))
+
+    assert job.status == "completed", job.error
+    assert job.files_uploaded == 4
+    assert sorted(fake_dst.uploaded_final) == ["v1.mp4", "v2.mp4", "v3.mp4", "v4.mp4"]
+    assert 1 <= fake_dst.max_active_part_uploads <= 2
+
 
 
 

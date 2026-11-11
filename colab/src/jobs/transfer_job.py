@@ -2515,7 +2515,7 @@ async def _wait_for_retry_account(
                     job._waiting_for_account = False
                     job.set(status="running", step="uploading")
                     raise _ItemSkippedFailure(exc.message)
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.005)
             if job.confirm_action == "cancel":
                 raise JobCancelled()
             if job.confirm_action != "retry_upload":

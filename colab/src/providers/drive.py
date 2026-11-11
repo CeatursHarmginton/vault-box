@@ -84,9 +84,24 @@ _API_KEY_ERROR_MARKERS = (
     "api keys are not supported",
 )
 
+_RATE_LIMIT_MARKERS = (
+    "ratelimitexceeded",
+    "userratelimitexceeded",
+    "sharingratelimitexceeded",
+    "quotaexceeded",
+    "automated queries",
+    "too many requests",
+    "backenderror",
+    "internalerror",
+)
+
 def _is_api_key_error(body: str) -> bool:
     lowered = (body or "").lower()
     return any(marker in lowered for marker in _API_KEY_ERROR_MARKERS)
+
+def _is_rate_limit_or_transient_403(body: str) -> bool:
+    lowered = (body or "").lower()
+    return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
 
 class DriveProvider(BaseProvider):
     name = "drive"
@@ -221,7 +236,11 @@ class DriveProvider(BaseProvider):
 
     def _web_key(self, c: dict[str, Any]) -> str:
         keys = c.get("api_keys") or {}
-        for host in DRIVE_KEY_HOST_ORDER:
+        for host in (
+            "drivefrontend-pa.clients6.google.com",
+            "workspacevideo-pa.clients6.google.com",
+            "blobcomments-pa.clients6.google.com",
+        ):
             key = keys.get(host)
             if key and key != "AIzaSyBc1bLOZpOtg3-qgMjSQ6pmn6HbE2zjzJg":
                 return str(key)
@@ -258,6 +277,13 @@ class DriveProvider(BaseProvider):
         if not resp:
             return
         headers = getattr(resp, "headers", {}) or {}
+        resp_url = str(getattr(resp, "url", "") or "")
+        loc_hdr = str(headers.get("location") or headers.get("Location") or "")
+        login_markers = ("accounts.google.com", "ServiceLogin", "/signin/", "CookieMismatch")
+        if any(m in resp_url for m in login_markers):
+            return
+        if getattr(resp, "status_code", 200) in (301, 302, 303, 307, 308) and any(m in loc_hdr for m in login_markers):
+            return
         set_cookies = headers.get_list("set-cookie") if hasattr(headers, "get_list") else []
         if not set_cookies and "set-cookie" in headers:
             set_cookies = [headers["set-cookie"]]
@@ -273,13 +299,23 @@ class DriveProvider(BaseProvider):
         if isinstance(cookies, dict):
             skip_attrs = {"domain", "path", "expires", "max-age", "samesite", "httponly", "secure", "priority", "partitioned"}
             for sc_hdr in set_cookies:
-                for chunk in sc_hdr.split(";"):
-                    chunk = chunk.strip()
-                    if "=" in chunk:
-                        k, v = chunk.split("=", 1)
-                        k = k.strip()
-                        if k and k.lower() not in skip_attrs and not k.lower().startswith(("domain", "path", "expires", "max-age")):
-                            cookies[k] = v.strip()
+                first_pair = sc_hdr.split(";", 1)[0].strip()
+                if "=" not in first_pair:
+                    continue
+                rest_lower = sc_hdr[len(first_pair):].lower()
+                if "max-age=0" in rest_lower or "max-age=-" in rest_lower or "1970" in rest_lower:
+                    continue
+                k, v = first_pair.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if (
+                    k
+                    and v
+                    and v.lower() != "deleted"
+                    and k.lower() not in skip_attrs
+                    and not k.lower().startswith(("domain", "path", "expires", "max-age"))
+                ):
+                    cookies[k] = v
 
     async def _refresh_web_session(self, credentials: dict[str, Any]) -> bool:
         """Refresh browser-session cookies inside the Colab job only (single-flight per credentials)."""
@@ -293,19 +329,19 @@ class DriveProvider(BaseProvider):
 
         async def _do_refresh() -> bool:
             try:
-                # Use isolated client so cookies from account A don't bleed into account B
-                async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                    for url, auth in (
-                        (f"{DRIVE_WEB_ORIGIN}/drive/my-drive", True),
-                        (f"{DRIVE_USERCONTENT}/auth_warmup", False),
+                # Use isolated client without auto-following redirects to accounts.google.com
+                async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+                    for url in (
+                        f"{DRIVE_WEB_ORIGIN}/drive/my-drive",
+                        f"{DRIVE_USERCONTENT}/auth_warmup",
                     ):
                         try:
                             resp = await self._send_request(
                                 client,
                                 "GET",
                                 url,
-                                headers=self._web_headers(credentials, auth=auth),
-                                follow_redirects=True,
+                                headers=self._web_headers(credentials, auth=False),
+                                follow_redirects=False,
                                 timeout=15.0,
                             )
                             self._update_cookies_from_response(credentials, resp)
@@ -313,19 +349,39 @@ class DriveProvider(BaseProvider):
                             pass
 
                     key = self._web_key(credentials)
+                    about_params: dict[str, str] = {"fields": "name,user(displayName,emailAddress),quotaBytesTotal,quotaBytesUsed"}
+                    if key:
+                        about_params["key"] = key
+                        about_params["$unique"] = "gc"
                     resp = await self._send_request(
                         client,
                         "GET",
                         f"{DRIVE_WEB_FILES_API}/about",
                         headers=self._web_headers(credentials),
-                        params={"key": key, "$unique": "gc"} if key else {},
+                        params=about_params,
+                        follow_redirects=False,
                         timeout=15.0,
                     )
                     self._update_cookies_from_response(credentials, resp)
                     resp_url = str(getattr(resp, "url", "") or "")
-                    if "accounts.google.com" in resp_url or "ServiceLogin" in resp_url:
+                    resp_headers = getattr(resp, "headers", {}) or {}
+                    loc_hdr = str(resp_headers.get("location") or resp_headers.get("Location") or "")
+                    if any(m in resp_url or m in loc_hdr for m in ("accounts.google.com", "ServiceLogin", "/signin/")):
                         return False
-                    return resp.status_code < 400
+                    if resp.status_code in (301, 302, 303, 307, 308) or resp.status_code >= 400:
+                        return False
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        data = None
+                    if isinstance(data, dict):
+                        if "error" in data:
+                            return False
+                        if "user" in data:
+                            return bool(data.get("user"))
+                        if not data or "importFormats" in data or "kind" in data:
+                            return False
+                    return True
             except Exception:
                 return False
 
@@ -347,11 +403,15 @@ class DriveProvider(BaseProvider):
         is_upload = "/upload/" in url
         params = dict(kwargs.pop("params", None) or {})
 
-        # Colab's v2internal/upload calls work cookie-bound; do not leak a
-        # captured frontend key there because older captures may be referrer-bound.
         key = self._web_key(credentials)
         host = str(httpx.URL(url).host or "")
-        if key and host != "clients6.google.com" and "key" not in params:
+        needs_key = (
+            not host
+            or host == "clients6.google.com"
+            or host.endswith(".clients6.google.com")
+            or host.endswith(".googleapis.com")
+        )
+        if key and needs_key and "key" not in params:
             params["key"] = key
             if not is_upload:
                 params.setdefault("$unique", "gc")
@@ -363,17 +423,24 @@ class DriveProvider(BaseProvider):
             body_lower = resp.text[:300].lower()
             is_key_error = any(m in body_lower for m in _API_KEY_ERROR_MARKERS)
 
-            # 1. If it looks like the API key is the problem, retry without it
+            # 1. If it looks like the API key is the problem, fallback to default key or retry without it
             if is_key_error and "key" in params:
-                params.pop("key", None)
-                params.pop("$unique", None)
+                if "api keys are not supported" in body_lower:
+                    params.pop("key", None)
+                    params.pop("$unique", None)
+                elif key != DRIVE_WEB_API_KEY:
+                    key = DRIVE_WEB_API_KEY
+                    params["key"] = key
+                else:
+                    params.pop("key", None)
+                    params.pop("$unique", None)
                 resp = await self._send_request(client, method, url, headers=headers, params=params, **kwargs)
                 self._update_cookies_from_response(credentials, resp)
                 if resp.status_code < 400:
                     return resp
 
             # Restore API key if needed
-            if key and "key" not in params:
+            if key and needs_key and "key" not in params and "api keys are not supported" not in body_lower:
                 params["key"] = key
                 if not is_upload:
                     params.setdefault("$unique", "gc")
@@ -389,10 +456,11 @@ class DriveProvider(BaseProvider):
                     return resp
 
             # 3. Autonomous self-refresh of web session cookies (renews SIDCC and session state)
+            session_ok = False
             for attempt in range(3):
                 if attempt:
                     await asyncio.sleep(1.0 * attempt)
-                await self._refresh_web_session(credentials)
+                session_ok = await self._refresh_web_session(credentials)
                 fresh_headers = self._web_headers(credentials, extra_headers)
                 fresh_headers.pop("X-Goog-Api-Key", None)
                 fresh_headers.pop("x-goog-api-key", None)
@@ -401,6 +469,12 @@ class DriveProvider(BaseProvider):
                 if resp.status_code < 400:
                     return resp
 
+            if resp.status_code == 403 and (session_ok or _is_rate_limit_or_transient_403(resp.text[:500])):
+                raise ProviderFailure(
+                    "UPLOAD_FAILED" if method != "GET" else "DOWNLOAD_FAILED",
+                    f"Drive web request rejected ({resp.status_code}): {resp.text[:300]}",
+                    {"status": resp.status_code},
+                )
             if resp.status_code in (401, 403):
                 raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked")
         if resp.status_code >= 400:
@@ -965,8 +1039,8 @@ class DriveProvider(BaseProvider):
                             offset = next_offset
                             break
                         if resp.status_code in (401, 403):
+                            session_ok = await self._refresh_web_session(credentials)
                             if attempt < 4:
-                                await self._refresh_web_session(credentials)
                                 await asyncio.sleep(min(2 ** attempt, 4))
                                 new_offset = await self._query_resumable_offset(client, credentials, session, size)
                                 if new_offset >= size:
@@ -978,6 +1052,8 @@ class DriveProvider(BaseProvider):
                                 if offset == 0:
                                     session = await new_session()
                                 continue
+                            if resp.status_code == 403 and (session_ok or _is_rate_limit_or_transient_403(resp.text[:500])):
+                                raise ProviderFailure("UPLOAD_FAILED", f"Drive web upload rejected ({resp.status_code}): {resp.text[:300]}", {"status": resp.status_code})
                             raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive web session expired or revoked")
                         if resp.status_code >= 500 or resp.status_code in (400, 404, 408, 410, 429):
                             if attempt < 4:
