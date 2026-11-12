@@ -376,6 +376,113 @@ def _is_local_part_valid(local_file: Path, expected_bytes: int | None = None) ->
     return True
 
 
+def _part_seg_range(cp: dict[str, Any]) -> tuple[int, int] | None:
+    """Extract (start_seg, end_seg) from a completed_parts entry if valid."""
+    s_raw = cp.get("start_seg")
+    e_raw = cp.get("end_seg")
+    if s_raw is None or e_raw is None:
+        return None
+    try:
+        s_idx = int(s_raw)
+        e_idx = int(e_raw)
+    except (TypeError, ValueError):
+        return None
+    if s_idx < 0 or e_idx < s_idx:
+        return None
+    return (s_idx, e_idx)
+
+
+def _part_seg_count(cp: dict[str, Any]) -> int:
+    """Return segment count for a part entry, preferring exact [start_seg..end_seg] span."""
+    rng = _part_seg_range(cp)
+    if rng is not None:
+        return rng[1] - rng[0] + 1
+    try:
+        return max(0, int(cp.get("segment_count") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _covered_segments_from_parts(completed_parts: list[dict[str, Any]]) -> set[int]:
+    """Return exact set of segment indices covered by completed_parts."""
+    covered: set[int] = set()
+    for cp in completed_parts:
+        rng = _part_seg_range(cp)
+        if rng is not None:
+            covered.update(range(rng[0], rng[1] + 1))
+    return covered
+
+
+def _count_synced_segments(
+    completed_parts: list[dict[str, Any]],
+    skipped_indices: list[int] | set[int] = (),
+    total_segments: int = 0,
+) -> int:
+    """Count unique covered + skipped segments accurately across non-contiguous parts."""
+    skip_set: set[int] = set()
+    for sk in skipped_indices:
+        try:
+            sk_i = int(sk)
+            if sk_i >= 0:
+                skip_set.add(sk_i)
+        except (TypeError, ValueError):
+            pass
+    if completed_parts and all(_part_seg_range(cp) is not None for cp in completed_parts):
+        all_cov = _covered_segments_from_parts(completed_parts) | skip_set
+        if total_segments > 0:
+            return sum(1 for idx in all_cov if 0 <= idx < total_segments)
+        return len(all_cov)
+    raw_sum = sum(_part_seg_count(cp) for cp in completed_parts) + len(skip_set)
+    return min(total_segments, raw_sum) if total_segments > 0 else raw_sum
+
+
+def _part_sort_key(cp: dict[str, Any]) -> tuple[int, int, int]:
+    """Sort parts chronologically by start_seg first (NOT part_index alone), preventing scrambled video when gap parts are filled later."""
+    rng = _part_seg_range(cp)
+    try:
+        p_idx = int(cp.get("part_index") or 0)
+    except (TypeError, ValueError):
+        p_idx = 0
+    if rng is not None:
+        return (rng[0], rng[1], p_idx)
+    return (p_idx * 1_000_000, p_idx * 1_000_000, p_idx)
+
+
+def _normalize_completed_parts(
+    parts: list[dict[str, Any]] | None,
+    valid_remote_names: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Deduplicate, optionally verify against remote files, normalize segment_count, and sort chronologically."""
+    seen_names: set[str] = set()
+    seen_ranges: set[tuple[int, int]] = set()
+    normalized: list[dict[str, Any]] = []
+    dropped_missing: list[str] = []
+    for raw_cp in parts or []:
+        if not isinstance(raw_cp, dict):
+            continue
+        fname = str(raw_cp.get("file_name") or "").strip()
+        if fname:
+            if valid_remote_names is not None and fname not in valid_remote_names:
+                dropped_missing.append(fname)
+                continue
+            if fname in seen_names:
+                continue
+        rng = _part_seg_range(raw_cp)
+        if rng is not None and rng in seen_ranges:
+            continue
+        cp_copy = dict(raw_cp)
+        if rng is not None:
+            cp_copy["start_seg"] = rng[0]
+            cp_copy["end_seg"] = rng[1]
+            cp_copy["segment_count"] = rng[1] - rng[0] + 1
+            seen_ranges.add(rng)
+        if fname:
+            seen_names.add(fname)
+        normalized.append(cp_copy)
+    normalized.sort(key=_part_sort_key)
+    return normalized, dropped_missing
+
+
 async def _find_and_load_best_manifest(
     provider: Any,
     creds: dict[str, Any],
@@ -386,8 +493,8 @@ async def _find_and_load_best_manifest(
     """
     Search all candidate _resume_manifest*.json files in remote items.
     If multiple exist (e.g. on Google Drive), download all candidates, evaluate their progress
-    (is_complete, last_synced_segment, completed_parts count), choose the latest/most complete,
-    and clean up the stale manifest files.
+    (is_complete, unique synced segments, completed_parts count, last_synced_segment), choose the
+    most complete, merge any disjoint verified parts from sibling manifests, and clean up stale files.
     """
     manifest_items = [
         it for it in items
@@ -425,6 +532,7 @@ async def _find_and_load_best_manifest(
     best_data: dict[str, Any] | None = None
     best_item: dict[str, Any] | None = None
     best_score: int = -1
+    parsed_candidates: list[dict[str, Any]] = []
 
     for idx, m_item in enumerate(manifest_items):
         cand_dl_dir = work_dir / f"_m_cand_{idx}"
@@ -439,10 +547,14 @@ async def _find_and_load_best_manifest(
                     try:
                         m_data = json.loads(actual_dl.read_text(encoding="utf-8"))
                         if isinstance(m_data, dict):
-                            parts_count = len(m_data.get("completed_parts") or [])
+                            parsed_candidates.append(m_data)
+                            cps = m_data.get("completed_parts") or []
+                            parts_count = len(cps)
+                            synced_segs = _count_synced_segments(cps, m_data.get("skipped_segments") or [])
                             last_seg = int(m_data.get("last_synced_segment") or -1)
-                            is_done = 1 if m_data.get("is_complete") else 0
-                            score = (is_done * 1_000_000_000) + (max(last_seg, 0) * 1_000) + parts_count
+                            tot_exp = int(m_data.get("total_segments_expected") or 0)
+                            is_done = 1 if (m_data.get("is_complete") and (tot_exp <= 0 or synced_segs >= tot_exp)) else 0
+                            score = (is_done * 1_000_000_000_000) + (synced_segs * 1_000_000) + (parts_count * 1_000) + max(last_seg, 0)
                             if score > best_score:
                                 best_score = score
                                 best_data = m_data
@@ -455,6 +567,39 @@ async def _find_and_load_best_manifest(
             shutil.rmtree(cand_dl_dir, ignore_errors=True)
 
     if best_data and best_item:
+        # Recover any disjoint part entries recorded in sibling manifests whose part_*.ts exists in items
+        actual_part_files = {
+            str(it.get("name") or "")
+            for it in items
+            if str(it.get("name") or "").startswith("part_") and str(it.get("name") or "").endswith(".ts")
+        }
+        if actual_part_files and len(parsed_candidates) > 1:
+            base_parts = list(best_data.get("completed_parts") or [])
+            known_names = {str(cp.get("file_name") or "") for cp in base_parts if isinstance(cp, dict)}
+            covered_now = _covered_segments_from_parts(base_parts)
+            recovered_count = 0
+            for cand in parsed_candidates:
+                if cand is best_data:
+                    continue
+                for cp in cand.get("completed_parts") or []:
+                    if not isinstance(cp, dict):
+                        continue
+                    fname = str(cp.get("file_name") or "")
+                    rng = _part_seg_range(cp)
+                    if not fname or fname in known_names or fname not in actual_part_files or rng is None:
+                        continue
+                    cand_span = set(range(rng[0], rng[1] + 1))
+                    if not (cand_span & covered_now):
+                        base_parts.append(dict(cp))
+                        known_names.add(fname)
+                        covered_now.update(cand_span)
+                        recovered_count += 1
+            if recovered_count > 0:
+                base_parts.sort(key=_part_sort_key)
+                best_data["completed_parts"] = base_parts
+                best_data["last_synced_segment"] = max((cp.get("end_seg", -1) for cp in base_parts), default=-1)
+                job.log(f"[Backup-Resume] Đã khôi phục thêm {recovered_count} part từ các bản ghi manifest song song!")
+
         p_len = len(best_data.get("completed_parts") or [])
         l_seg = best_data.get("last_synced_segment", -1)
         job.log(f"[Backup-Resume] Đã chọn Manifest chính xác nhất ({p_len} parts đã tải, last_seg={l_seg}). Tiến hành dọn dẹp các manifest cũ...")
@@ -789,6 +934,10 @@ async def _run_resumable_backup_pipeline_core(
     )
 
     folder_manifest_data: dict[str, Any] | None = None
+    src_backup_folder_id: str | None = None
+    src_listing_succeeded = False
+    src_remote_part_map: dict[str, dict[str, Any]] = {}
+    dst_remote_part_map: dict[str, dict[str, Any]] = {}
     backup_folder_id: str | None = None
     backup_folder_scope: tuple[str, str, str] = _live_account_key()
     completed_parts: list[dict[str, Any]] = []
@@ -802,7 +951,7 @@ async def _run_resumable_backup_pipeline_core(
             src_folder_id = src_folder_id[3:].strip()
         src_folder_name = PurePosixPath(file_item.get("name") or file_item.get("path") or "").name
         backup_folder_name = src_folder_name if src_folder_name.endswith("__backup_resume") else generate_backup_folder_name(src_folder_name)
-        backup_folder_id = src_folder_id
+        src_backup_folder_id = src_folder_id
         job_work_dir = dirs["input"] / f"backup_pipe_{safe_name(backup_folder_name)}"
         parts_local_dir = job_work_dir / "parts"
         segs_local_dir = job_work_dir / "segments"
@@ -814,10 +963,13 @@ async def _run_resumable_backup_pipeline_core(
         try:
             src_listing = await src_provider.list_files(source_creds, src_folder_id)
             items_found = src_listing.get("items") or []
+            if items_found:
+                src_listing_succeeded = True
             for it in items_found:
                 nm = str(it.get("name") or "")
                 if nm.startswith("part_") and nm.endswith(".ts"):
                     existing_remote_part_names.add(nm)
+                    src_remote_part_map[nm] = it
                     remote_part_map[nm] = it
             folder_manifest_data = await _find_and_load_best_manifest(src_provider, source_creds, items_found, job_work_dir, job)
             if not folder_manifest_data and target_folder and hasattr(src_provider, "list_files"):
@@ -825,13 +977,16 @@ async def _run_resumable_backup_pipeline_core(
                     parent_listing = await src_provider.list_files(source_creds, target_folder)
                     b_item = next((it for it in (parent_listing.get("items") or []) if it.get("name") == backup_folder_name and (it.get("type") == "folder" or it.get("is_folder"))), None)
                     if b_item:
-                        backup_folder_id = b_item.get("id") or b_item.get("path") or backup_folder_id
-                        src_listing = await src_provider.list_files(source_creds, backup_folder_id)
+                        src_backup_folder_id = b_item.get("id") or b_item.get("path") or src_backup_folder_id
+                        src_listing = await src_provider.list_files(source_creds, src_backup_folder_id)
                         items_found = src_listing.get("items") or []
+                        if items_found:
+                            src_listing_succeeded = True
                         for it in items_found:
                             nm = str(it.get("name") or "")
                             if nm.startswith("part_") and nm.endswith(".ts"):
                                 existing_remote_part_names.add(nm)
+                                src_remote_part_map[nm] = it
                                 remote_part_map[nm] = it
                         folder_manifest_data = await _find_and_load_best_manifest(src_provider, source_creds, items_found, job_work_dir, job)
                 except Exception:
@@ -939,17 +1094,65 @@ async def _run_resumable_backup_pipeline_core(
     skipped_segments_count = 0
 
     if folder_manifest_data:
-        completed_parts = folder_manifest_data.get("completed_parts") or []
+        raw_manifest_parts = folder_manifest_data.get("completed_parts") or []
+        valid_src_names = set(src_remote_part_map.keys()) if src_listing_succeeded else None
+        prelim_parts, missing_in_src = _normalize_completed_parts(raw_manifest_parts, valid_remote_names=valid_src_names)
+
+        # If any manifest part is missing from source folder, check if it already exists in destination backup folder
+        if missing_in_src and hasattr(_live_dst_provider(), "list_files"):
+            try:
+                from .transfer_job import wait_for_retry_gate
+                await wait_for_retry_gate(job)
+                live_dst_chk = _live_dst_provider()
+                live_creds_chk = _live_target_creds()
+                live_folder_chk = _live_target_folder()
+                dst_root_listing = await live_dst_chk.list_files(live_creds_chk, live_folder_chk)
+                dst_b_item = next(
+                    (
+                        it for it in (dst_root_listing.get("items") or [])
+                        if it.get("name") == backup_folder_name and (it.get("type") == "folder" or it.get("is_folder"))
+                    ),
+                    None,
+                )
+                if dst_b_item:
+                    backup_folder_id = dst_b_item.get("id") or dst_b_item.get("path")
+                    backup_folder_scope = _live_account_key()
+                    dst_parts_listing = await live_dst_chk.list_files(live_creds_chk, backup_folder_id)
+                    for it in dst_parts_listing.get("items") or []:
+                        nm = str(it.get("name") or "")
+                        if nm.startswith("part_") and nm.endswith(".ts"):
+                            existing_remote_part_names.add(nm)
+                            dst_remote_part_map[nm] = it
+                            remote_part_map.setdefault(nm, it)
+            except Exception:
+                pass
+            combined_valid_names = (set(src_remote_part_map.keys()) | set(dst_remote_part_map.keys())) if src_listing_succeeded else None
+            prelim_parts, missing_in_src = _normalize_completed_parts(raw_manifest_parts, valid_remote_names=combined_valid_names)
+
+        if missing_in_src:
+            missing_preview = ", ".join(missing_in_src[:5])
+            job.log(f"[Resume-Manifest] Phát hiện {len(missing_in_src)} part ghi trong manifest nhưng không có trên Cloud ({missing_preview}) — sẽ tải bù!")
+
+        completed_parts = prelim_parts
         last_synced_seg = max((cp.get("end_seg", -1) for cp in completed_parts), default=-1)
-        existing_remote_part_names.update(cp.get("file_name") for cp in completed_parts if cp.get("file_name"))
+        if not src_listing_succeeded:
+            existing_remote_part_names.update(cp.get("file_name") for cp in completed_parts if cp.get("file_name"))
         for sk in folder_manifest_data.get("skipped_segments") or []:
             if sk not in skipped_segment_indices:
                 skipped_segment_indices.append(sk)
         skipped_segments_count = len(skipped_segment_indices)
         total_segments_expected = int(folder_manifest_data.get("total_segments_expected") or 0)
+        synced_manifest_segs = _count_synced_segments(completed_parts, skipped_segment_indices, total_segments_expected)
         is_already_complete = (
-            folder_manifest_data.get("is_complete") is True
-            or (total_segments_expected > 0 and (sum(cp.get("segment_count", 0) for cp in completed_parts) + skipped_segments_count) >= total_segments_expected)
+            not missing_in_src
+            and bool(completed_parts)
+            and (
+                (
+                    folder_manifest_data.get("is_complete") is True
+                    and (total_segments_expected <= 0 or synced_manifest_segs >= total_segments_expected)
+                )
+                or (total_segments_expected > 0 and synced_manifest_segs >= total_segments_expected)
+            )
         )
     else:
         is_already_complete = False
@@ -1184,62 +1387,97 @@ async def _run_resumable_backup_pipeline_core(
             live_dst = _live_dst_provider()
             live_creds = _live_target_creds()
             live_folder = _live_target_folder()
-            remote_files = await live_dst.list_files(live_creds, live_folder)
-            sub_items = remote_files.get("items") or []
-            backup_item = next((it for it in sub_items if (it.get("name") == backup_folder_name and (it.get("type") == "folder" or it.get("is_folder")))), None)
-            if backup_item:
-                backup_folder_id = backup_item.get("id") or backup_item.get("path")
-                backup_folder_scope = _live_account_key()
-                parts_listing = await live_dst.list_files(live_creds, backup_folder_id)
-                sub_parts = parts_listing.get("items") or []
-                for it in sub_parts:
-                    name = str(it.get("name") or "")
-                    if name.startswith("part_") and name.endswith(".ts"):
-                        existing_remote_part_names.add(name)
-                        remote_part_map[name] = it
-                job.log(f"[Backup-Resume] Phát hiện thư mục backup từ xa: {len(existing_remote_part_names)} part(s) đã upload trước đó.")
+            if hasattr(live_dst, "list_files"):
+                remote_files = await live_dst.list_files(live_creds, live_folder)
+                sub_items = remote_files.get("items") or []
+                backup_item = next((it for it in sub_items if (it.get("name") == backup_folder_name and (it.get("type") == "folder" or it.get("is_folder")))), None)
+                if backup_item:
+                    backup_folder_id = backup_item.get("id") or backup_item.get("path")
+                    backup_folder_scope = _live_account_key()
+                    parts_listing = await live_dst.list_files(live_creds, backup_folder_id)
+                    sub_parts = parts_listing.get("items") or []
+                    for it in sub_parts:
+                        name = str(it.get("name") or "")
+                        if name.startswith("part_") and name.endswith(".ts"):
+                            existing_remote_part_names.add(name)
+                            dst_remote_part_map[name] = it
+                            remote_part_map[name] = it
+                    job.log(f"[Backup-Resume] Phát hiện thư mục backup từ xa: {len(existing_remote_part_names)} part(s) đã upload trước đó.")
 
-                # Try to restore state from manifest first (most accurate for variable-size parts)
-                manifest_loaded = bool(folder_manifest_data)
-                if not manifest_loaded:
-                    try:
-                        manifest_data = await _find_and_load_best_manifest(live_dst, live_creds, sub_parts, job_work_dir, job)
-                        if manifest_data:
-                            for cp in manifest_data.get("completed_parts") or []:
-                                p_name = cp.get("file_name") or ""
-                                if p_name in existing_remote_part_names:
-                                    completed_parts.append(cp)
-                                    last_synced_seg = max(last_synced_seg, cp.get("end_seg", -1))
-                            for sk in manifest_data.get("skipped_segments") or []:
-                                if sk not in skipped_segment_indices:
-                                    skipped_segment_indices.append(sk)
-                            skipped_segments_count = len(skipped_segment_indices)
-                            manifest_loaded = True
-                            skip_txt = f", {skipped_segments_count} segment đã bỏ qua" if skipped_segments_count > 0 else ""
-                            job.log(f"[Resume-Manifest] Đọc manifest thành công: {len(completed_parts)} part xác nhận{skip_txt}.")
-                    except Exception as exc:
-                        job.log(f"[Resume-Manifest] Không thể đọc manifest, dùng file listing thay thế: {exc}")
+                    # Try to restore state from manifest first (most accurate for variable-size parts)
+                    manifest_loaded = bool(folder_manifest_data)
+                    if not manifest_loaded:
+                        try:
+                            manifest_data = await _find_and_load_best_manifest(live_dst, live_creds, sub_parts, job_work_dir, job)
+                            if manifest_data:
+                                norm_dst_parts, _ = _normalize_completed_parts(
+                                    manifest_data.get("completed_parts") or [],
+                                    valid_remote_names=existing_remote_part_names,
+                                )
+                                completed_parts.extend(norm_dst_parts)
+                                completed_parts, _ = _normalize_completed_parts(completed_parts)
+                                last_synced_seg = max((cp.get("end_seg", -1) for cp in completed_parts), default=-1)
+                                for sk in manifest_data.get("skipped_segments") or []:
+                                    if sk not in skipped_segment_indices:
+                                        skipped_segment_indices.append(sk)
+                                skipped_segments_count = len(skipped_segment_indices)
+                                manifest_loaded = True
+                                skip_txt = f", {skipped_segments_count} segment đã bỏ qua" if skipped_segments_count > 0 else ""
+                                job.log(f"[Resume-Manifest] Đọc manifest thành công: {len(completed_parts)} part xác nhận{skip_txt}.")
+                        except Exception as exc:
+                            job.log(f"[Resume-Manifest] Không thể đọc manifest, dùng file listing thay thế: {exc}")
+                    elif backup_folder_id and backup_folder_id != src_backup_folder_id:
+                        # Cross-folder/account resume: merge any additional verified parts from target's manifest
+                        try:
+                            dst_manifest_data = await _find_and_load_best_manifest(live_dst, live_creds, sub_parts, job_work_dir, job)
+                            if dst_manifest_data:
+                                cur_cov = _covered_segments_from_parts(completed_parts)
+                                cur_names = {str(cp.get("file_name") or "") for cp in completed_parts}
+                                merged_extra = 0
+                                for cp in dst_manifest_data.get("completed_parts") or []:
+                                    p_name = str(cp.get("file_name") or "")
+                                    rng = _part_seg_range(cp)
+                                    if p_name and p_name not in cur_names and p_name in existing_remote_part_names and rng is not None:
+                                        span = set(range(rng[0], rng[1] + 1))
+                                        if not (span & cur_cov):
+                                            completed_parts.append(dict(cp))
+                                            cur_names.add(p_name)
+                                            cur_cov.update(span)
+                                            merged_extra += 1
+                                for sk in dst_manifest_data.get("skipped_segments") or []:
+                                    if sk not in skipped_segment_indices:
+                                        skipped_segment_indices.append(sk)
+                                skipped_segments_count = len(skipped_segment_indices)
+                                if merged_extra > 0:
+                                    completed_parts, _ = _normalize_completed_parts(completed_parts)
+                                    last_synced_seg = max((cp.get("end_seg", -1) for cp in completed_parts), default=-1)
+                                    job.log(f"[Resume-Manifest] Hợp nhất thêm {merged_extra} part đã có sẵn trên thư mục đích!")
+                        except Exception:
+                            pass
 
-                # Fallback: infer from file listing if manifest unavailable or empty
-                if not manifest_loaded and not completed_parts:
-                    num_parts = (total_segments + chunk_segments - 1) // chunk_segments
-                    for p_idx in range(1, num_parts + 1):
-                        p_name = f"part_{p_idx:04d}.ts"
-                        start_seg = (p_idx - 1) * chunk_segments
-                        end_seg = min(p_idx * chunk_segments - 1, total_segments - 1)
-                        if p_name in existing_remote_part_names:
-                            completed_parts.append({
-                                "part_index": p_idx,
-                                "file_name": p_name,
-                                "start_seg": start_seg,
-                                "end_seg": end_seg,
-                                "segment_count": end_seg - start_seg + 1,
-                            })
-                            last_synced_seg = max(last_synced_seg, end_seg)
+                    # Fallback: infer from file listing if manifest unavailable or empty
+                    if not manifest_loaded and not completed_parts:
+                        num_parts = (total_segments + chunk_segments - 1) // chunk_segments
+                        for p_idx in range(1, num_parts + 1):
+                            p_name = f"part_{p_idx:04d}.ts"
+                            start_seg = (p_idx - 1) * chunk_segments
+                            end_seg = min(p_idx * chunk_segments - 1, total_segments - 1)
+                            if p_name in existing_remote_part_names:
+                                completed_parts.append({
+                                    "part_index": p_idx,
+                                    "file_name": p_name,
+                                    "start_seg": start_seg,
+                                    "end_seg": end_seg,
+                                    "segment_count": end_seg - start_seg + 1,
+                                })
+                                last_synced_seg = max(last_synced_seg, end_seg)
         except Exception as exc:
             job.log(f"[Backup-Resume] Lưu ý: Kiểm tra remote backup: {exc}")
     else:
-        total_segments = int(folder_manifest_data.get("total_segments_expected") or sum(cp.get("segment_count", 0) for cp in completed_parts))
+        total_segments = int(
+            folder_manifest_data.get("total_segments_expected")
+            or _count_synced_segments(completed_parts, skipped_segment_indices)
+        )
         job.log(f"[Backup-Resume] Toàn bộ {total_segments} segments đã có đủ trên Cloud đích! Tiến hành ghép hoàn chỉnh: {final_video_name}...")
 
     # Evaluate disk space & merge feasibility (Space-Saver for Kaggle / low-disk)
@@ -1264,10 +1502,32 @@ async def _run_resumable_backup_pipeline_core(
             f"Bỏ qua bước ghép video (Final Assembly) trên runtime để chống tràn bộ nhớ (Errno 28)."
         )
 
+    # Compute exact segment coverage across all verified parts (supporting non-contiguous / out-of-order parts)
+    covered_by_parts = _covered_segments_from_parts(completed_parts)
+    if completed_parts and not covered_by_parts and last_synced_seg >= 0:
+        covered_by_parts = set(range(0, last_synced_seg + 1))
+    covered_all_segments = covered_by_parts | {int(sk) for sk in skipped_segment_indices if isinstance(sk, int) or str(sk).isdigit()}
+    remaining_segments: list[dict[str, Any]] = (
+        []
+        if is_already_complete
+        else [s for s in all_segments if s["index"] not in covered_all_segments]
+    )
+
     if completed_parts:
         remote_list_summary = ", ".join(sorted(existing_remote_part_names)) if len(existing_remote_part_names) <= 5 else f"{len(existing_remote_part_names)} parts"
         job.log(f"[Trace] Đã phát hiện {len(existing_remote_part_names)} part(s) trên Cloud đích ({remote_list_summary}). Bỏ qua {len(completed_parts)} part đã hoàn thành.")
-        job.log(f"[Resume-Hit] Khôi phục phiên! Bỏ qua {len(completed_parts)} part đã có. Tiếp tục từ segment {last_synced_seg + 1}/{total_segments}")
+        if is_already_complete or not remaining_segments:
+            job.log(f"[Resume-Hit] Khôi phục phiên! Toàn bộ {len(completed_parts)} part ({total_segments}/{total_segments} segments) đã có đủ trên Cloud — chuyển sang ghép file!")
+        else:
+            first_missing_seg = remaining_segments[0]["index"]
+            if first_missing_seg <= last_synced_seg:
+                synced_now = _count_synced_segments(completed_parts, skipped_segment_indices, total_segments)
+                job.log(
+                    f"[Resume-Hit] Khôi phục phiên! Giữ nguyên {len(completed_parts)} part đã có ({synced_now}/{total_segments} segments). "
+                    f"Phát hiện {len(remaining_segments)} segment bị khuyết giữa chừng (từ segment {first_missing_seg}/{total_segments}) — tiến hành tải bù!"
+                )
+            else:
+                job.log(f"[Resume-Hit] Khôi phục phiên! Bỏ qua {len(completed_parts)} part đã có. Tiếp tục từ segment {first_missing_seg}/{total_segments}")
     else:
         job.log("[Backup-Resume] Bắt đầu phiên mới từ segment 0.")
 
@@ -1282,7 +1542,7 @@ async def _run_resumable_backup_pipeline_core(
     accumulated_bytes = 0
     total_downloaded_segs = 0
     session_downloaded_bytes = 0
-    initial_synced_segs = sum(cp.get("segment_count", 0) for cp in completed_parts)
+    initial_synced_segs = len(covered_by_parts) if covered_by_parts else sum(_part_seg_count(cp) for cp in completed_parts)
     initial_synced_bytes = sum(cp.get("bytes", 0) for cp in completed_parts)
     in_flight_part_names: list[str] = []
     est_parts_total = max(len(completed_parts), (total_segments + max(1, chunk_segments) - 1) // max(1, chunk_segments)) if total_segments > 0 else 0
@@ -1359,7 +1619,8 @@ async def _run_resumable_backup_pipeline_core(
     async def _upload_manifest() -> None:
         """Build and upload _resume_manifest.json to remote backup folder (with replace)."""
         async with manifest_lock:
-            is_done = ((sum(cp.get("segment_count", 0) for cp in completed_parts) + len(skipped_segment_indices)) >= total_segments) if total_segments else False
+            synced_for_manifest = _count_synced_segments(completed_parts, skipped_segment_indices, total_segments)
+            is_done = (synced_for_manifest >= total_segments) if total_segments else False
             manifest = {
                 "version": 1,
                 "transfer_strategy": "backup_resume",
@@ -1376,7 +1637,7 @@ async def _run_resumable_backup_pipeline_core(
                 "chunk_and_mode": chunk_and_mode,
                 "chunk_condition_mode": "and" if chunk_and_mode else "or",
                 "total_segments_expected": total_segments,
-                "completed_parts": sorted(completed_parts, key=lambda x: x["part_index"]),
+                "completed_parts": sorted(completed_parts, key=_part_sort_key),
                 "last_synced_segment": max((cp["end_seg"] for cp in completed_parts), default=-1),
                 "skipped_segments": list(skipped_segment_indices),
                 "skipped_segments_count": len(skipped_segment_indices),
@@ -1608,6 +1869,7 @@ async def _run_resumable_backup_pipeline_core(
             current_part=in_flight_part_names[-1] if in_flight_part_names else "",
         )
         if isinstance(res, dict):
+            dst_remote_part_map[p_name] = res
             remote_part_map[p_name] = res
 
         # Tối ưu giữ lại các file part cục bộ chỉ khi đủ không gian đĩa an toàn cho toàn bộ video + merge
@@ -1628,8 +1890,7 @@ async def _run_resumable_backup_pipeline_core(
         await _upload_manifest()
 
     if not is_already_complete:
-        # Filter segments that need downloading
-        remaining_segments = [s for s in all_segments if s["index"] > last_synced_seg]
+        # Filter segments that need downloading (gap-aware across all covered + skipped segments)
         total_remaining = len(remaining_segments)
 
         if total_remaining > 0:
@@ -1649,7 +1910,7 @@ async def _run_resumable_backup_pipeline_core(
             or ""
         ).strip()
         try:
-            for seg in remaining_segments:
+            for rem_pos, seg in enumerate(remaining_segments):
                 job.check_cancelled()
                 if getattr(job, "_waiting_for_account", False) and active_upload_tasks:
                     done_set, _ = await asyncio.wait(active_upload_tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -1819,21 +2080,32 @@ async def _run_resumable_backup_pipeline_core(
                         size=max(bytes_now, est_total_now),
                     )
 
-                # Progress logging every 50 segments
-                if (total_downloaded_segs + skipped_segments_count) % 50 == 0 or seg["index"] == total_segments - 1:
-                    pct = (last_synced_seg + 1 + total_downloaded_segs + skipped_segments_count) * 100 // total_segments
+                # Progress logging every 50 segments or at end of remaining queue
+                is_last_rem = (rem_pos == len(remaining_segments) - 1)
+                if (total_downloaded_segs + skipped_segments_count) % 50 == 0 or seg["index"] == total_segments - 1 or is_last_rem:
+                    done_segs_log = min(total_segments, initial_synced_segs + total_downloaded_segs + skipped_segments_count)
+                    pct = done_segs_log * 100 // max(1, total_segments)
                     skip_info = f", {skipped_segments_count} skipped" if skipped_segments_count > 0 else ""
-                    job.log(f"[Download] {last_synced_seg + 1 + total_downloaded_segs + skipped_segments_count}/{total_segments} segments ({pct}%{skip_info}) | {accumulated_bytes // (1024*1024)} MB tích lũy")
+                    job.log(f"[Download] {done_segs_log}/{total_segments} segments ({pct}%{skip_info}) | {accumulated_bytes // (1024*1024)} MB tích lũy")
 
-                # Check threshold trigger (OR by default: either condition met; AND when chunk_and_mode is enabled: both conditions must be met)
+                # Check threshold trigger (OR by default; AND when chunk_and_mode is enabled) + gap boundary trigger
                 hit_seg_threshold = len(cur_batch_segments) >= chunk_segments
                 hit_mb_threshold = accumulated_bytes >= (chunk_mb * 1024 * 1024)
                 is_last_seg = (seg["index"] == total_segments - 1)
+                next_rem_idx = remaining_segments[rem_pos + 1]["index"] if (rem_pos + 1) < len(remaining_segments) else None
+                is_gap_span_end = (
+                    next_rem_idx is None
+                    or any(mid_idx in covered_by_parts for mid_idx in range(seg["index"] + 1, next_rem_idx))
+                )
                 hit_chunk_threshold = (hit_seg_threshold and hit_mb_threshold) if chunk_and_mode else (hit_seg_threshold or hit_mb_threshold)
 
-                if (hit_chunk_threshold or is_last_seg) and cur_batch_segments:
-                    # Determine part index — skip indices already used by completed parts
-                    while any(cp["part_index"] == part_idx for cp in completed_parts):
+                if (hit_chunk_threshold or is_last_seg or is_gap_span_end) and cur_batch_segments:
+                    # Determine part index — skip indices/filenames already used by completed, remote, or in-flight parts
+                    while (
+                        any(cp.get("part_index") == part_idx for cp in completed_parts)
+                        or f"part_{part_idx:04d}.ts" in existing_remote_part_names
+                        or f"part_{part_idx:04d}.ts" in in_flight_part_names
+                    ):
                         part_idx += 1
 
                     part_name = f"part_{part_idx:04d}.ts"
@@ -1899,7 +2171,11 @@ async def _run_resumable_backup_pipeline_core(
                         max_inflight_parts = 1 if getattr(job, "_waiting_for_account", False) else 2
 
             if cur_batch_segments:
-                while any(cp["part_index"] == part_idx for cp in completed_parts):
+                while (
+                    any(cp.get("part_index") == part_idx for cp in completed_parts)
+                    or f"part_{part_idx:04d}.ts" in existing_remote_part_names
+                    or f"part_{part_idx:04d}.ts" in in_flight_part_names
+                ):
                     part_idx += 1
 
                 part_name = f"part_{part_idx:04d}.ts"
@@ -1951,7 +2227,8 @@ async def _run_resumable_backup_pipeline_core(
 
 
     # 4. Check if all segments are covered before Final Assembly
-    total_synced = sum(cp.get("segment_count", 0) for cp in completed_parts) + len(skipped_segment_indices)
+    completed_parts, _ = _normalize_completed_parts(completed_parts)
+    total_synced = _count_synced_segments(completed_parts, skipped_segment_indices, total_segments)
     if not completed_parts:
         raise ProviderFailure("DOWNLOAD_FAILED", "Không có segment nào tải thành công (toàn bộ segment bị lỗi hoặc bị bỏ qua).")
     if total_synced < total_segments:
@@ -2004,8 +2281,8 @@ async def _run_resumable_backup_pipeline_core(
     job.log(f"[Final-Assembly] Hoàn tất 100% segments ({total_segments} segments{skipped_str})! Bắt đầu ghép file hoàn chỉnh: {final_video_name}...")
     final_output_path = job_work_dir / final_video_name
 
-    # Download missing local parts for final concat
-    completed_parts.sort(key=lambda x: x["part_index"])
+    # Sort chronologically by start_seg (critical when gap-fill parts were uploaded with higher part_index)
+    completed_parts.sort(key=_part_sort_key)
     concat_list_file = job_work_dir / "concat_parts.txt"
     concat_lines = []
 
@@ -2057,16 +2334,29 @@ async def _run_resumable_backup_pipeline_core(
 
     # If there are missing parts, ensure we have fresh remote items to download from
     if missing_parts:
-        bf_id = backup_folder_id if is_backup_folder_input else await _resolve_backup_folder_id()
-        if bf_id:
+        if is_src_parts and src_backup_folder_id and hasattr(src_provider, "list_files"):
             try:
-                fresh_listing = await parts_provider.list_files(parts_creds, bf_id)
-                for it in fresh_listing.get("items") or []:
+                fresh_src_listing = await src_provider.list_files(source.get("credentials") or {}, src_backup_folder_id)
+                for it in fresh_src_listing.get("items") or []:
                     fn = str(it.get("name") or "")
                     if fn.startswith("part_") and fn.endswith(".ts"):
+                        src_remote_part_map[fn] = it
                         remote_part_map[fn] = it
             except Exception:
                 pass
+        need_dst_lookup = (not is_src_parts) or any(cp["file_name"] not in src_remote_part_map for cp in missing_parts)
+        if need_dst_lookup and hasattr(_live_dst_provider(), "list_files"):
+            dst_bf_id = await _resolve_backup_folder_id()
+            if dst_bf_id:
+                try:
+                    fresh_dst_listing = await _live_dst_provider().list_files(_live_target_creds(), dst_bf_id)
+                    for it in fresh_dst_listing.get("items") or []:
+                        fn = str(it.get("name") or "")
+                        if fn.startswith("part_") and fn.endswith(".ts"):
+                            dst_remote_part_map[fn] = it
+                            remote_part_map[fn] = it
+                except Exception:
+                    pass
 
     for cp in completed_parts:
         p_name = cp["file_name"]
@@ -2074,21 +2364,30 @@ async def _run_resumable_backup_pipeline_core(
         exp_bytes = cp.get("bytes")
         if not _is_local_part_valid(local_p, exp_bytes):
             size_mb = (exp_bytes or 0) / (1024 * 1024)
-            job.log(f"[Final-Assembly] Tải phân đoạn còn thiếu từ {provider_label}: {p_name} ({size_mb:.1f} MB)...")
-            part_remote_item = remote_part_map.get(p_name) or {
-                "name": p_name,
-                "path": f"{backup_folder_name}/{p_name}",
-                "relative_path": f"{backup_folder_name}/{p_name}",
-            }
+            use_dst_for_part = (not is_src_parts) or (p_name not in src_remote_part_map and p_name in dst_remote_part_map)
+            cur_part_label = "Cloud đích" if use_dst_for_part else provider_label
+            job.log(f"[Final-Assembly] Tải phân đoạn còn thiếu từ {cur_part_label}: {p_name} ({size_mb:.1f} MB)...")
+            part_remote_item = (
+                (dst_remote_part_map.get(p_name) if use_dst_for_part else src_remote_part_map.get(p_name))
+                or remote_part_map.get(p_name)
+                or {
+                    "name": p_name,
+                    "path": f"{backup_folder_name}/{p_name}",
+                    "relative_path": f"{backup_folder_name}/{p_name}",
+                }
+            )
             part_downloaded = False
             for part_dl_attempt in range(5):
                 try:
-                    if not is_src_parts:
+                    if use_dst_for_part:
                         from .transfer_job import wait_for_retry_gate
                         await wait_for_retry_gate(job)
-                        parts_provider = _live_dst_provider()
-                        parts_creds = _live_target_creds()
-                    await parts_provider.download_file(parts_creds, part_remote_item, parts_local_dir, job)
+                        dl_prov = _live_dst_provider()
+                        dl_creds = _live_target_creds()
+                    else:
+                        dl_prov = src_provider
+                        dl_creds = source.get("credentials") or {}
+                    await dl_prov.download_file(dl_creds, part_remote_item, parts_local_dir, job)
                     if not local_p.is_file():
                         candidates = list(parts_local_dir.glob(f"*{p_name}*"))
                         if candidates:
@@ -2098,10 +2397,13 @@ async def _run_resumable_backup_pipeline_core(
                         break
                 except Exception as p_err:
                     job.log(f"[Final-Assembly] Tải lại part {p_name} lần {part_dl_attempt + 1}/5 thất bại: {p_err}")
+                    if not use_dst_for_part and p_name in dst_remote_part_map:
+                        use_dst_for_part = True
+                        part_remote_item = dst_remote_part_map[p_name]
                     await asyncio.sleep(2.0 * (part_dl_attempt + 1))
 
             if not part_downloaded or not local_p.is_file() or local_p.stat().st_size <= 0:
-                raise ProviderFailure("DOWNLOAD_FAILED", f"Không thể tải lại part {p_name} từ {provider_label}")
+                raise ProviderFailure("DOWNLOAD_FAILED", f"Không thể tải lại part {p_name} từ {cur_part_label}")
             job.log(f"[Final-Assembly] Tải thành công part: {p_name}")
         else:
             size_mb = local_p.stat().st_size / (1024 * 1024)
@@ -2218,7 +2520,7 @@ async def _run_resumable_backup_pipeline_core(
             clean_provider = src_provider if is_src_clean else _live_dst_provider()
             clean_creds = (source.get("credentials") or {}) if is_src_clean else _live_target_creds()
             clean_folder = target_folder if is_src_clean else _live_target_folder()
-            clean_bf_id = backup_folder_id if is_src_clean else (await _resolve_backup_folder_id())
+            clean_bf_id = src_backup_folder_id if is_src_clean else (await _resolve_backup_folder_id())
             job.log(f"[Cleanup] Tự động dọn dẹp thư mục phân mảnh tạm trên {'Cloud nguồn' if is_src_clean else 'Cloud đích'}: {backup_folder_name}...")
             target_base = str(clean_folder or "/").rstrip("/")
             del_path = (str(file_item.get("path") or "") if is_src_clean else "") or f"{target_base}/{backup_folder_name}"
@@ -2232,6 +2534,26 @@ async def _run_resumable_backup_pipeline_core(
                 await clean_provider.delete_item(clean_creds, del_ref)
             elif hasattr(clean_provider, "delete_file"):
                 await clean_provider.delete_file(clean_creds, del_ref)
+
+            # If cross-folder/account resume also created a backup folder on target, clean it up too
+            if is_src_clean and backup_folder_id and (backup_folder_id != src_backup_folder_id or _live_dst_provider() is not src_provider):
+                try:
+                    await wait_for_retry_gate(job)
+                    dst_clean_prov = _live_dst_provider()
+                    dst_clean_creds = _live_target_creds()
+                    dst_base = str(_live_target_folder() or "/").rstrip("/")
+                    dst_del_ref = {
+                        "id": backup_folder_id,
+                        "path": f"{dst_base}/{backup_folder_name}",
+                        "name": backup_folder_name,
+                        "type": "folder",
+                    }
+                    if hasattr(dst_clean_prov, "delete_item"):
+                        await dst_clean_prov.delete_item(dst_clean_creds, dst_del_ref)
+                    elif hasattr(dst_clean_prov, "delete_file"):
+                        await dst_clean_prov.delete_file(dst_clean_creds, dst_del_ref)
+                except Exception:
+                    pass
         except Exception as e:
             job.log(f"[Cleanup] Ghi chú dọn dẹp: {e}")
 
