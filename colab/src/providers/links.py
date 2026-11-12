@@ -221,9 +221,162 @@ class LinksProvider(BaseProvider):
         """Return a SOCKS5 URL with IsolateSOCKSAuth credentials so a download and its token resolution share one dedicated exit IP."""
         if not proxy:
             return None
-        if "127.0.0.1:9050" in proxy and circuit_tag:
-            return f"socks5://vb_{circuit_tag}:pass@127.0.0.1:9050"
+        if circuit_tag:
+            m_tor = re.search(r"127\.0\.0\.1:(905\d)\b", str(proxy))
+            if m_tor:
+                return f"socks5://vb_{circuit_tag}:pass@127.0.0.1:{m_tor.group(1)}"
         return proxy
+
+    _TOR_TURBO_EXTRA_PORTS: tuple[int, ...] = (9051, 9052, 9053)
+    _tor_turbo_daemons: list[str] = []
+    _mega_direct_cooldown_until: float = 0.0
+    _mega_direct_notice_ts: float = 0.0
+
+    async def _ensure_mega_tor_pool(self, progress: JobState | None = None) -> list[str]:
+        """Ensure primary Tor proxy plus up to 3 extra independent Tor daemons (ports 9050-9053) for multi-core parallel throughput."""
+        base_px = await self._ensure_tor_proxy(progress)
+        if not base_px:
+            return []
+        if not sys.platform.startswith("linux") or "127.0.0.1:9050" not in str(base_px) or not shutil.which("tor"):
+            return [base_px]
+
+        import socket
+        from ..providers.base import _loop_store
+
+        def _port_open(port: int) -> bool:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.6):
+                    return True
+            except Exception:
+                return False
+
+        if len(type(self)._tor_turbo_daemons) >= 1 + len(self._TOR_TURBO_EXTRA_PORTS) and all(
+            _port_open(p) for p in (9050, *self._TOR_TURBO_EXTRA_PORTS)
+        ):
+            return list(type(self)._tor_turbo_daemons)
+
+        locks = _loop_store("mega_tor_locks")
+        lock = locks.get("pool_init")
+        if lock is None:
+            lock = locks["pool_init"] = asyncio.Lock()
+
+        async with lock:
+            if len(type(self)._tor_turbo_daemons) >= 1 + len(self._TOR_TURBO_EXTRA_PORTS) and all(
+                _port_open(p) for p in (9050, *self._TOR_TURBO_EXTRA_PORTS)
+            ):
+                return list(type(self)._tor_turbo_daemons)
+
+            def _spawn_extra_daemons() -> None:
+                cache_src = Path("/var/lib/tor")
+                cache_names = (
+                    "cached-certs",
+                    "cached-microdesc-consensus",
+                    "cached-microdescs",
+                    "cached-microdescs.new",
+                )
+                for port in self._TOR_TURBO_EXTRA_PORTS:
+                    if _port_open(port):
+                        continue
+                    try:
+                        data_dir = Path(f"/tmp/vb_tor_{port}")
+                        data_dir.mkdir(parents=True, exist_ok=True)
+                        os.chmod(data_dir, 0o700)
+                        if cache_src.is_dir():
+                            for cname in cache_names:
+                                src_f = cache_src / cname
+                                dst_f = data_dir / cname
+                                if src_f.is_file() and not dst_f.exists():
+                                    try:
+                                        shutil.copyfile(src_f, dst_f)
+                                        os.chmod(dst_f, 0o600)
+                                    except Exception:
+                                        pass
+                        torrc_f = data_dir / "torrc"
+                        torrc_f.write_text(
+                            f"DataDirectory {data_dir}\n"
+                            f"PidFile {data_dir}/tor.pid\n"
+                            f"SocksPort 127.0.0.1:{port} IsolateSOCKSAuth KeepAliveIsolateSOCKSAuth\n"
+                            "ConnLimit 4096\n"
+                            "NumEntryGuards 8\n"
+                            "CircuitBuildTimeout 10\n"
+                            "LearnCircuitBuildTimeout 0\n"
+                            "MaxCircuitDirtiness 7200\n"
+                            "CircuitStreamTimeout 30\n"
+                            "RunAsDaemon 1\n",
+                            encoding="utf-8",
+                        )
+                        subprocess.run(
+                            ["tor", "-f", str(torrc_f)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=10,
+                        )
+                    except Exception:
+                        pass
+
+            await asyncio.to_thread(_spawn_extra_daemons)
+
+            for _ in range(12):
+                if all(_port_open(p) for p in self._TOR_TURBO_EXTRA_PORTS):
+                    break
+                await asyncio.sleep(0.4)
+
+            active_ports = [9050] + [p for p in self._TOR_TURBO_EXTRA_PORTS if _port_open(p)]
+            daemons = [f"socks5://127.0.0.1:{p}" for p in active_ports]
+            prev_count = len(type(self)._tor_turbo_daemons)
+            type(self)._tor_turbo_daemons = daemons
+            if progress and len(daemons) > 1 and prev_count <= 1:
+                progress.log(f"[Proxy] Tor Turbo pool active ({len(daemons)} parallel SOCKS5 daemons on ports {', '.join(str(p) for p in active_ports)})")
+            return daemons
+
+    def _get_mega_circuit_pool(self) -> dict[str, Any]:
+        from ..providers.base import _loop_store
+        pool = _loop_store("mega_circuit_pool")
+        if "idle" not in pool:
+            pool["idle"] = []  # LIFO stack of verified fast (proxy_url, httpx.AsyncClient)
+            pool["rr"] = 0
+            pool["sem"] = asyncio.Semaphore(64)
+        return pool
+
+    def _acquire_mega_circuit(self, daemons: list[str]) -> tuple[str, httpx.AsyncClient]:
+        from ..providers.base import track_client
+        from ..utils.http import ensure_socks_support
+        ensure_socks_support()
+        pool = self._get_mega_circuit_pool()
+        idle: list[tuple[str, httpx.AsyncClient]] = pool["idle"]
+        while idle:
+            px, cli = idle.pop()
+            if not getattr(cli, "is_closed", False):
+                return px, cli
+        idx = int(pool.get("rr", 0))
+        pool["rr"] = idx + 1
+        base_daemon = daemons[idx % len(daemons)]
+        px = self._isolated_proxy(base_daemon, uuid.uuid4().hex[:10]) or base_daemon
+        cli = track_client(
+            httpx.AsyncClient(
+                proxy=px,
+                follow_redirects=True,
+                timeout=httpx.Timeout(connect=12.0, read=18.0, write=15.0, pool=20.0),
+                limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
+            )
+        )
+        return px, cli
+
+    def _release_mega_circuit(self, px: str | None, cli: httpx.AsyncClient | None) -> None:
+        if not px or cli is None or getattr(cli, "is_closed", False):
+            return
+        pool = self._get_mega_circuit_pool()
+        idle: list[tuple[str, httpx.AsyncClient]] = pool["idle"]
+        if len(idle) < 96:
+            idle.append((px, cli))
+
+    async def _discard_mega_circuit(self, cli: httpx.AsyncClient | None) -> None:
+        if cli is None:
+            return
+        try:
+            await cli.aclose()
+        except Exception:
+            pass
 
     @staticmethod
     def _is_ip_bound_token_error(msg: str) -> bool:
@@ -1692,36 +1845,74 @@ class LinksProvider(BaseProvider):
         raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"Invalid or unsupported MEGA URL format (missing decryption key after #): {u}")
 
     async def _mega_api_req(self, payload: list[dict[str, Any]], params: dict[str, Any] | None = None, proxy: str | None = None) -> Any:
-        q = {"id": str(random.randint(100000, 9999999))}
-        if params:
-            q.update({k: str(v) for k, v in params.items() if v is not None})
-        api_url = f"https://g.api.mega.co.nz/cs?{urlencode(q)}"
-        client_kw: dict[str, Any] = {"timeout": 30.0, "follow_redirects": True}
-        if proxy:
-            if "socks" in str(proxy).lower():
-                from ..utils.http import ensure_socks_support
-                ensure_socks_support()
-            client_kw["proxy"] = proxy
-        for attempt in range(4):
-            async with httpx.AsyncClient(**client_kw) as client:
-                resp = await client.post(api_url, json=payload)
+        from ..providers.base import shared_client
+        from ..utils.http import ensure_socks_support
+
+        active_proxy = proxy
+        last_err: Exception | None = None
+        for attempt in range(6):
+            q = {"id": str(random.randint(100000, 9999999))}
+            if params:
+                q.update({k: str(v) for k, v in params.items() if v is not None})
+            api_url = f"https://g.api.mega.co.nz/cs?{urlencode(q)}"
+            try:
+                if active_proxy:
+                    if "socks" in str(active_proxy).lower():
+                        ensure_socks_support()
+                    async with httpx.AsyncClient(timeout=25.0, follow_redirects=True, proxy=active_proxy) as client:
+                        resp = await client.post(api_url, json=payload)
+                else:
+                    client = shared_client("mega_api_direct", timeout=25.0, follow_redirects=True)
+                    resp = await client.post(api_url, json=payload)
+
+                if resp.status_code in (429, 509):
+                    daemons = await self._ensure_mega_tor_pool()
+                    if daemons:
+                        active_proxy = self._isolated_proxy(daemons[attempt % len(daemons)], uuid.uuid4().hex[:10])
+                        continue
+                    raise ProviderFailure("PROVIDER_RATE_LIMITED", f"MEGA API rate limited (HTTP {resp.status_code})")
+
                 resp.raise_for_status()
                 data = resp.json()
-            if isinstance(data, int) and data == -3:
-                await asyncio.sleep(1.0 * (attempt + 1))
-                continue
-            if isinstance(data, list) and data and isinstance(data[0], int) and data[0] < 0:
+            except ProviderFailure:
+                raise
+            except Exception as exc:
+                last_err = exc
+                daemons = await self._ensure_mega_tor_pool()
+                if daemons and attempt < 5:
+                    active_proxy = self._isolated_proxy(daemons[attempt % len(daemons)], uuid.uuid4().hex[:10])
+                    await asyncio.sleep(0.3 * (attempt + 1))
+                    continue
+                if attempt < 5:
+                    await asyncio.sleep(0.8 * (attempt + 1))
+                    continue
+                raise ProviderFailure("DOWNLOAD_FAILED", f"MEGA API request failed: {exc}") from exc
+
+            code: int | None = None
+            if isinstance(data, int) and data < 0:
+                code = data
+            elif isinstance(data, list) and data and isinstance(data[0], int) and data[0] < 0:
                 code = data[0]
-                if code == -3 and attempt < 3:
-                    await asyncio.sleep(1.0 * (attempt + 1))
+
+            if code is not None:
+                if code in (-3, -4) and attempt < 5:
+                    if code == -4:
+                        daemons = await self._ensure_mega_tor_pool()
+                        if daemons:
+                            active_proxy = self._isolated_proxy(daemons[attempt % len(daemons)], uuid.uuid4().hex[:10])
+                    await asyncio.sleep(0.8 * (attempt + 1))
                     continue
                 if code in (-9, -16, -11):
                     raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"MEGA item not found or access denied (API error {code})")
                 if code in (-17, -18):
+                    daemons = await self._ensure_mega_tor_pool()
+                    if daemons and attempt < 5:
+                        active_proxy = self._isolated_proxy(daemons[attempt % len(daemons)], uuid.uuid4().hex[:10])
+                        continue
                     raise ProviderFailure("PROVIDER_RATE_LIMITED", f"MEGA bandwidth quota or temporary unavailability (API error {code})")
                 raise ProviderFailure("DOWNLOAD_FAILED", f"MEGA API error {code}")
             return data[0] if isinstance(data, list) and data else data
-        raise ProviderFailure("DOWNLOAD_FAILED", "MEGA API busy (-3 EAGAIN)")
+        raise ProviderFailure("DOWNLOAD_FAILED", f"MEGA API busy ({last_err or '-3 EAGAIN'})")
 
     async def _list_mega_folder_nodes(self, url: str, proxy: str | None = None) -> list[dict[str, Any]]:
         parsed = self._parse_mega_url(url)
@@ -1843,6 +2034,13 @@ class LinksProvider(BaseProvider):
             })
         return file_items
 
+    def _mark_mega_direct_quota_exceeded(self, progress: JobState | None = None) -> None:
+        now = time.time()
+        type(self)._mega_direct_cooldown_until = now + 600.0
+        if progress and (now - type(self)._mega_direct_notice_ts) >= 30.0:
+            type(self)._mega_direct_notice_ts = now
+            progress.log("[MEGA] Direct IP bandwidth limit reached; switching to Multi-Circuit Tor Turbo pool and resuming...")
+
     async def _download_mega_stream_decrypt(
         self,
         dl_url: str,
@@ -1852,15 +2050,21 @@ class LinksProvider(BaseProvider):
         expected_size: int,
         progress: JobState,
         proxy: str | None = None,
+        refresh_url: Any = None,
     ) -> Path:
+        import threading
+        from ..providers.base import shared_client, track_client
+        from ..utils.http import ensure_socks_support
+
         dest.parent.mkdir(parents=True, exist_ok=True)
         part_path = dest.with_suffix(dest.suffix + ".part")
         progress.current_file = dest.name
+        req_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36"}
 
         def _make_decryptor(initial_iv: bytes, byte_offset: int = 0) -> Any:
             if byte_offset > 0:
                 block_offset = byte_offset // 16
-                iv_int = int.from_bytes(initial_iv, "big") + block_offset
+                iv_int = (int.from_bytes(initial_iv, "big") + block_offset) & ((1 << 128) - 1)
                 ctr_iv = iv_int.to_bytes(16, "big")
             else:
                 ctr_iv = initial_iv
@@ -1874,68 +2078,335 @@ class LinksProvider(BaseProvider):
                 ctr = Counter.new(128, initial_value=int.from_bytes(ctr_iv, "big"))
                 return AES.new(file_key, AES.MODE_CTR, counter=ctr)
 
-        client_kw: dict[str, Any] = {
-            "follow_redirects": True,
-            "timeout": httpx.Timeout(None, connect=30.0, read=60.0, write=30.0, pool=30.0),
-        }
-        if proxy:
-            if "socks" in str(proxy).lower():
-                from ..utils.http import ensure_socks_support
-                ensure_socks_support()
-            client_kw["proxy"] = proxy
+        class _SlowMegaCircuit(Exception):
+            pass
 
-        for attempt in range(4):
-            progress.check_cancelled()
-            done = part_path.stat().st_size if part_path.exists() else 0
-            # Align resume offset to 16-byte AES block boundary
-            if done % 16 != 0:
-                done = (done // 16) * 16
-                with part_path.open("r+b") as f_trunc:
-                    f_trunc.truncate(done)
-            req_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36"}
-            if done > 0:
-                req_headers["Range"] = f"bytes={done}-"
-            decryptor = _make_decryptor(file_iv, done)
+        url_state = {"dl_url": dl_url}
+        refresh_lock = asyncio.Lock()
+
+        # Fallback path when exact byte size is unknown (or 0-byte node)
+        if expected_size <= 0:
+            part_path.unlink(missing_ok=True)
+            done = 0
+            worker_px: str | None = proxy
+            worker_cli: httpx.AsyncClient | None = None
+            saw_rl = False
             try:
-                async with httpx.AsyncClient(**client_kw) as client:
-                    async with client.stream("GET", dl_url, headers=req_headers) as resp:
-                        if resp.status_code == 509 or resp.status_code == 429:
-                            raise ProviderFailure("PROVIDER_RATE_LIMITED", f"MEGA bandwidth quota exceeded (HTTP {resp.status_code})")
-                        resp.raise_for_status()
-                        if done > 0 and resp.status_code != 206:
-                            part_path.unlink(missing_ok=True)
-                            done = 0
-                            decryptor = _make_decryptor(file_iv, 0)
-                        total = expected_size or (done + int(resp.headers.get("content-length") or 0))
-                        with part_path.open("ab" if done > 0 else "wb") as fh:
-                            async for chunk in resp.aiter_bytes(262144):
-                                progress.check_cancelled()
-                                if not chunk:
-                                    continue
-                                plain = decryptor.update(chunk)
-                                fh.write(plain)
-                                done += len(plain)
-                                progress.add_bytes(len(plain), total, "download", dest.name)
-                            if hasattr(decryptor, "finalize"):
-                                tail = decryptor.finalize()
-                                if tail:
-                                    fh.write(tail)
-                                    done += len(tail)
-                if not expected_size or part_path.stat().st_size >= expected_size:
-                    break
-            except ProviderFailure as pf:
-                if pf.code == "PROVIDER_RATE_LIMITED" and not proxy:
-                    tor_px = await self._ensure_tor_proxy(progress)
-                    if tor_px:
-                        proxy = self._isolated_proxy(tor_px, uuid.uuid4().hex[:8])
-                        client_kw["proxy"] = proxy
-                        progress.log("[MEGA] Bandwidth limit reached; switching to isolated Tor circuit and resuming...")
-                        continue
-                raise
-            except Exception as exc:
-                if attempt == 3:
-                    raise ProviderFailure("DOWNLOAD_FAILED", f"MEGA file stream failed for {dest.name}: {exc}") from exc
-                await asyncio.sleep(1.5 * (attempt + 1))
+                for attempt in range(12):
+                    progress.check_cancelled()
+                    if done % 16 != 0:
+                        done = (done // 16) * 16
+                        if part_path.exists():
+                            with part_path.open("r+b") as f_tr:
+                                f_tr.truncate(done)
+                    use_tor = bool(worker_px) or (time.time() < type(self)._mega_direct_cooldown_until)
+                    if use_tor:
+                        daemons = await self._ensure_mega_tor_pool(progress)
+                        if not daemons:
+                            raise ProviderFailure("PROVIDER_RATE_LIMITED", "MEGA bandwidth quota exceeded and Tor proxy unavailable")
+                        if worker_cli is None:
+                            if worker_px:
+                                ensure_socks_support()
+                                worker_cli = track_client(httpx.AsyncClient(proxy=worker_px, follow_redirects=True, timeout=httpx.Timeout(connect=12.0, read=20.0, write=15.0, pool=20.0)))
+                            else:
+                                worker_px, worker_cli = self._acquire_mega_circuit(daemons)
+                        active_cli = worker_cli
+                    else:
+                        active_cli = shared_client("mega_dl_direct", follow_redirects=True, timeout=httpx.Timeout(connect=20.0, read=45.0, write=30.0, pool=30.0))
+
+                    curr_u = url_state["dl_url"]
+                    req_u = f"{curr_u.rstrip('/')}/{done}-" if done > 0 else curr_u
+                    decryptor = _make_decryptor(file_iv, done)
+                    rotate_cli = False
+                    try:
+                        async with active_cli.stream("GET", req_u, headers=req_headers) as resp:
+                            if resp.status_code in (509, 429):
+                                saw_rl = True
+                                if not use_tor:
+                                    self._mark_mega_direct_quota_exceeded(progress)
+                                else:
+                                    rotate_cli = True
+                            else:
+                                resp.raise_for_status()
+                                saw_rl = False
+                                total = done + int(resp.headers.get("content-length") or 0)
+                                with part_path.open("ab" if done > 0 else "wb") as fh:
+                                    async for chunk in resp.aiter_bytes(131072):
+                                        progress.check_cancelled()
+                                        if not chunk:
+                                            continue
+                                        plain = decryptor.update(chunk)
+                                        fh.write(plain)
+                                        done += len(plain)
+                                        progress.add_bytes(len(plain), total, "download", dest.name)
+                                    if hasattr(decryptor, "finalize"):
+                                        tail = decryptor.finalize()
+                                        if tail:
+                                            fh.write(tail)
+                                            done += len(tail)
+                                break
+                    except ProviderFailure:
+                        raise
+                    except Exception as exc:
+                        rotate_cli = use_tor
+                        if attempt == 11:
+                            raise ProviderFailure("DOWNLOAD_FAILED", f"MEGA file stream failed for {dest.name}: {exc}") from exc
+                    if rotate_cli:
+                        await self._discard_mega_circuit(worker_cli)
+                        worker_px = None
+                        worker_cli = None
+                    if saw_rl and attempt == 11:
+                        raise ProviderFailure("PROVIDER_RATE_LIMITED", f"MEGA bandwidth quota exceeded (HTTP 509) for {dest.name}")
+            finally:
+                self._release_mega_circuit(worker_px, worker_cli)
+
+            if not part_path.exists():
+                part_path.write_bytes(b"")
+            part_path.replace(dest)
+            return dest
+
+        # Multi-Circuit Parallel Chunked AES-128-CTR Engine (for all sized files)
+        # Chunk boundaries are strict multiples of 16 bytes so each chunk decrypts & resumes independently.
+        if expected_size <= 2 * 1024 * 1024:
+            chunk_size = expected_size
+        elif expected_size < 64 * 1024 * 1024:
+            chunk_size = 2 * 1024 * 1024  # 2 MB (131,072 AES blocks)
+        else:
+            chunk_size = 4 * 1024 * 1024  # 4 MB (262,144 AES blocks)
+
+        chunk_queue: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
+        pos = 0
+        chunk_count = 0
+        while pos < expected_size:
+            end = min(expected_size - 1, pos + chunk_size - 1)
+            chunk_queue.put_nowait((pos, end))
+            pos = end + 1
+            chunk_count += 1
+
+        with part_path.open("wb") as f_alloc:
+            f_alloc.truncate(expected_size)
+
+        write_lock = threading.Lock()
+        has_pwrite = hasattr(os, "pwrite")
+        fatal_errors: list[BaseException] = []
+        pool_sem = self._get_mega_circuit_pool()["sem"]
+        worker_count = min(chunk_count, 12)
+
+        with part_path.open("r+b") as f_out:
+            fd = f_out.fileno()
+
+            def _write_at(data: bytes, offset: int) -> None:
+                if has_pwrite:
+                    os.pwrite(fd, data, offset)
+                else:
+                    with write_lock:
+                        f_out.seek(offset)
+                        f_out.write(data)
+
+            async def _chunk_worker(worker_id: int) -> None:
+                w_px: str | None = None
+                w_cli: httpx.AsyncClient | None = None
+                used_explicit_px = False
+                try:
+                    while not fatal_errors:
+                        try:
+                            c_start, c_end = chunk_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            return
+
+                        write_pos = c_start
+                        consecutive_403 = 0
+                        saw_rate_limit = False
+                        last_exc: Exception | None = None
+
+                        for attempt in range(24):
+                            progress.check_cancelled()
+                            if fatal_errors:
+                                return
+                            if write_pos > c_end:
+                                break
+
+                            use_tor = bool(proxy) or (time.time() < type(self)._mega_direct_cooldown_until)
+                            if use_tor:
+                                daemons = await self._ensure_mega_tor_pool(progress)
+                                if not daemons:
+                                    raise ProviderFailure("PROVIDER_RATE_LIMITED", f"MEGA bandwidth quota exceeded and Tor proxy unavailable for {dest.name}")
+                                if w_cli is None:
+                                    if proxy and worker_id == 0 and not used_explicit_px:
+                                        used_explicit_px = True
+                                        w_px = proxy
+                                        ensure_socks_support()
+                                        w_cli = track_client(
+                                            httpx.AsyncClient(
+                                                proxy=w_px,
+                                                follow_redirects=True,
+                                                timeout=httpx.Timeout(connect=12.0, read=18.0, write=15.0, pool=20.0),
+                                                limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
+                                            )
+                                        )
+                                    else:
+                                        w_px, w_cli = self._acquire_mega_circuit(daemons)
+                                active_cli = w_cli
+                            else:
+                                active_cli = shared_client(
+                                    "mega_dl_direct",
+                                    follow_redirects=True,
+                                    timeout=httpx.Timeout(connect=20.0, read=45.0, write=30.0, pool=30.0),
+                                    limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
+                                )
+
+                            curr_url = url_state["dl_url"]
+                            if write_pos == 0 and c_end == expected_size - 1:
+                                req_url = curr_url
+                            else:
+                                req_url = f"{curr_url.rstrip('/')}/{write_pos}-{c_end}"
+
+                            rotate_circuit = False
+                            need_refresh = False
+                            bytes_attempt = 0
+                            t_stream = time.monotonic()
+
+                            try:
+                                async with pool_sem:
+                                    decryptor = _make_decryptor(file_iv, write_pos)
+                                    rem = b""
+                                    needed = c_end - write_pos + 1
+                                    async with active_cli.stream("GET", req_url, headers=req_headers) as resp:
+                                        if resp.status_code in (509, 429):
+                                            saw_rate_limit = True
+                                            if not use_tor:
+                                                self._mark_mega_direct_quota_exceeded(progress)
+                                            else:
+                                                rotate_circuit = True
+                                        elif resp.status_code in (403, 404, 410):
+                                            if not use_tor:
+                                                self._mark_mega_direct_quota_exceeded(progress)
+                                            else:
+                                                rotate_circuit = True
+                                            consecutive_403 += 1
+                                            if consecutive_403 >= 2 and refresh_url is not None:
+                                                need_refresh = True
+                                                consecutive_403 = 0
+                                        else:
+                                            resp.raise_for_status()
+                                            consecutive_403 = 0
+                                            saw_rate_limit = False
+                                            ctype = (resp.headers.get("content-type") or "").lower()
+                                            cl_hdr = resp.headers.get("content-length") or ""
+                                            if "text/html" in ctype and cl_hdr.isdigit() and int(cl_hdr) < needed:
+                                                raise RuntimeError("Proxy returned unexpected HTML response instead of MEGA ciphertext")
+
+                                            t_stream = time.monotonic()
+                                            async for raw in resp.aiter_bytes(131072):
+                                                progress.check_cancelled()
+                                                if fatal_errors:
+                                                    return
+                                                if not raw:
+                                                    continue
+                                                max_take = (c_end + 1) - (write_pos + len(rem))
+                                                if max_take <= 0:
+                                                    break
+                                                if len(raw) > max_take:
+                                                    raw = raw[:max_take]
+                                                bytes_attempt += len(raw)
+                                                buf = rem + raw
+                                                if write_pos + len(buf) >= c_end + 1:
+                                                    plain = decryptor.update(buf)
+                                                    if hasattr(decryptor, "finalize"):
+                                                        plain += decryptor.finalize()
+                                                    rem = b""
+                                                else:
+                                                    aligned = (len(buf) // 16) * 16
+                                                    if aligned > 0:
+                                                        plain = decryptor.update(buf[:aligned])
+                                                        rem = buf[aligned:]
+                                                    else:
+                                                        plain = b""
+                                                        rem = buf
+                                                if plain:
+                                                    _write_at(plain, write_pos)
+                                                    write_pos += len(plain)
+                                                    progress.add_bytes(len(plain), expected_size, "download", dest.name)
+                                                if write_pos > c_end:
+                                                    break
+                                                if use_tor and attempt < 20:
+                                                    elapsed_s = time.monotonic() - t_stream
+                                                    is_endgame = chunk_queue.empty() and (c_end - write_pos) > 512 * 1024
+                                                    grace_s = 3.5 if is_endgame else 5.0
+                                                    min_bps = 420 * 1024 if is_endgame else 160 * 1024
+                                                    if elapsed_s >= grace_s and (bytes_attempt / elapsed_s) < min_bps:
+                                                        raise _SlowMegaCircuit()
+                            except _SlowMegaCircuit:
+                                rotate_circuit = True
+                            except asyncio.CancelledError:
+                                raise
+                            except ProviderFailure:
+                                raise
+                            except Exception as exc:
+                                last_exc = exc
+                                if use_tor:
+                                    rotate_circuit = True
+                                else:
+                                    await asyncio.sleep(0.4)
+
+                            if rotate_circuit:
+                                await self._discard_mega_circuit(w_cli)
+                                w_px = None
+                                w_cli = None
+
+                            if need_refresh and refresh_url is not None:
+                                async with refresh_lock:
+                                    if url_state["dl_url"] == curr_url:
+                                        try:
+                                            fresh_u = await refresh_url(w_px)
+                                            if fresh_u:
+                                                url_state["dl_url"] = fresh_u
+                                        except Exception as ref_exc:
+                                            last_exc = ref_exc
+
+                            if write_pos > c_end:
+                                if use_tor and w_cli is not None and bytes_attempt >= 512 * 1024:
+                                    rate = bytes_attempt / max(0.05, time.monotonic() - t_stream)
+                                    if rate < 220 * 1024:
+                                        await self._discard_mega_circuit(w_cli)
+                                        w_px = None
+                                        w_cli = None
+                                break
+
+                            if not rotate_circuit and not saw_rate_limit and write_pos <= c_end:
+                                if use_tor:
+                                    await self._discard_mega_circuit(w_cli)
+                                    w_px = None
+                                    w_cli = None
+                                await asyncio.sleep(0.15)
+                        else:
+                            if saw_rate_limit:
+                                raise ProviderFailure("PROVIDER_RATE_LIMITED", f"MEGA bandwidth quota exceeded (HTTP 509) for {dest.name}")
+                            raise ProviderFailure(
+                                "DOWNLOAD_FAILED",
+                                f"MEGA file stream failed for {dest.name}: {last_exc or f'incomplete chunk at {write_pos}/{c_end + 1}'}",
+                            )
+                except BaseException as worker_err:
+                    if not isinstance(worker_err, asyncio.CancelledError):
+                        fatal_errors.append(worker_err)
+                    raise
+                finally:
+                    if fatal_errors:
+                        await self._discard_mega_circuit(w_cli)
+                    else:
+                        self._release_mega_circuit(w_px, w_cli)
+
+            tasks = [asyncio.create_task(_chunk_worker(i)) for i in range(worker_count)]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res_item in results:
+                if isinstance(res_item, asyncio.CancelledError):
+                    part_path.unlink(missing_ok=True)
+                    raise res_item
+            if fatal_errors:
+                part_path.unlink(missing_ok=True)
+                err = fatal_errors[0]
+                if isinstance(err, BaseException):
+                    raise err
 
         part_path.replace(dest)
         self._validate_downloaded_files([dest])
@@ -1964,12 +2435,18 @@ class LinksProvider(BaseProvider):
             dl_url = str(res.get("g") or "")
             if not dl_url:
                 raise ProviderFailure("DOWNLOAD_FAILED", f"MEGA did not return download URL for folder node {node_id}")
-            file_sz = int(res.get("s") or meta.get("size") or file_ref.get("size") or 0)
+            file_sz = int(res.get("s") if res.get("s") is not None else (meta.get("size") or file_ref.get("size") or 0))
             out_name = safe_name(name or file_ref.get("name") or f"{node_id}.bin")
             dest = dest_dir / out_name
             progress.log(f"[MEGA] Downloading & decrypting node {out_name} ({file_sz} bytes)...")
+
+            async def _refresh_folder_node_url(px_hint: str | None = None) -> str:
+                r_new = await self._mega_api_req([{"a": "g", "g": 1, "n": node_id}], params={"n": folder_id}, proxy=px_hint or proxy)
+                return str(r_new.get("g") or "")
+
             downloaded_path = await self._download_mega_stream_decrypt(
-                dl_url, dest, bytes.fromhex(key_hex), bytes.fromhex(iv_hex), file_sz, progress, proxy=proxy
+                dl_url, dest, bytes.fromhex(key_hex), bytes.fromhex(iv_hex), file_sz, progress,
+                proxy=proxy, refresh_url=_refresh_folder_node_url,
             )
             return [downloaded_path]
 
@@ -2002,11 +2479,17 @@ class LinksProvider(BaseProvider):
             out_name = safe_name(real_name or name or f"{file_id}.bin")
         else:
             out_name = safe_name(name)
-        file_sz = int(res.get("s") or file_ref.get("size") or 0)
+        file_sz = int(res.get("s") if res.get("s") is not None else (file_ref.get("size") or 0))
         dest = dest_dir / out_name
         progress.log(f"[MEGA] Downloading & decrypting {out_name} ({file_sz} bytes)...")
+
+        async def _refresh_public_file_url(px_hint: str | None = None) -> str:
+            r_new = await self._mega_api_req([{"a": "g", "g": 1, "p": file_id}], proxy=px_hint or proxy)
+            return str(r_new.get("g") or "")
+
         downloaded_path = await self._download_mega_stream_decrypt(
-            dl_url, dest, file_key, file_iv, file_sz, progress, proxy=proxy
+            dl_url, dest, file_key, file_iv, file_sz, progress,
+            proxy=proxy, refresh_url=_refresh_public_file_url,
         )
         return [downloaded_path]
 

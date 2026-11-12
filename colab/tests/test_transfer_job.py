@@ -5847,6 +5847,236 @@ def test_multi_hls_drive_web_caps_concurrent_uploads_and_recovers_transient_403(
     assert 1 <= fake_dst.max_active_part_uploads <= 2
 
 
+def test_mega_parallel_chunk_decrypt_rotates_multiple_509_and_disconnected_tor_circuits(tmp_path, monkeypatch):
+    """Verify MEGA parallel chunk downloader slices /{start}-{end}, rotates across multiple 509/dropped Tor circuits,
+    resumes mid-chunk on 16-byte AES-CTR boundaries without data corruption, and reuses fast circuits across files."""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.backends import default_backend
+    import httpx
+    import os
+    import re as _re
+
+    provider = LinksProvider()
+    monkeypatch.setattr(LinksProvider, "_mega_direct_cooldown_until", 0.0)
+    monkeypatch.setattr(LinksProvider, "_mega_direct_notice_ts", 0.0)
+
+    # 5 MB + 37 tail bytes -> forces 3 parallel chunks (2MB, 2MB, ~1MB+37B) with unaligned final block
+    plain_original = os.urandom(5 * 1024 * 1024 + 37)
+    file_key = os.urandom(16)
+    file_iv = os.urandom(8) + (b"\x00" * 8)
+
+    enc = Cipher(algorithms.AES(file_key), modes.CTR(file_iv), backend=default_backend()).encryptor()
+    ciphertext = enc.update(plain_original) + enc.finalize()
+
+    daemons = [
+        "socks5://127.0.0.1:9050",
+        "socks5://127.0.0.1:9051",
+        "socks5://127.0.0.1:9052",
+        "socks5://127.0.0.1:9053",
+    ]
+
+    async def fake_tor_pool(progress=None):
+        return daemons
+
+    monkeypatch.setattr(provider, "_ensure_mega_tor_pool", fake_tor_pool)
+
+    seen_requests: list[tuple[str | None, str]] = []
+    circuit_counter = {"n": 0}
+    bad_509_circuits: set[str] = set()
+    drop_mid_circuits: set[str] = set()
+
+    orig_acquire = provider._acquire_mega_circuit
+
+    def tracking_acquire(d_list):
+        px, _cli = orig_acquire(d_list)
+        # First 2 newly minted circuits fail: #1 gets HTTP 509 (exhausted Tor exit), #2 drops stream mid-chunk!
+        if px not in seen_circuits_minted:
+            seen_circuits_minted.add(px)
+            circuit_counter["n"] += 1
+            if circuit_counter["n"] == 1:
+                bad_509_circuits.add(px)
+            elif circuit_counter["n"] == 2:
+                drop_mid_circuits.add(px)
+        return px, FakeClient(proxy=px)
+
+    seen_circuits_minted: set[str] = set()
+
+    class FakeStreamResp:
+        def __init__(self, status_code: int, body: bytes = b"", drop_after: int | None = None):
+            self.status_code = status_code
+            self._body = body
+            self._drop_after = drop_after
+            self.headers = {"content-length": str(len(body)), "content-type": "application/octet-stream"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+        async def aiter_bytes(self, chunk_size: int = 131072):
+            pos = 0
+            while pos < len(self._body):
+                if self._drop_after is not None and pos >= self._drop_after:
+                    raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+                # Yield odd-sized network reads (e.g. 50,003 bytes) to stress-test 16-byte block alignment!
+                step = min(50003, len(self._body) - pos)
+                yield self._body[pos : pos + step]
+                pos += step
+
+    class FakeClient:
+        def __init__(self, proxy: str | None = None, **kwargs):
+            self.proxy = proxy
+            self.is_closed = False
+
+        def stream(self, method: str, url: str, headers=None):
+            seen_requests.append((self.proxy, url))
+            # Direct IP (proxy=None) hits MEGA 509 bandwidth limit!
+            if self.proxy is None:
+                return FakeStreamResp(509)
+            # First Tor exit IP ALSO hits 509 -> must rotate to a new Tor circuit instead of failing!
+            if self.proxy in bad_509_circuits:
+                return FakeStreamResp(509)
+            m = _re.search(r"/(\d+)-(\d+)$", url)
+            if m:
+                s_idx, e_idx = int(m.group(1)), int(m.group(2))
+                body_slice = ciphertext[s_idx : e_idx + 1]
+            else:
+                body_slice = ciphertext
+            if self.proxy in drop_mid_circuits:
+                drop_mid_circuits.discard(self.proxy)
+                return FakeStreamResp(200, body_slice, drop_after=150009)
+            return FakeStreamResp(200, body_slice)
+
+        async def aclose(self):
+            self.is_closed = True
+
+    monkeypatch.setattr(provider, "_acquire_mega_circuit", tracking_acquire)
+    monkeypatch.setattr("src.providers.base.shared_client", lambda key, **kw: FakeClient(proxy=None))
+
+    async def _run():
+        job = JobState("test-mega-turbo", {})
+        out1 = tmp_path / "video_1.mp4"
+        res1 = await provider._download_mega_stream_decrypt(
+            "https://gfs270n123.userstorage.mega.co.nz/dl/ticket_abc",
+            out1,
+            file_key,
+            file_iv,
+            len(plain_original),
+            job,
+        )
+        assert res1 == out1
+        assert out1.read_bytes() == plain_original
+
+        # Second file should remember Direct IP cooldown (zero new proxy=None 509 hits) and reuse fast circuits!
+        direct_hits_before = sum(1 for px, _ in seen_requests if px is None)
+        out2 = tmp_path / "video_2.mp4"
+        res2 = await provider._download_mega_stream_decrypt(
+            "https://gfs270n123.userstorage.mega.co.nz/dl/ticket_def",
+            out2,
+            file_key,
+            file_iv,
+            len(plain_original),
+            job,
+        )
+        direct_hits_after = sum(1 for px, _ in seen_requests if px is None)
+        assert res2 == out2
+        assert out2.read_bytes() == plain_original
+        assert direct_hits_after == direct_hits_before
+        assert job.bytes_done == len(plain_original) * 2
+
+    asyncio.run(_run())
+    # Verify multi-port Tor daemon distribution (ports 9050..9053 used)
+    used_ports = {
+        _re.search(r":(905\d)$", px).group(1)
+        for px, _ in seen_requests
+        if px and _re.search(r":(905\d)$", px)
+    }
+    assert len(used_ports) >= 2
+
+
+def test_mega_stream_decrypt_refreshes_expired_dl_url_on_repeated_403(tmp_path, monkeypatch):
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.backends import default_backend
+    import os
+
+    provider = LinksProvider()
+    monkeypatch.setattr(LinksProvider, "_mega_direct_cooldown_until", 0.0)
+
+    plain = os.urandom(256 * 1024 + 11)
+    key = os.urandom(16)
+    iv = os.urandom(8) + (b"\x00" * 8)
+    enc = Cipher(algorithms.AES(key), modes.CTR(iv), backend=default_backend()).encryptor()
+    ciphertext = enc.update(plain) + enc.finalize()
+
+    async def fake_tor_pool(progress=None):
+        return ["socks5://127.0.0.1:9050"]
+
+    monkeypatch.setattr(provider, "_ensure_mega_tor_pool", fake_tor_pool)
+
+    class FakeResp:
+        def __init__(self, code: int, data: bytes = b""):
+            self.status_code = code
+            self._data = data
+            self.headers = {"content-length": str(len(data)), "content-type": "application/octet-stream"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+        async def aiter_bytes(self, sz=131072):
+            yield self._data
+
+    class FakeCli:
+        is_closed = False
+
+        def stream(self, method, url, headers=None):
+            if "expired_ticket" in url:
+                return FakeResp(403)
+            return FakeResp(200, ciphertext)
+
+        async def aclose(self):
+            self.is_closed = True
+
+    monkeypatch.setattr(provider, "_acquire_mega_circuit", lambda d: ("socks5://vb_ok:pass@127.0.0.1:9050", FakeCli()))
+    monkeypatch.setattr("src.providers.base.shared_client", lambda k, **kw: FakeCli())
+
+    refreshes = []
+
+    async def fake_refresh(px_hint=None):
+        refreshes.append(px_hint)
+        return "https://gfs270n123.userstorage.mega.co.nz/dl/fresh_ticket"
+
+    async def _run():
+        job = JobState("test-mega-403-refresh", {})
+        out = tmp_path / "renewed.mp4"
+        res = await provider._download_mega_stream_decrypt(
+            "https://gfs270n123.userstorage.mega.co.nz/dl/expired_ticket",
+            out,
+            key,
+            iv,
+            len(plain),
+            job,
+            refresh_url=fake_refresh,
+        )
+        assert res == out
+        assert out.read_bytes() == plain
+        assert len(refreshes) == 1
+
+    asyncio.run(_run())
+
+
+
 
 
 
