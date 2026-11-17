@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import shutil
 import time
+import unicodedata
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..extract.extractor import extract_archives, is_archive_name
 from ..config import FOLDER_DOWNLOAD_CONCURRENCY, IS_KAGGLE, UPLOAD_FILE_CONCURRENCY
 from ..providers import PROVIDERS
-from ..providers.base import ProviderFailure, close_shared_clients, download_with_retry, is_skippable_download_failure, safe_name
+from ..providers.base import ProviderFailure, close_shared_clients, dict_lock, download_with_retry, is_skippable_download_failure, safe_name
 from ..security import redact
 from ..utils.image_optimizer import VIDEO_EXTENSIONS
 from ..utils.temp_storage import cleanup_job, job_dirs
@@ -48,6 +49,10 @@ def _is_auto_skip_enabled(options: dict[str, Any] | None) -> bool:
     return bool(opts.get("auto_skip") or opts.get("autoSkip"))
 
 
+def _norm_check_name(name: str) -> str:
+    return unicodedata.normalize("NFC", str(name or "").strip()).casefold()
+
+
 class _TargetFileChecker:
     """Lazily lists and caches target directories to check whether individual files already exist at destination."""
 
@@ -56,25 +61,57 @@ class _TargetFileChecker:
         self.target = target
         self.options = options or {}
         self.job = job
-        self._dir_cache: dict[str, tuple[set[str], dict[str, str]]] = {}
-        self._lock = asyncio.Lock()
+        self._dir_cache: dict[str, tuple[set[str], dict[str, list[str]]]] = {}
+        self._dir_locks: dict[str, asyncio.Lock] = {}
+        self._uploaded_rel_keys: set[str] = set()
 
-    async def _list_dir(self, folder_id: str) -> tuple[set[str], dict[str, str]]:
+    def _live_target(self) -> dict[str, Any]:
+        if self.job is not None and isinstance(getattr(self.job, "payload", None), dict):
+            live_t = self.job.payload.get("target")
+            if isinstance(live_t, dict) and live_t:
+                return live_t
+        return self.target
+
+    @staticmethod
+    def _add_sub_id(mapping: dict[str, list[str]], key: str, sub_id: str) -> None:
+        if not key or not sub_id:
+            return
+        bucket = mapping.setdefault(key, [])
+        if sub_id not in bucket:
+            bucket.append(sub_id)
+
+    async def _list_dir(self, folder_id: str) -> tuple[set[str], dict[str, list[str]]]:
         norm_id = str(folder_id or "/").strip() or "/"
         if norm_id.startswith("id:"):
             norm_id = norm_id[3:].strip() or "/"
         if norm_id in self._dir_cache:
             return self._dir_cache[norm_id]
-        async with self._lock:
+        async with dict_lock(self._dir_locks, norm_id):
             if norm_id in self._dir_cache:
                 return self._dir_cache[norm_id]
-            active_dst = PROVIDERS.get(str(self.target.get("provider") or "").lower(), self.dst)
+            live_t = self._live_target()
+            active_dst = PROVIDERS.get(str(live_t.get("provider") or self.target.get("provider") or "").lower(), self.dst)
             files_set: set[str] = set()
-            subfolders_map: dict[str, str] = {}
+            subfolders_map: dict[str, list[str]] = {}
+            list_succeeded = True
             if hasattr(active_dst, "list_files"):
-                try:
-                    creds = self.target.get("credentials") or {}
-                    res = await active_dst.list_files(creds, norm_id)
+                last_exc: Exception | None = None
+                res: Any = None
+                for attempt in range(3):
+                    try:
+                        creds = live_t.get("credentials") or self.target.get("credentials") or {}
+                        res = await active_dst.list_files(creds, norm_id)
+                        last_exc = None
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        if attempt < 2:
+                            await asyncio.sleep(0.6 * (attempt + 1))
+                if last_exc is not None:
+                    list_succeeded = False
+                    if self.job is not None:
+                        self.job.log(f"[Auto-Skip] Cảnh báo: Không thể đọc danh sách thư mục đích ({norm_id[:48]}): {last_exc}")
+                else:
                     items = (res or {}).get("items") or (res or {}).get("files") or []
                     for it in items:
                         if not isinstance(it, dict):
@@ -91,30 +128,108 @@ class _TargetFileChecker:
                                 continue
                             sub_id = str(it.get("id") or it.get("path") or "").strip()
                             if sub_id:
-                                subfolders_map[base_name.lower()] = sub_id
-                                subfolders_map[safe_name(base_name).lower()] = sub_id
+                                self._add_sub_id(subfolders_map, _norm_check_name(base_name), sub_id)
+                                self._add_sub_id(subfolders_map, _norm_check_name(safe_name(base_name, is_dir=True)), sub_id)
+                                self._add_sub_id(subfolders_map, _norm_check_name(safe_name(base_name)), sub_id)
                         else:
                             if base_name.lower().endswith("__backup_resume") or base_name.lower().startswith("_resume_manifest"):
                                 continue
-                            files_set.add(base_name.lower())
-                            files_set.add(safe_name(base_name).lower())
-                except Exception:
-                    pass
-            self._dir_cache[norm_id] = (files_set, subfolders_map)
+                            files_set.add(_norm_check_name(base_name))
+                            files_set.add(_norm_check_name(safe_name(base_name)))
+            if list_succeeded:
+                self._dir_cache[norm_id] = (files_set, subfolders_map)
             return files_set, subfolders_map
 
     async def _exists_in_dir_path(self, root_id: str, dir_parts: list[str], candidate_names: set[str]) -> bool:
-        curr_id = root_id
-        for part in dir_parts:
-            if not part or part in (".", ".."):
-                continue
+        clean_parts = [p for p in dir_parts if p and p not in (".", "..")]
+
+        async def _walk(curr_id: str, depth: int) -> bool:
+            if depth >= len(clean_parts):
+                files_set, _ = await self._list_dir(curr_id)
+                return any(cand in files_set for cand in candidate_names)
+            part = clean_parts[depth]
             _, subfolders = await self._list_dir(curr_id)
-            next_id = subfolders.get(part.lower()) or subfolders.get(safe_name(part).lower())
-            if not next_id:
-                return False
-            curr_id = next_id
-        files_set, _ = await self._list_dir(curr_id)
-        return any(cand in files_set for cand in candidate_names)
+            matched_ids: list[str] = []
+            for k in (
+                _norm_check_name(part),
+                _norm_check_name(safe_name(part, is_dir=True)),
+                _norm_check_name(safe_name(part)),
+            ):
+                for sid in subfolders.get(k) or []:
+                    if sid not in matched_ids:
+                        matched_ids.append(sid)
+            for next_id in matched_ids:
+                if await _walk(next_id, depth + 1):
+                    return True
+            return False
+
+        return await _walk(root_id, 0)
+
+    def _normalize_full_rel_key(self, dir_parts: list[str], file_name: str) -> str:
+        norm_dirs = [_norm_check_name(safe_name(p, is_dir=True)) for p in dir_parts if p and p not in (".", "..")]
+        norm_file = _norm_check_name(safe_name(file_name))
+        return "/".join([*norm_dirs, norm_file])
+
+    def record_uploaded(
+        self,
+        rel_path: str,
+        options: dict[str, Any] | None = None,
+        *,
+        already_prefixed: bool = False,
+    ) -> None:
+        opts = options if options is not None else self.options
+        clean_rel = str(rel_path or "").replace("\\", "/").strip("/")
+        if not already_prefixed:
+            prefix = str(opts.get("upload_prefix") or "").replace("\\", "/").strip("/")
+            if prefix:
+                clean_rel = f"{prefix}/{clean_rel}".strip("/")
+        parts = [p for p in clean_rel.split("/") if p and p not in (".", "..")]
+        if not parts:
+            return
+        dir_parts, file_name = parts[:-1], parts[-1]
+        self._uploaded_rel_keys.add(self._normalize_full_rel_key(dir_parts, file_name))
+        # Also update root dir cache immediately when uploading directly to root_id
+        if not dir_parts:
+            live_t = self._live_target()
+            target_folder_obj = live_t.get("folder") or {}
+            root_id = str(target_folder_obj.get("id") or target_folder_obj.get("path") or "/").strip() or "/"
+            if root_id.startswith("id:"):
+                root_id = root_id[3:].strip() or "/"
+            if root_id in self._dir_cache:
+                files_set, _ = self._dir_cache[root_id]
+                files_set.add(_norm_check_name(file_name))
+                files_set.add(_norm_check_name(safe_name(file_name)))
+
+    async def relative_path_exists(
+        self,
+        rel_path: str,
+        options: dict[str, Any] | None = None,
+        *,
+        already_prefixed: bool = False,
+    ) -> bool:
+        opts = options if options is not None else self.options
+        clean_rel = str(rel_path or "").replace("\\", "/").strip("/")
+        if not already_prefixed:
+            prefix = str(opts.get("upload_prefix") or "").replace("\\", "/").strip("/")
+            if prefix:
+                clean_rel = f"{prefix}/{clean_rel}".strip("/")
+        parts = [p for p in clean_rel.split("/") if p and p not in (".", "..")]
+        if not parts:
+            return False
+        dir_parts, file_name = parts[:-1], parts[-1]
+        if self._normalize_full_rel_key(dir_parts, file_name) in self._uploaded_rel_keys:
+            return True
+        live_t = self._live_target()
+        target_folder_obj = live_t.get("folder") or {}
+        root_id = str(target_folder_obj.get("id") or target_folder_obj.get("path") or "/").strip() or "/"
+        cand_names = {
+            _norm_check_name(file_name),
+            _norm_check_name(safe_name(file_name)),
+        }
+        cand_names.discard("")
+        if not cand_names:
+            return False
+        return await self._exists_in_dir_path(root_id, dir_parts, cand_names)
 
     async def item_exists(
         self,
@@ -123,7 +238,8 @@ class _TargetFileChecker:
         folder_name: str = "",
     ) -> bool:
         opts = options if options is not None else self.options
-        target_folder_obj = self.target.get("folder") or {}
+        live_t = self._live_target()
+        target_folder_obj = live_t.get("folder") or {}
         root_id = str(target_folder_obj.get("id") or target_folder_obj.get("path") or "/").strip() or "/"
 
         raw_item_name = str(item.get("name") or item.get("server_filename") or "").strip()
@@ -135,14 +251,22 @@ class _TargetFileChecker:
         dir_parts = parts[:-1]
 
         cand_names = {
-            file_name.lower(),
-            safe_name(file_name).lower(),
+            _norm_check_name(file_name),
+            _norm_check_name(safe_name(file_name)),
         }
-        if raw_item_name:
-            base_raw = PurePosixPath(raw_item_name.replace("\\", "/")).name
-            if base_raw:
-                cand_names.add(base_raw.lower())
-                cand_names.add(safe_name(base_raw).lower())
+        for raw_cand in (raw_item_name, str(item.get("raw_name") or "").strip()):
+            if raw_cand:
+                base_raw = PurePosixPath(raw_cand.replace("\\", "/")).name
+                if base_raw:
+                    cand_names.add(_norm_check_name(base_raw))
+                    cand_names.add(_norm_check_name(safe_name(base_raw)))
+
+        mime_str = str(item.get("mimeType") or (item.get("meta") or {}).get("mimeType") or "").lower()
+        if mime_str.startswith("application/vnd.google-apps."):
+            stem = PurePosixPath(file_name).stem or file_name
+            for ext in (".pdf", ".docx", ".xlsx", ".pptx"):
+                cand_names.add(_norm_check_name(f"{stem}{ext}"))
+                cand_names.add(_norm_check_name(safe_name(f"{stem}{ext}")))
 
         item_url = str(item.get("path") or item.get("id") or item.get("url") or "").lower()
         item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or "").lower()
@@ -150,8 +274,8 @@ class _TargetFileChecker:
             try:
                 from .hls_backup_pipeline import generate_final_video_name
                 final_vid = generate_final_video_name(file_name)
-                cand_names.add(final_vid.lower())
-                cand_names.add(safe_name(final_vid).lower())
+                cand_names.add(_norm_check_name(final_vid))
+                cand_names.add(_norm_check_name(safe_name(final_vid)))
             except Exception:
                 pass
 
@@ -164,7 +288,7 @@ class _TargetFileChecker:
         prefix_parts = [p for p in upload_prefix.split("/") if p and p not in (".", "..")]
         if parent_prefix:
             for pp in parent_prefix.split("/"):
-                if pp and pp not in (".", "..") and (not prefix_parts or prefix_parts[-1].lower() != pp.lower()):
+                if pp and pp not in (".", "..") and (not prefix_parts or _norm_check_name(prefix_parts[-1]) != _norm_check_name(pp)):
                     prefix_parts.append(pp)
 
         candidate_dir_paths: list[list[str]] = []
@@ -172,8 +296,8 @@ class _TargetFileChecker:
         full_dir_parts = prefix_parts + dir_parts
         candidate_dir_paths.append(full_dir_parts)
 
-        if dir_parts:
-            if folder_name and dir_parts[0].lower() in (folder_name.lower(), safe_name(folder_name).lower()):
+        if dir_parts and root_id not in ("/", "root", ""):
+            if folder_name and _norm_check_name(dir_parts[0]) in (_norm_check_name(folder_name), _norm_check_name(safe_name(folder_name, is_dir=True))):
                 stripped = prefix_parts + dir_parts[1:]
                 if stripped not in candidate_dir_paths:
                     candidate_dir_paths.append(stripped)
@@ -186,6 +310,8 @@ class _TargetFileChecker:
             candidate_dir_paths.append([])
 
         for d_path in candidate_dir_paths:
+            if self._normalize_full_rel_key(d_path, file_name) in self._uploaded_rel_keys:
+                return True
             if await self._exists_in_dir_path(root_id, d_path, cand_names):
                 return True
         return False
@@ -327,14 +453,22 @@ async def run_transfer(job: JobState) -> None:
         job.log(f"Accounts: source={source.get('accountId') or source.get('account_id') or '-'} target={target.get('accountId') or target.get('account_id') or '-'}")
 
         items = source.get("items") or []
+        fallback_drive_creds: dict[str, Any] = {}
+        if str(source.get("provider") or "").lower() == "drive":
+            fallback_drive_creds = source.get("credentials") or {}
+        elif str(target.get("provider") or "").lower() == "drive":
+            fallback_drive_creds = target.get("credentials") or {}
+
+        meta_changed = False
         for item in items:
             if not isinstance(item, dict):
                 continue
             item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
             item_src = PROVIDERS.get(item_prov, src)
             item_url = str(item.get("id") or item.get("path") or item.get("url") or "").strip()
-            if item_url and hasattr(item_src, "is_folder_link") and item_src.is_folder_link(item_url):
+            if item_prov == "links" and item_url and hasattr(item_src, "is_folder_link") and item_src.is_folder_link(item_url) is True:
                 item["type"] = "folder"
+                item["is_folder"] = True
                 if isinstance(item.get("meta"), dict):
                     item["meta"]["type"] = "folder"
                 cur_name = str(item.get("name") or "").strip()
@@ -342,8 +476,26 @@ async def run_transfer(job: JobState) -> None:
                     cur_name = cur_name[:-4].strip()
                 if not cur_name or cur_name.startswith(("http://", "https://")) or "#" in cur_name:
                     clean_tail = item_url.split("#", 1)[0].split("?", 1)[0].rstrip("/").split("/")[-1]
-                    cur_name = safe_name(clean_tail or "cloud_folder")
+                    cur_name = safe_name(clean_tail or "cloud_folder", is_dir=True)
                 item["name"] = cur_name
+            if item_prov == "links" and item_url and hasattr(item_src, "resolve_item_metadata"):
+                old_name = str(item.get("name") or "").strip()
+                resolve_creds = item.get("credentials") or source.get("credentials") or fallback_drive_creds
+                try:
+                    await item_src.resolve_item_metadata(
+                        resolve_creds,
+                        item,
+                        resolve_file_names=_is_auto_skip_enabled(options),
+                    )
+                except Exception as meta_exc:
+                    job.log(f"[Metadata] Lưu ý khi truy vấn tên từ link ({item_url[:60]}): {meta_exc}")
+                new_name = str(item.get("name") or "").strip()
+                if new_name and new_name != old_name:
+                    meta_changed = True
+                    if item.get("type") == "folder" or item.get("is_folder"):
+                        job.log(f"[Folder] Đã nhận diện tên thư mục gốc: '{new_name}' (thay cho {old_name or 'ID'})")
+        if meta_changed:
+            job.save_state()
         has_folder_batch = any((item.get("type") == "folder" or item.get("is_folder")) for item in items)
         has_mixed_source_scope = len({_item_scope(source, item) for item in items}) > 1
         if options.get("optimize_image") and len(items) > 1:
@@ -1021,40 +1173,53 @@ async def _expand_folder_files(
     folder_item: dict[str, Any],
     current_rel_prefix: str = "",
     job: JobState | None = None,
+    _scan_sem: asyncio.Semaphore | None = None,
 ) -> list[dict[str, Any]]:
     """Recursively list all files in folder_item with their relative paths."""
     folder_id = str(folder_item.get("id") or folder_item.get("path") or "/")
-    try:
-        if not hasattr(provider, "list_files"):
+    scan_sem = _scan_sem or asyncio.Semaphore(6)
+    listing = folder_item.pop("_prefetched_listing", None) if isinstance(folder_item.get("_prefetched_listing"), dict) else None
+    if listing is None:
+        try:
+            if not hasattr(provider, "list_files"):
+                return []
+            async with scan_sem:
+                listing = await provider.list_files(credentials, folder_id)
+        except Exception as exc:
+            if job:
+                job.log(f"[Warning] Không thể liệt kê nội dung thư mục '{folder_item.get('name') or folder_id}': {exc}")
             return []
-        listing = await provider.list_files(credentials, folder_id)
-    except Exception as exc:
-        if job:
-            job.log(f"[Warning] Không thể liệt kê nội dung thư mục '{folder_item.get('name') or folder_id}': {exc}")
-        return []
 
     items = listing.get("items") or listing.get("files") or []
     files_result: list[dict[str, Any]] = []
+    sub_tasks: list[Any] = []
 
     for child in items:
         child_type = child.get("type") or ("folder" if (child.get("is_folder") or child.get("isdir")) else "file")
         raw_name = str(child.get("name") or child.get("server_filename") or child.get("id") or "item").replace("\\", "/")
-        child_name = safe_name(PurePosixPath(raw_name).name or raw_name)
+        child_name = safe_name(PurePosixPath(raw_name).name or raw_name, is_dir=(child_type == "folder"))
         rel_from_child = str(child.get("_relative_path") or "").replace("\\", "/").strip("/")
         if rel_from_child and "/" in rel_from_child:
-            safe_rel = "/".join(safe_name(p) for p in rel_from_child.split("/") if p and p not in (".", ".."))
+            rel_segs = [p for p in rel_from_child.split("/") if p and p not in (".", "..")]
+            safe_rel = "/".join(safe_name(p, is_dir=(i < len(rel_segs) - 1)) for i, p in enumerate(rel_segs))
             child_rel = f"{current_rel_prefix}/{safe_rel}" if current_rel_prefix else safe_rel
         else:
             child_rel = f"{current_rel_prefix}/{child_name}" if current_rel_prefix else child_name
 
         if child_type == "folder":
-            sub_files = await _expand_folder_files(provider, credentials, child, child_rel, job)
-            files_result.extend(sub_files)
+            sub_tasks.append(_expand_folder_files(provider, credentials, child, child_rel, job, _scan_sem=scan_sem))
         else:
             child_copy = dict(child)
             child_copy["_relative_path"] = child_rel
             child_copy["_parent_folder"] = folder_item
             files_result.append(child_copy)
+
+    if sub_tasks:
+        if job and current_rel_prefix and "/" not in current_rel_prefix:
+            job.log(f"[Pipeline] Thư mục '{current_rel_prefix}': phát hiện {len(sub_tasks)} thư mục con và {len(files_result)} file gốc, đang quét chi tiết...")
+        sub_lists = await asyncio.gather(*sub_tasks)
+        for sl in sub_lists:
+            files_result.extend(sl)
 
     return files_result
 
@@ -1066,16 +1231,24 @@ async def _expand_all_items_to_files(
     job: JobState | None = None,
 ) -> list[dict[str, Any]]:
     all_files: list[dict[str, Any]] = []
+    fallback_drive_creds: dict[str, Any] = {}
+    if job is not None and isinstance(getattr(job, "payload", None), dict):
+        tgt = job.payload.get("target") or {}
+        if str(tgt.get("provider") or "").lower() == "drive":
+            fallback_drive_creds = tgt.get("credentials") or {}
+
     for item in items:
         item_type = item.get("type") or ("folder" if (item.get("is_folder") or item.get("isdir")) else "file")
         item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
         item_src = PROVIDERS.get(item_prov, src)
-        item_creds = item.get("credentials") or source.get("credentials") or {}
+        item_creds = item.get("credentials") or source.get("credentials") or (fallback_drive_creds if item_prov == "links" else {})
 
         if item_type == "folder":
             raw_name = str(item.get("name") or item.get("path") or item.get("id") or "folder").replace("\\", "/")
-            folder_name = safe_name(PurePosixPath(raw_name).name or raw_name)
+            folder_name = safe_name(PurePosixPath(raw_name).name or raw_name, is_dir=True)
             folder_files = await _expand_folder_files(item_src, item_creds, item, folder_name, job)
+            if job and folder_files:
+                job.log(f"[Pipeline] Đã quét xong thư mục '{folder_name}': tổng cộng {len(folder_files)} file.")
             all_files.extend(folder_files)
         else:
             file_copy = dict(item)
@@ -1097,6 +1270,11 @@ async def _resolve_smart_folder_units(
     """
     resolved_folders: list[dict[str, Any]] = []
     resolved_files: list[dict[str, Any]] = []
+    fallback_drive_creds: dict[str, Any] = {}
+    if job is not None and isinstance(getattr(job, "payload", None), dict):
+        tgt = job.payload.get("target") or {}
+        if str(tgt.get("provider") or "").lower() == "drive":
+            fallback_drive_creds = tgt.get("credentials") or {}
 
     for item in items:
         item_type = item.get("type") or ("folder" if (item.get("is_folder") or item.get("isdir")) else "file")
@@ -1106,9 +1284,9 @@ async def _resolve_smart_folder_units(
 
         item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
         item_src = PROVIDERS.get(item_prov, src)
-        item_creds = item.get("credentials") or source.get("credentials") or {}
+        item_creds = item.get("credentials") or source.get("credentials") or (fallback_drive_creds if item_prov == "links" else {})
         raw_name = str(item.get("name") or item.get("path") or item.get("id") or "folder").replace("\\", "/")
-        f_name = safe_name(PurePosixPath(raw_name).name or raw_name)
+        f_name = safe_name(PurePosixPath(raw_name).name or raw_name, is_dir=True)
         folder_id = str(item.get("id") or item.get("path") or "/")
 
         if not hasattr(item_src, "list_files"):
@@ -1116,7 +1294,15 @@ async def _resolve_smart_folder_units(
             continue
 
         try:
-            listing = await item_src.list_files(item_creds, folder_id)
+            listing = item.pop("_prefetched_listing", None) if isinstance(item.get("_prefetched_listing"), dict) else None
+            if listing is None:
+                listing = await item_src.list_files(item_creds, folder_id)
+            resolved_title = str(listing.get("name") or "").strip()
+            if resolved_title and item_prov == "links":
+                from ..providers.links import is_placeholder_link_name
+                if is_placeholder_link_name(item.get("name"), folder_id):
+                    f_name = safe_name(resolved_title, is_dir=True)
+                    item["name"] = f_name
             children = listing.get("items") or listing.get("files") or []
         except Exception:
             resolved_folders.append(item)
@@ -1400,11 +1586,12 @@ async def _run_file_pipeline_batches(
         return
 
     if _is_auto_skip_enabled(options) and file_items:
+        job.log(f"[Auto-Skip] Đang kiểm tra đối chiếu {len(file_items)} file với thư mục đích...")
         checker = _get_target_checker(job, dst, target, options)
         missing_files: list[dict[str, Any]] = []
         for it in file_items:
             parent_folder = it.get("_parent_folder") or {}
-            f_name = safe_name(PurePosixPath(str(parent_folder.get("name") or parent_folder.get("path") or "")).name) if parent_folder else ""
+            f_name = safe_name(PurePosixPath(str(parent_folder.get("name") or parent_folder.get("path") or "")).name, is_dir=True) if parent_folder else ""
             if await checker.item_exists(it, options, folder_name=f_name):
                 rel_p = it.get("_relative_path") or _item_name(it)
                 job.files_skipped += 1
@@ -1413,6 +1600,8 @@ async def _run_file_pipeline_batches(
                     _finish_items(job, source, [it])
             else:
                 missing_files.append(it)
+        if job.files_skipped and missing_files:
+            job.log(f"[Auto-Skip] Đã bỏ qua {job.files_skipped} file đã có ở đích, còn {len(missing_files)} file cần tải.")
         file_items = missing_files
         if not file_items:
             job.log(f"[Pipeline] [Auto-Skip] Toàn bộ {job.files_skipped} file đã tồn tại ở đích. Hoàn tất!")
@@ -1477,17 +1666,20 @@ async def _run_file_pipeline_batches(
                     return
             job.start_file(item_name, phase="download", size=item_size, key=item_k)
             job.start_item(item_k, name=item_name)
+            sz_label = f" ({item_size / (1024 * 1024):.1f} MB)" if item_size > 0 else ""
+            job.log(f"[Pipeline] ↓ Đang tải: {rel_path}{sz_label}")
             try:
                 path = await download_with_retry(
                     lambda: item_src.download_file(item_creds, item, dl_dest, job),
                     progress=job, label=item_name,
                 )
+                actual_name = path.name if (path and path.exists()) else item_name
                 actual_size = path.stat().st_size if (path and path.exists()) else item_size
                 job.finish_file(item_name, phase="download", size=actual_size, key=item_k)
                 if item_k != item_name:
                     job.file_sizes[item_k] = actual_size
                 job.files_downloaded += 1
-                job.log(f"[{job.files_downloaded}/{job.files_to_download}] Downloaded: {item_name}")
+                job.log(f"[{job.files_downloaded}/{job.files_to_download}] Downloaded: {actual_name}")
                 _remember_source_ref(job, path, item)
             except ProviderFailure as exc:
                 job.finish_file(item_name, phase="download", key=item_k)
@@ -2166,6 +2358,14 @@ async def _recover_upload(
     return True
 
 async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options: dict[str, Any], dst: Any, path: Path, rel: str, item: dict[str, Any], gate: _UploadGate | None = None) -> None:
+    live_opts = _live_options(job, options)
+    if _is_auto_skip_enabled(live_opts) and not live_opts.get("replace"):
+        checker = _get_target_checker(job, dst, target, live_opts)
+        if await checker.relative_path_exists(rel, live_opts):
+            job.files_skipped += 1
+            job._upload_log_done = getattr(job, "_upload_log_done", 0) + 1
+            job.log(f"[Auto-Skip] File đã tồn tại ở đích, bỏ qua upload: {rel}")
+            return
     retry_count = 0
     while retry_count < 3:
         retry_count += 1
@@ -2185,6 +2385,9 @@ async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options
                 await active_dst.replace_file(target.get("credentials") or {}, path, source_ref, job)
             else:
                 await active_dst.upload_file(target.get("credentials") or {}, path, target_ref, job)
+                cur_checker = getattr(job, "_target_checker", None)
+                if isinstance(cur_checker, _TargetFileChecker):
+                    cur_checker.record_uploaded(rel, options)
             job.files_uploaded += 1
             if not getattr(job, "_waiting_for_account", False):
                 job.error = None
@@ -2240,6 +2443,14 @@ async def _upload_path_with_retry(job: JobState, target: dict[str, Any], options
 
 async def _upload_one_with_retry(job: JobState, target: dict[str, Any], options: dict[str, Any], dst: Any, path: Path) -> dict[str, Any]:
     file_sz = path.stat().st_size if path.exists() else 0
+    live_opts = _live_options(job, options)
+    if _is_auto_skip_enabled(live_opts) and not live_opts.get("replace"):
+        checker = _get_target_checker(job, dst, target, live_opts)
+        if await checker.relative_path_exists(path.name, live_opts):
+            job.files_skipped += 1
+            job.finish_file(path.name, phase="upload")
+            job.log(f"[Auto-Skip] File đã tồn tại ở đích, bỏ qua upload: {path.name}")
+            return {"ok": True, "uploaded": 0, "skipped": 1, "items": []}
     if path.name in job.uploaded_files:
         job.log(f"[Cache-Hit] File already uploaded: {path.name}. Skipping re-upload.")
         job.files_uploaded = 1
@@ -2254,6 +2465,10 @@ async def _upload_one_with_retry(job: JobState, target: dict[str, Any], options:
                 source = (job.payload.get("source") or {}).get("items") or []
                 source_ref = {**source[0], "name": path.name} if source and options.get("replace") and hasattr(active_dst, "replace_file") else None
                 result = await (active_dst.replace_file(target.get("credentials") or {}, path, source_ref, job) if source_ref else active_dst.upload_file(target.get("credentials") or {}, path, _upload_target(target.get("folder") or {}, path.name, options), job))
+                if not source_ref:
+                    cur_checker = getattr(job, "_target_checker", None)
+                    if isinstance(cur_checker, _TargetFileChecker):
+                        cur_checker.record_uploaded(path.name, options)
                 job.files_uploaded = 1
                 job.uploaded_files.add(path.name)
                 job.save_state()
@@ -2446,6 +2661,9 @@ def apply_retry_target_update(
             orig_creds.clear()
             orig_creds.update(new_creds_copy)
             merged["credentials"] = orig_creds
+
+    if account_changed or provider_changed or merged.get("folder") != old_folder:
+        setattr(job, "_target_checker", None)
 
     if isinstance(payload_target, dict) and payload_target is not merged:
         payload_target.clear()

@@ -5990,6 +5990,7 @@ def test_mega_parallel_chunk_decrypt_rotates_multiple_509_and_disconnected_tor_c
         assert job.bytes_done == len(plain_original) * 2
 
     asyncio.run(_run())
+
     # Verify multi-port Tor daemon distribution (ports 9050..9053 used)
     used_ports = {
         _re.search(r":(905\d)$", px).group(1)
@@ -6074,6 +6075,240 @@ def test_mega_stream_decrypt_refreshes_expired_dl_url_on_repeated_403(tmp_path, 
         assert len(refreshes) == 1
 
     asyncio.run(_run())
+
+
+def test_gdrive_folder_link_file_by_file_resolves_real_folder_name_and_auto_skips_existing(tmp_path, monkeypatch):
+    """Verify Google Drive folder links in file_by_file mode:
+    1) Resolve real folder name ('CNNs') instead of 'GDrive_Folder_1ytmMWpxqqrE',
+    2) Expand nested subfolders via LinksProvider.list_files instead of blocking on gdown.download_folder,
+    3) Retry transient target list_files errors without caching empty sets, and check all duplicate-named target folders.
+    """
+    import unicodedata
+    from src.providers.links import LinksProvider
+
+    dirs = {"input": tmp_path / "input", "work": tmp_path / "work", "output": tmp_path / "output"}
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+
+    links_prov = LinksProvider()
+    monkeypatch.setattr(LinksProvider, "_ensure_deps", classmethod(lambda cls: asyncio.sleep(0)))
+
+    root_url = "https://drive.google.com/drive/folders/1ytmMWpxqqrE6RNZU2yihH3eP6oEltdgR"
+    part1_url = "https://drive.google.com/drive/folders/1nAJiIxEdv72pdgyuxVuYWjQTgvqGT54u"
+    part2_url = "https://drive.google.com/drive/folders/1wneH517mOVnUbBqqnA0ziIcdQygVLe4m"
+
+    async def fake_resolve_title(folder_id: str, resourcekey: str = "") -> str:
+        if folder_id == "1ytmMWpxqqrE6RNZU2yihH3eP6oEltdgR":
+            return "CNNs"
+        return ""
+
+    async def fake_list_gdrive(url: str, credentials=None):
+        if "1ytmMWpxqqrE6RNZU2yihH3eP6oEltdgR" in url:
+            return "CNNs", [
+                {"id": part1_url, "path": part1_url, "url": part1_url, "name": "part1", "type": "folder", "is_folder": True, "provider": "links"},
+                {"id": part2_url, "path": part2_url, "url": part2_url, "name": "part2", "type": "folder", "is_folder": True, "provider": "links"},
+            ]
+        if "1nAJiIxEdv72pdgyuxVuYWjQTgvqGT54u" in url:
+            return "part1", [
+                {
+                    "id": "https://drive.google.com/uc?id=file_slide_1&export=download",
+                    "path": "https://drive.google.com/uc?id=file_slide_1&export=download",
+                    "url": "https://drive.google.com/uc?id=file_slide_1&export=download",
+                    "name": "1.[Slide_v3]-From_MLP_to_CNN.pdf",
+                    "type": "file",
+                    "size": 10_201_005,
+                    "provider": "links",
+                },
+                {
+                    "id": "https://drive.google.com/uc?id=file_rec_1&export=download",
+                    "path": "https://drive.google.com/uc?id=file_rec_1&export=download",
+                    "url": "https://drive.google.com/uc?id=file_rec_1&export=download",
+                    "name": "GMT20251210_Recording.mp4",
+                    "type": "file",
+                    "size": 21,
+                    "provider": "links",
+                },
+            ]
+        if "1wneH517mOVnUbBqqnA0ziIcdQygVLe4m" in url:
+            return "part2", [
+                {
+                    "id": "https://drive.google.com/uc?id=file_vn_doc&export=download",
+                    "path": "https://drive.google.com/uc?id=file_vn_doc&export=download",
+                    "url": "https://drive.google.com/uc?id=file_vn_doc&export=download",
+                    "name": unicodedata.normalize("NFC", "Bài giảng 02.pdf"),
+                    "type": "file",
+                    "size": 4_194_304,
+                    "provider": "links",
+                },
+                {
+                    "id": "https://drive.google.com/uc?id=file_new_2&export=download",
+                    "path": "https://drive.google.com/uc?id=file_new_2&export=download",
+                    "url": "https://drive.google.com/uc?id=file_new_2&export=download",
+                    "name": "Lab02_Solution.ipynb",
+                    "type": "file",
+                    "size": 21,
+                    "provider": "links",
+                },
+            ]
+        return "", []
+
+    downloaded_urls = []
+
+    async def fake_dl_gdrive(url: str, dest_dir: Path, name: str | None, progress: JobState):
+        downloaded_urls.append(url)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out = dest_dir / (name or "file.bin")
+        out.write_bytes(b"gdrive-stream-content")
+        progress.add_bytes(21, 21, "download", out.name)
+        return [out]
+
+    async def fail_if_gdown_folder(*args, **kwargs):
+        raise AssertionError("Should use file_by_file pipeline instead of gdown.download_folder")
+
+    monkeypatch.setattr(links_prov, "_resolve_gdrive_folder_title", fake_resolve_title)
+    monkeypatch.setattr(links_prov, "_list_gdrive_folder_items", fake_list_gdrive)
+    monkeypatch.setattr(links_prov, "_download_gdrive", fake_dl_gdrive)
+    monkeypatch.setattr(links_prov, "_download_gdrive_folder", fail_if_gdown_folder)
+
+    uploaded_rel_paths = []
+    list_attempts_root = 0
+
+    class FakeDriveTarget:
+        async def list_files(self, credentials, path_or_id):
+            nonlocal list_attempts_root
+            if path_or_id in ("/", "root", "dest_root_id"):
+                list_attempts_root += 1
+                if list_attempts_root == 1:
+                    # Simulate transient glitch on first check: must retry instead of caching empty!
+                    raise RuntimeError("Transient 503 backendError")
+                # Simulate two duplicate 'CNNs' folders on Drive where existing files live in the first one
+                return {
+                    "items": [
+                        {"id": "cnns_dup_full", "name": "CNNs", "type": "folder", "is_folder": True},
+                        {"id": "cnns_dup_empty", "name": "CNNs", "type": "folder", "is_folder": True},
+                    ]
+                }
+            if path_or_id == "cnns_dup_empty":
+                return {"items": []}
+            if path_or_id == "cnns_dup_full":
+                return {
+                    "items": [
+                        {"id": "p1_id", "name": "part1", "type": "folder", "is_folder": True},
+                        {"id": "p2_id", "name": "part2", "type": "folder", "is_folder": True},
+                    ]
+                }
+            if path_or_id == "p1_id":
+                return {
+                    "items": [
+                        {"id": "existing_1", "name": "1.[Slide_v3]-From_MLP_to_CNN.pdf", "type": "file", "size": 10_201_005},
+                    ]
+                }
+            if path_or_id == "p2_id":
+                # Simulate NFD decomposed Vietnamese filename on target Drive
+                return {
+                    "items": [
+                        {"id": "existing_vn", "name": unicodedata.normalize("NFD", "Bài giảng 02.pdf"), "type": "file", "size": 4_194_304},
+                    ]
+                }
+            return {"items": []}
+
+        async def upload_file(self, credentials, local_path: Path, target_ref, progress: JobState):
+            uploaded_rel_paths.append(target_ref.get("relative_path") or local_path.name)
+            return {"ok": True}
+
+    monkeypatch.setattr(transfer_job_mod, "job_dirs", lambda job_id: dirs)
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "links", links_prov)
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "drive", FakeDriveTarget())
+
+    payload = {
+        "source": {
+            "provider": "links",
+            "items": [
+                {
+                    "id": root_url,
+                    "path": root_url,
+                    "name": "GDrive_Folder_1ytmMWpxqqrE",
+                    "type": "folder",
+                    "is_folder": True,
+                    "provider": "links",
+                }
+            ],
+        },
+        "target": {"provider": "drive", "accountId": "gd_1c7267ccb27018f8", "folder": {"id": "dest_root_id", "path": "/Courses"}},
+        "options": {"transfer_strategy": "file_by_file", "auto_skip": True, "cleanupAfterFinish": True},
+    }
+    job = JobState("test-gdrive-folder-cnns", payload)
+    asyncio.run(run_transfer(job))
+
+    assert job.status == "completed"
+    assert payload["source"]["items"][0]["name"] == "CNNs"
+    assert job.files_skipped == 2
+    assert job.files_downloaded == 2
+    assert job.files_uploaded == 2
+    assert sorted(uploaded_rel_paths) == [
+        "CNNs/part1/GMT20251210_Recording.mp4",
+        "CNNs/part2/Lab02_Solution.ipynb",
+    ]
+    assert any("CNNs" in line for line in job.logs)
+    assert any("File-by-File" in line for line in job.logs)
+
+
+def test_auto_skip_pre_upload_prevents_duplicates_on_resolved_names_and_duplicate_links(tmp_path, monkeypatch):
+    """When single links only reveal their real filename during download (e.g. MediaFire_abc -> slide1.pdf)
+    or when two links download to the same filename, pre-upload Auto-Skip + record_uploaded must prevent duplicates."""
+    dirs = {"input": tmp_path / "input", "work": tmp_path / "work", "output": tmp_path / "output"}
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+
+    class FakeLinksSource:
+        async def download_file(self, credentials, file_ref, dest_dir: Path, progress: JobState):
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            uid = file_ref["id"]
+            real_name = "already_there.pdf" if uid == "u_existing" else "brand_new.mp4"
+            file_ref["name"] = real_name
+            out = dest_dir / real_name
+            out.write_bytes(b"payload")
+            return out
+
+    uploaded_files = []
+
+    class FakeDriveTarget:
+        async def list_files(self, credentials, path_or_id):
+            return {
+                "items": [
+                    {"id": "drv_1", "name": "already_there.pdf", "type": "file", "size": 7},
+                ]
+            }
+
+        async def upload_file(self, credentials, local_path: Path, target_ref, progress: JobState):
+            uploaded_files.append(target_ref.get("relative_path") or local_path.name)
+            return {"ok": True}
+
+    monkeypatch.setattr(transfer_job_mod, "job_dirs", lambda job_id: dirs)
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "links", FakeLinksSource())
+    monkeypatch.setitem(transfer_job_mod.PROVIDERS, "drive", FakeDriveTarget())
+
+    payload = {
+        "source": {
+            "provider": "links",
+            "items": [
+                {"id": "u_existing", "name": "MediaFire_111", "type": "file"},
+                {"id": "u_new_1", "name": "MediaFire_222", "type": "file"},
+                {"id": "u_new_2_dup", "name": "MediaFire_333", "type": "file"},
+            ],
+        },
+        "target": {"provider": "drive", "folder": {"id": "dest_id", "path": "/Dest"}},
+        "options": {"transfer_strategy": "file_by_file", "auto_skip": True, "download_concurrency": 1, "upload_concurrency": 1},
+    }
+    job = JobState("test-pre-upload-autoskip", payload)
+    asyncio.run(run_transfer(job))
+
+    assert job.status == "completed"
+    # 'already_there.pdf' skipped pre-upload; 'brand_new.mp4' uploaded once, second duplicate skipped pre-upload!
+    assert uploaded_files == ["brand_new.mp4"]
+    assert job.files_uploaded == 1
+    assert job.files_skipped >= 2
+
 
 
 

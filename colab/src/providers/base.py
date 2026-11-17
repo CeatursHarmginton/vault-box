@@ -257,11 +257,21 @@ class BaseProvider(ABC):
         async def upload(path: Path) -> dict[str, Any] | None:
             progress.check_cancelled()
             async with sem:
+                live_options = (progress.payload or {}).get("options", options) if hasattr(progress, "payload") else options
                 rel = "/".join(part for part in (str(root_target.get("relative_path") or "").strip("/"), path.relative_to(local_dir).as_posix()) if part)
+                checker = getattr(progress, "_target_checker", None)
+                if checker is not None and not live_options.get("replace") and (live_options.get("auto_skip") or live_options.get("autoSkip")):
+                    if await checker.relative_path_exists(rel, live_options, already_prefixed=True):
+                        progress.files_skipped += 1
+                        progress.finish_item(path.name, status="skipped", name=path.name)
+                        progress.log(f"[Auto-Skip] File đã tồn tại ở đích, bỏ qua upload: {rel}")
+                        return None
                 file_sz = path.stat().st_size if path.exists() else 0
                 progress.start_file(path.name, phase="upload", size=file_sz)
                 try:
                     res = await self.upload_file(credentials, path, {**root_target, "relative_path": rel}, progress)
+                    if checker is not None:
+                        checker.record_uploaded(rel, live_options, already_prefixed=True)
                     progress.files_uploaded += 1
                     progress.finish_file(path.name, phase="upload", size=file_sz)
                     progress.finish_item(path.name, status="done", name=path.name)

@@ -34,6 +34,56 @@ from ..config import DOWNLOAD_THREADS
 
 BT_TRACKERS = "udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,udp://tracker.openbittorrent.com:6969/announce,udp://exodus.desync.com:6969/announce"
 
+_GDRIVE_FRONTEND_API_KEY = "AIzaSyD_InbmSFufIEps5UAt2NmB_3LvBH3Sz_8"
+_GDRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
+_GDRIVE_SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
+_GDRIVE_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+_PLACEHOLDER_LINK_NAME_RE = re.compile(
+    r"^(?:"
+    r"GDrive_Folder_[A-Za-z0-9_-]+|"
+    r"GDrive_[A-Za-z0-9_-]+|"
+    r"GDrive_File|"
+    r"MEGA_Folder_[A-Za-z0-9_-]+|"
+    r"MEGA_File_[A-Za-z0-9_-]+|"
+    r"MEGA_Download|"
+    r"MediaFire_Folder_[A-Za-z0-9,_-]+|"
+    r"MediaFire_[A-Za-z0-9_-]+|"
+    r"Pixeldrain_List_[A-Za-z0-9_-]+|"
+    r"Pixeldrain_[A-Za-z0-9_-]+|"
+    r"Gofile_[A-Za-z0-9_-]+|"
+    r"Dropbox_Folder_[A-Za-z0-9_-]+|"
+    r"cloud_folder|folder|"
+    r"(?:video_)?download_\d+(?:\.[A-Za-z0-9]{2,5})?"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def is_placeholder_link_name(name: str | None, url: str = "") -> bool:
+    """Return True if ``name`` is empty or an auto-generated link ID placeholder rather than a real title."""
+    s = str(name or "").strip()
+    if not s:
+        return True
+    if s.startswith(("http://", "https://")) or "#" in s:
+        return True
+    if _PLACEHOLDER_LINK_NAME_RE.match(s):
+        return True
+    stem = s[:-4].strip() if s.lower().endswith(".mp4") else s
+    if _PLACEHOLDER_LINK_NAME_RE.match(stem):
+        return True
+    if url:
+        clean_tail = str(url).split("#", 1)[0].split("?", 1)[0].rstrip("/").split("/")[-1].strip()
+        if clean_tail and stem in (clean_tail, safe_name(clean_tail)):
+            # For cloud share links where URL tail is an opaque ID (Drive/MEGA/Gofile/Pixeldrain/MediaFire), treat as placeholder
+            if any(h in url.lower() for h in ("drive.google.com", "docs.google.com", "drive.usercontent.google.com", "mega.nz", "mega.co.nz", "gofile.io", "pixeldrain.com", "mediafire.com")):
+                return True
+    return False
+
+
 class LinksProvider(BaseProvider):
     """Provider for downloading files from user-provided URLs."""
     
@@ -567,8 +617,8 @@ class LinksProvider(BaseProvider):
                 return "mediafire_folder"
             return "mediafire"
 
-        if "drive.google.com" in url_lower or "docs.google.com" in url_lower:
-            if "/drive/folders/" in url_lower or "/drive/u/" in url_lower and "/folders/" in url_lower or "folders/" in parsed.path:
+        if any(h in url_lower for h in ("drive.google.com", "docs.google.com", "drive.usercontent.google.com")):
+            if "/drive/folders/" in url_lower or ("/drive/u/" in url_lower and "/folders/" in url_lower) or "folders/" in parsed.path or "embeddedfolderview" in parsed.path:
                 return "gdrive_folder"
             return "gdrive"
 
@@ -1720,30 +1770,595 @@ class LinksProvider(BaseProvider):
             if cookie_dir:
                 shutil.rmtree(cookie_dir, ignore_errors=True)
 
+    @staticmethod
+    def _extract_gdrive_id_and_resourcekey(url: str) -> tuple[str, str]:
+        u = str(url or "").strip()
+        if not u:
+            return "", ""
+        parsed = urlparse(u)
+        qs = parse_qs(parsed.query)
+        rk = str((qs.get("resourcekey") or qs.get("resourceKey") or [""])[0] or "").strip()
+
+        for pat in (
+            r"/folders/([A-Za-z0-9_-]{10,})",
+            r"/file/d/([A-Za-z0-9_-]{10,})",
+            r"/(?:document|spreadsheets|presentation|drawings)/d/([A-Za-z0-9_-]{10,})",
+            r"/d/([A-Za-z0-9_-]{10,})",
+        ):
+            m = re.search(pat, parsed.path)
+            if m:
+                return m.group(1), rk
+
+        q_id = str((qs.get("id") or [""])[0] or "").strip()
+        if q_id:
+            return q_id, rk
+
+        tail = parsed.path.rstrip("/").split("/")[-1].strip()
+        if re.match(r"^[A-Za-z0-9_-]{15,}$", tail):
+            return tail, rk
+        return "", rk
+
+    @staticmethod
+    def _clean_gdrive_html_title(raw_title: str) -> str:
+        t = html.unescape(str(raw_title or "")).strip()
+        t = re.sub(r"\s+", " ", t)
+        for suffix in (
+            " - Google Drive",
+            " – Google Drive",
+            " - Google Tài liệu",
+            " - Google Trang tính",
+            " - Google Trang trình bày",
+            " - Google Docs",
+            " - Google Sheets",
+            " - Google Slides",
+        ):
+            if t.lower().endswith(suffix.lower()):
+                t = t[: -len(suffix)].strip()
+                break
+        bad_lower = t.lower()
+        if not t or bad_lower in {
+            "google drive",
+            "meet google drive – one place for all your files",
+            "sign in - google accounts",
+            "google accounts",
+            "error 404 (not found)!!1",
+            "page not found",
+        } or "sign in" in bad_lower and "google" in bad_lower:
+            return ""
+        return t
+
+    @staticmethod
+    def _parse_content_disposition_filename(cd_header: str) -> str:
+        if not cd_header:
+            return ""
+        m_utf8 = re.search(r"filename\*\s*=\s*(?:UTF-8|utf-8)''([^;\r\n]+)", cd_header)
+        if m_utf8:
+            val = unquote(m_utf8.group(1).strip().strip('"'))
+            if val:
+                return val
+        m_quoted = re.search(r'filename\s*=\s*"([^"\r\n]+)"', cd_header)
+        if m_quoted:
+            val = unquote(m_quoted.group(1).strip())
+            if val:
+                return val
+        m_plain = re.search(r"filename\s*=\s*([^;\r\n]+)", cd_header)
+        if m_plain:
+            val = unquote(m_plain.group(1).strip().strip('"'))
+            if val:
+                return val
+        return ""
+
+    @staticmethod
+    def _extract_gdrive_confirm_download_url(html_text: str, fallback_fid: str = "", rk: str = "") -> tuple[str, str]:
+        """Parse Google Drive virus-scan confirmation HTML and return (direct_download_url, discovered_filename)."""
+        discovered_name = ""
+        m_name = re.search(r'class="uc-name-size"[^>]*>\s*<a[^>]*>(.*?)</a>', html_text, re.S | re.I)
+        if m_name:
+            discovered_name = html.unescape(re.sub(r"<[^>]+>", "", m_name.group(1))).strip()
+
+        if "uc-error-subcaption" in html_text:
+            m_err = re.search(r'<p[^>]*class="uc-error-subcaption"[^>]*>(.*?)</p>', html_text, re.S | re.I)
+            err_txt = html.unescape(re.sub(r"<[^>]+>", "", m_err.group(1))).strip() if m_err else "Google Drive denied public download"
+            raise ProviderFailure("PROVIDER_RATE_LIMITED" if "quota" in err_txt.lower() or "too many" in err_txt.lower() else "DOWNLOAD_FAILED", err_txt)
+
+        m_form = re.search(r'<form[^>]*id="download-form"[^>]*action="([^"]+)"[^>]*>(.*?)</form>', html_text, re.S | re.I)
+        if m_form:
+            action = html.unescape(m_form.group(1))
+            form_inner = m_form.group(2)
+            parsed_action = urlparse(action)
+            q_params = {k: v[0] for k, v in parse_qs(parsed_action.query).items() if v}
+            for inp in re.finditer(r'<input[^>]+type="hidden"[^>]*>', form_inner, re.I):
+                tag = inp.group(0)
+                mn = re.search(r'name="([^"]+)"', tag, re.I)
+                mv = re.search(r'value="([^"]*)"', tag, re.I)
+                if mn and mv is not None:
+                    q_params[html.unescape(mn.group(1))] = html.unescape(mv.group(1))
+            if rk and "resourcekey" not in q_params:
+                q_params["resourcekey"] = rk
+            new_q = urlencode(q_params)
+            return urlunparse((parsed_action.scheme or "https", parsed_action.netloc or "drive.usercontent.google.com", parsed_action.path, "", new_q, "")), discovered_name
+
+        m_dl = re.search(r'"downloadUrl"\s*:\s*"([^"]+)"', html_text)
+        if m_dl:
+            dl_u = m_dl.group(1).replace("\\u003d", "=").replace("\\u0026", "&").replace("\\/", "/")
+            return dl_u, discovered_name
+
+        m_href = re.search(r'href="(/uc\?export=download[^"]+)"', html_text)
+        if m_href:
+            return "https://drive.google.com" + html.unescape(m_href.group(1)), discovered_name
+
+        if fallback_fid:
+            params = {"id": fallback_fid, "export": "download", "confirm": "t"}
+            if rk:
+                params["resourcekey"] = rk
+            return f"https://drive.usercontent.google.com/download?{urlencode(params)}", discovered_name
+        return "", discovered_name
+
+    @classmethod
+    def _normalize_gdrive_workspace_item(cls, fid: str, raw_title: str, mime: str, rk: str = "") -> tuple[str, str] | None:
+        """If ``mime`` is a Google Docs/Sheets/Slides/Drawings native document, return (export_url, filename_with_ext)."""
+        if not mime.startswith("application/vnd.google-apps.") or mime in (_GDRIVE_FOLDER_MIME, _GDRIVE_SHORTCUT_MIME):
+            return None
+        kind_map = {
+            "application/vnd.google-apps.document": ("document", "docx", ".docx"),
+            "application/vnd.google-apps.spreadsheet": ("spreadsheets", "xlsx", ".xlsx"),
+            "application/vnd.google-apps.presentation": ("presentation", "pptx", ".pptx"),
+            "application/vnd.google-apps.drawing": ("drawings", "pdf", ".pdf"),
+        }
+        if mime in kind_map:
+            doc_path, fmt, ext = kind_map[mime]
+            q = {"format": fmt}
+            if rk:
+                q["resourcekey"] = rk
+            export_url = f"https://docs.google.com/{doc_path}/d/{fid}/export?{urlencode(q)}"
+            clean_t = safe_name(raw_title or fid)
+            if not clean_t.lower().endswith(ext):
+                clean_t = f"{clean_t}{ext}"
+            return export_url, clean_t
+        return None
+
+    async def _resolve_gdrive_folder_title(self, folder_id: str, resourcekey: str = "") -> str:
+        if not folder_id:
+            return ""
+        cache = getattr(self, "_folder_title_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._folder_title_cache = cache
+        if folder_id in cache and cache[folder_id]:
+            return cache[folder_id]
+
+        headers = {"User-Agent": _GDRIVE_BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"}
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=headers) as client:
+            params: dict[str, str] = {"id": folder_id}
+            if resourcekey:
+                params["resourcekey"] = resourcekey
+            try:
+                r_emb = await client.get("https://drive.google.com/embeddedfolderview", params=params)
+                if r_emb.status_code == 200 and r_emb.text:
+                    m_t = re.search(r"<title>(.*?)</title>", r_emb.text, re.S | re.I)
+                    if m_t:
+                        title = self._clean_gdrive_html_title(m_t.group(1))
+                        if title:
+                            cache[folder_id] = title
+                            return title
+            except Exception:
+                pass
+
+            try:
+                folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
+                r_page = await client.get(folder_url, params={"resourcekey": resourcekey} if resourcekey else None)
+                if r_page.status_code == 200 and r_page.text:
+                    m_t = re.search(r"<title>(.*?)</title>", r_page.text, re.S | re.I)
+                    if m_t:
+                        title = self._clean_gdrive_html_title(m_t.group(1))
+                        if title:
+                            cache[folder_id] = title
+                            return title
+            except Exception:
+                pass
+        return ""
+
+    async def _list_gdrive_folder_items(self, url: str, credentials: dict[str, Any] | None = None) -> tuple[str, list[dict[str, Any]]]:
+        folder_id, rk = self._extract_gdrive_id_and_resourcekey(url)
+        if not folder_id:
+            return "", []
+
+        title_task = asyncio.create_task(self._resolve_gdrive_folder_title(folder_id, rk))
+        items: list[dict[str, Any]] = []
+
+        def _make_item(cid: str, raw_name: str, mime: str, size: int = 0) -> dict[str, Any] | None:
+            if not cid or mime == _GDRIVE_SHORTCUT_MIME:
+                return None
+            if mime == _GDRIVE_FOLDER_MIME:
+                sub_u = f"https://drive.google.com/drive/folders/{cid}"
+                d_name = safe_name(raw_name or cid, is_dir=True)
+                return {
+                    "id": sub_u,
+                    "path": sub_u,
+                    "url": sub_u,
+                    "name": d_name,
+                    "raw_name": raw_name or d_name,
+                    "type": "folder",
+                    "is_folder": True,
+                    "mimeType": mime,
+                    "size": 0,
+                    "provider": "links",
+                    "meta": {"provider": "links", "gdrive_id": cid, "mimeType": mime, "type": "folder"},
+                }
+            ws_doc = self._normalize_gdrive_workspace_item(cid, raw_name, mime, rk=rk)
+            if ws_doc is not None:
+                exp_url, exp_name = ws_doc
+                return {
+                    "id": exp_url,
+                    "path": exp_url,
+                    "url": exp_url,
+                    "name": exp_name,
+                    "raw_name": raw_name or exp_name,
+                    "type": "file",
+                    "is_folder": False,
+                    "mimeType": mime,
+                    "size": 0,
+                    "provider": "links",
+                    "meta": {"provider": "links", "gdrive_id": cid, "mimeType": mime, "size": 0},
+                }
+            q_dl = {"id": cid, "export": "download"}
+            if rk:
+                q_dl["resourcekey"] = rk
+            dl_u = f"https://drive.google.com/uc?{urlencode(q_dl)}"
+            f_name = safe_name(raw_name or cid)
+            return {
+                "id": dl_u,
+                "path": dl_u,
+                "url": dl_u,
+                "name": f_name,
+                "raw_name": raw_name or f_name,
+                "type": "file",
+                "is_folder": False,
+                "mimeType": mime,
+                "size": max(0, int(size or 0)),
+                "provider": "links",
+                "meta": {"provider": "links", "gdrive_id": cid, "mimeType": mime, "size": max(0, int(size or 0))},
+            }
+
+        # 1. Primary: Paginated drivefrontend-pa v1/items:list (supports 1000+ items & exact byte sizes)
+        try:
+            async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
+                page_token = ""
+                parent_entry = [folder_id, 0, rk] if rk else [folder_id, 0]
+                while True:
+                    body: list[Any] = [[None] * 44, [1000, page_token, [2, 5]]]
+                    body[0][4] = 0
+                    body[0][21] = 0
+                    body[0][24] = [4, 1, 1]
+                    body[0][35] = [[1]]
+                    body[0][43] = [parent_entry]
+                    resp = await client.post(
+                        "https://drivefrontend-pa.clients6.google.com/v1/items:list",
+                        params={"key": _GDRIVE_FRONTEND_API_KEY},
+                        json=body,
+                        headers={
+                            "User-Agent": _GDRIVE_BROWSER_UA,
+                            "Origin": "https://drive.google.com",
+                            "Referer": f"https://drive.google.com/drive/folders/{folder_id}",
+                            "content-type": "application/json+protobuf",
+                            "x-goog-fieldmask": "items(id,title,mime_type,file_size,explicitly_trashed,trashed),continuation_token",
+                        },
+                    )
+                    if resp.status_code != 200:
+                        items.clear()
+                        break
+                    txt = resp.text.lstrip()
+                    if txt.startswith(")]}'"):
+                        txt = txt[4:].lstrip()
+                    data = json.loads(txt)
+                    raw_rows = data[0] if isinstance(data, list) and data and isinstance(data[0], list) else []
+                    for row in raw_rows:
+                        if not isinstance(row, list) or not row:
+                            continue
+                        cid = str(row[0] if len(row) > 0 and row[0] else "")
+                        cname = str(row[2] if len(row) > 2 and row[2] else "")
+                        cmime = str(row[3] if len(row) > 3 and row[3] else "")
+                        csize = int(row[13] if len(row) > 13 and row[13] else 0)
+                        trashed = bool((len(row) > 25 and row[25]) or (len(row) > 87 and row[87]))
+                        if trashed:
+                            continue
+                        built = _make_item(cid, cname, cmime, csize)
+                        if built:
+                            items.append(built)
+                    next_tok = str(data[1] if isinstance(data, list) and len(data) > 1 and data[1] else "")
+                    if not next_tok or next_tok == page_token:
+                        break
+                    page_token = next_tok
+        except Exception:
+            items.clear()
+
+        # 2. Fallback: _DRIVE_ivd embedded JSON or embeddedfolderview HTML links
+        if not items:
+            try:
+                async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, headers={"User-Agent": _GDRIVE_BROWSER_UA}) as client:
+                    r_page = await client.get(
+                        f"https://drive.google.com/drive/folders/{folder_id}",
+                        params={"resourcekey": rk} if rk else None,
+                    )
+                    if r_page.status_code == 200 and r_page.text:
+                        m_ivd = re.search(r"_DRIVE_ivd'\s*\]\s*=\s*'([^']+)'", r_page.text)
+                        if m_ivd:
+                            dec = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), m_ivd.group(1))
+                            dec = dec.replace("\\'", "'").replace("\\\\", "\\")
+                            ivd_data = json.loads(dec)
+                            raw_rows = ivd_data[0] if isinstance(ivd_data, list) and ivd_data and isinstance(ivd_data[0], list) else []
+                            for row in raw_rows:
+                                if not isinstance(row, list) or not row:
+                                    continue
+                                cid = str(row[0] if len(row) > 0 and row[0] else "")
+                                cname = str(row[2] if len(row) > 2 and row[2] else "")
+                                cmime = str(row[3] if len(row) > 3 and row[3] else "")
+                                csize = int(row[13] if len(row) > 13 and row[13] else 0)
+                                built = _make_item(cid, cname, cmime, csize)
+                                if built:
+                                    items.append(built)
+
+                    if not items:
+                        r_emb = await client.get(
+                            "https://drive.google.com/embeddedfolderview",
+                            params={"id": folder_id, **({"resourcekey": rk} if rk else {})},
+                        )
+                        if r_emb.status_code == 200 and r_emb.text:
+                            for m_a in re.finditer(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', r_emb.text, re.S | re.I):
+                                href = html.unescape(m_a.group(1))
+                                label = html.unescape(re.sub(r"<[^>]+>", "", m_a.group(2))).strip()
+                                m_f = re.search(r"drive\.google\.com/file/d/([A-Za-z0-9_-]{10,})", href)
+                                if m_f:
+                                    built = _make_item(m_f.group(1), label, "application/octet-stream", 0)
+                                    if built:
+                                        items.append(built)
+                                    continue
+                                m_doc = re.search(r"docs\.google\.com/(\w+)/d/([A-Za-z0-9_-]{10,})", href)
+                                if m_doc:
+                                    kind, doc_id = m_doc.group(1), m_doc.group(2)
+                                    mime = f"application/vnd.google-apps.{kind.removesuffix('s')}"
+                                    built = _make_item(doc_id, label, mime, 0)
+                                    if built:
+                                        items.append(built)
+                                    continue
+                                m_dir = re.search(r"/folders/([A-Za-z0-9_-]{10,})", href)
+                                if m_dir:
+                                    built = _make_item(m_dir.group(1), label, _GDRIVE_FOLDER_MIME, 0)
+                                    if built:
+                                        items.append(built)
+            except Exception:
+                pass
+
+        # 3. Authenticated fallback if Drive credentials were supplied
+        if not items and credentials and (credentials.get("access_token") or credentials.get("token") or credentials.get("cookies")):
+            try:
+                from .drive import DriveProvider
+                drv_res = await DriveProvider().list_files(credentials, folder_id)
+                for d_it in drv_res.get("items") or []:
+                    built = _make_item(
+                        str(d_it.get("id") or ""),
+                        str(d_it.get("name") or ""),
+                        str(d_it.get("mimeType") or (_GDRIVE_FOLDER_MIME if d_it.get("is_folder") else "application/octet-stream")),
+                        int(d_it.get("size") or 0),
+                    )
+                    if built:
+                        items.append(built)
+            except Exception:
+                pass
+
+        folder_title = ""
+        try:
+            folder_title = await title_task
+        except Exception:
+            folder_title = ""
+
+        if folder_title:
+            titles = getattr(self, "_last_folder_titles", None)
+            if not isinstance(titles, dict):
+                titles = {}
+                self._last_folder_titles = titles
+            titles[url] = folder_title
+
+        return folder_title, items
+
+    async def _resolve_gdrive_file_meta(self, url: str) -> dict[str, Any]:
+        fid, rk = self._extract_gdrive_id_and_resourcekey(url)
+        if not fid:
+            return {}
+        params = {"id": fid, "export": "download", "confirm": "t"}
+        if rk:
+            params["resourcekey"] = rk
+        probe_url = f"https://drive.usercontent.google.com/download?{urlencode(params)}"
+        try:
+            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True, headers={"User-Agent": _GDRIVE_BROWSER_UA}) as client:
+                async with client.stream("GET", probe_url) as resp:
+                    if resp.status_code >= 400:
+                        return {}
+                    ct = (resp.headers.get("content-type") or "").lower()
+                    cd = resp.headers.get("content-disposition") or ""
+                    fname = self._parse_content_disposition_filename(cd)
+                    cl = resp.headers.get("content-length") or ""
+                    size = int(cl) if cl.isdigit() else 0
+                    if fname:
+                        return {"name": safe_name(fname), "size": size}
+                    if "text/html" in ct:
+                        raw_bytes = await resp.aread()
+                        html_txt = raw_bytes.decode("utf-8", errors="replace")
+                        _, html_name = self._extract_gdrive_confirm_download_url(html_txt, fallback_fid=fid, rk=rk)
+                        if html_name:
+                            return {"name": safe_name(html_name), "size": 0}
+        except Exception:
+            pass
+        return {}
+
+    async def resolve_item_metadata(self, credentials: dict[str, Any], item: dict[str, Any], *, resolve_file_names: bool = False) -> dict[str, Any]:
+        """Resolve real folder/file title for cloud links that currently only have an ID placeholder."""
+        url = str(item.get("id") or item.get("path") or item.get("url") or "").strip()
+        if not url:
+            return item
+        cur_name = str(item.get("name") or "").strip()
+        if not is_placeholder_link_name(cur_name, url):
+            return item
+
+        ltype = self._classify_link(url)
+        if ltype == "gdrive_folder":
+            fid, rk = self._extract_gdrive_id_and_resourcekey(url)
+            title = await self._resolve_gdrive_folder_title(fid, rk)
+            if title:
+                item["name"] = safe_name(title, is_dir=True)
+            return item
+
+        if ltype in ("mega_folder", "pixeldrain_list", "gofile_page", "mediafire_folder"):
+            try:
+                listing = await self.list_files(credentials, url)
+                item["_prefetched_listing"] = listing
+                title = str(listing.get("name") or "").strip()
+                if title:
+                    item["name"] = safe_name(title, is_dir=True)
+            except Exception:
+                pass
+            return item
+
+        if resolve_file_names and ltype == "gdrive":
+            meta = await self._resolve_gdrive_file_meta(url)
+            if meta.get("name"):
+                item["name"] = meta["name"]
+            if meta.get("size") and not item.get("size"):
+                item["size"] = meta["size"]
+        return item
+
     async def _download_gdrive(self, url: str, dest_dir: Path, name: str | None, progress: JobState) -> list[Path]:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        clean_name = None if is_placeholder_link_name(name, url) else safe_name(name)
+        fid, rk = self._extract_gdrive_id_and_resourcekey(url)
+        is_docs_export = "docs.google.com/" in url.lower() and "/export" in url.lower()
+
+        # 1. Fast async streaming via drive.usercontent.google.com / docs export (live progress + MB/s speed!)
+        if fid or is_docs_export:
+            try:
+                if is_docs_export:
+                    dl_url = url
+                else:
+                    q_params = {"id": fid, "export": "download", "confirm": "t"}
+                    if rk:
+                        q_params["resourcekey"] = rk
+                    dl_url = f"https://drive.usercontent.google.com/download?{urlencode(q_params)}"
+
+                cookies_jar = httpx.Cookies()
+                resolved_name = clean_name or ""
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(None, connect=25.0, read=60.0, write=30.0, pool=30.0),
+                    follow_redirects=True,
+                    headers={"User-Agent": _GDRIVE_BROWSER_UA},
+                    cookies=cookies_jar,
+                ) as probe_client:
+                    for _hop in range(2):
+                        async with probe_client.stream("GET", dl_url) as resp:
+                            if resp.status_code in (401, 403, 429):
+                                raise ProviderFailure("PROVIDER_RATE_LIMITED", f"Google Drive rejected public download (HTTP {resp.status_code})")
+                            resp.raise_for_status()
+                            ct = (resp.headers.get("content-type") or "").lower()
+                            cd = resp.headers.get("content-disposition") or ""
+                            cd_name = self._parse_content_disposition_filename(cd)
+                            if cd_name and not resolved_name:
+                                resolved_name = safe_name(cd_name)
+
+                            if "text/html" in ct and not cd:
+                                html_body = (await resp.aread()).decode("utf-8", errors="replace")
+                                next_url, html_name = self._extract_gdrive_confirm_download_url(html_body, fallback_fid=fid, rk=rk)
+                                if html_name and not resolved_name:
+                                    resolved_name = safe_name(html_name)
+                                if next_url and next_url != dl_url:
+                                    dl_url = next_url
+                                    continue
+                                raise ProviderFailure("DOWNLOAD_FAILED", "Google Drive returned HTML confirmation page instead of binary stream")
+
+                            final_filename = resolved_name or safe_name(f"{fid or 'gdrive_file'}.bin")
+                            target_path = dest_dir / final_filename
+                            part_path = target_path.with_suffix(target_path.suffix + ".part")
+                            total_bytes = int(resp.headers.get("content-length") or 0)
+                            progress.current_file = target_path.name
+                            done = 0
+                            with part_path.open("wb") as fh:
+                                async for chunk in resp.aiter_bytes(262144):
+                                    progress.check_cancelled()
+                                    if not chunk:
+                                        continue
+                                    fh.write(chunk)
+                                    done += len(chunk)
+                                    progress.add_bytes(len(chunk), total_bytes, "download", target_path.name)
+                            if total_bytes and done < total_bytes:
+                                # Resume remaining bytes via stream_download
+                                downloaded_file = await _default_stream_download(
+                                    dl_url,
+                                    target_path,
+                                    progress,
+                                    headers={"User-Agent": _GDRIVE_BROWSER_UA},
+                                    cookies=cookies_jar,
+                                )
+                                return [downloaded_file]
+                            part_path.replace(target_path)
+                            self._validate_downloaded_files([target_path])
+                            return [target_path]
+            except asyncio.CancelledError:
+                raise
+            except Exception as stream_exc:
+                if progress.__class__.__name__ == "JobCancelled" or stream_exc.__class__.__name__ == "JobCancelled":
+                    raise
+                progress.log(f"[GDrive] Direct stream notice ({stream_exc}); trying fallback downloader...")
+
+        # 2. Authenticated Drive fallback if job carries Google Drive credentials (bypasses anonymous public quota!)
+        if fid and not is_docs_export:
+            payload = getattr(progress, "payload", None) or {}
+            for side in ("source", "target"):
+                side_obj = payload.get(side) or {}
+                if str(side_obj.get("provider") or "").lower() == "drive":
+                    drv_creds = side_obj.get("credentials") or {}
+                    if drv_creds and (drv_creds.get("access_token") or drv_creds.get("token") or drv_creds.get("cookies")):
+                        try:
+                            from .drive import DriveProvider
+                            progress.log("[GDrive] Using connected Google Drive session to fetch quota-limited file...")
+                            drv_path = await DriveProvider().download_file(
+                                drv_creds,
+                                {"id": fid, **({"name": clean_name} if clean_name else {})},
+                                dest_dir,
+                                progress,
+                            )
+                            if drv_path and drv_path.is_file():
+                                return [drv_path]
+                        except Exception as drv_exc:
+                            progress.log(f"[GDrive] Connected Drive session fallback notice: {drv_exc}")
+                        break
+
+        # 3. Fallback to gdown / yt-dlp
         progress.log(f"Starting gdown download for: {url}")
         try:
             import gdown
             before = {p for p in dest_dir.rglob("*") if p.is_file()} if dest_dir.exists() else set()
             def run_gdown() -> None:
-                output = str(dest_dir / name) if (name and "." in name) else str(dest_dir) + "/"
-                gdown.download(url, output, quiet=False, fuzzy=True)
+                output = str(dest_dir / clean_name) if (clean_name and "." in clean_name) else str(dest_dir) + "/"
+                gdown.download(url, output, quiet=True, fuzzy=True)
             await asyncio.to_thread(run_gdown)
             after = {p for p in dest_dir.rglob("*") if p.is_file()} if dest_dir.exists() else set()
             new_files = [p for p in sorted(after - before) if p.is_file() and not p.name.endswith(".part")]
             return new_files or [p for p in sorted(dest_dir.rglob("*")) if p.is_file() and not p.name.endswith(".part")]
         except Exception as e:
             progress.log(f"gdown failed, falling back to yt-dlp: {e}")
-            return await self._download_ytdlp(url, dest_dir, name, progress)
+            return await self._download_ytdlp(url, dest_dir, clean_name, progress)
 
     async def _download_gdrive_folder(self, url: str, dest_dir: Path, progress: JobState) -> list[Path]:
         progress.log(f"Starting Google Drive folder download via gdown: {url}")
         dest_dir.mkdir(parents=True, exist_ok=True)
         try:
+            import inspect
             import gdown
             before = {p for p in dest_dir.rglob("*") if p.is_file()} if dest_dir.exists() else set()
+            sig_params = inspect.signature(gdown.download_folder).parameters
             def run_gdown_folder() -> None:
-                gdown.download_folder(url=url, output=str(dest_dir), quiet=False, use_cookies=False, remaining_ok=True)
+                kw: dict[str, Any] = {"url": url, "output": str(dest_dir), "quiet": True, "use_cookies": False}
+                if "remaining_ok" in sig_params:
+                    kw["remaining_ok"] = True
+                gdown.download_folder(**kw)
             await asyncio.to_thread(run_gdown_folder)
             after = {p for p in dest_dir.rglob("*") if p.is_file()} if dest_dir.exists() else set()
             new_files = [p for p in sorted(after - before) if p.is_file() and not p.name.endswith(".part")]
@@ -1972,6 +2587,19 @@ class LinksProvider(BaseProvider):
         # Build relative paths for all file nodes (t == 0)
         # Note: The root folder node itself is the first t==1 node whose parent is not in nodes_by_id.
         root_handles = {h for h, info in nodes_by_id.items() if info["p"] not in nodes_by_id}
+        mega_title = ""
+        if sub_target and sub_target in nodes_by_id and nodes_by_id[sub_target]["t"] == 1:
+            mega_title = str(nodes_by_id[sub_target]["name"] or "").strip()
+        elif len(root_handles) == 1:
+            only_root = next(iter(root_handles))
+            if nodes_by_id[only_root]["t"] == 1:
+                mega_title = str(nodes_by_id[only_root]["name"] or "").strip()
+        if mega_title:
+            titles = getattr(self, "_last_folder_titles", None)
+            if not isinstance(titles, dict):
+                titles = {}
+                self._last_folder_titles = titles
+            titles[url] = mega_title
 
         def _build_rel_path(handle: str) -> str:
             parts: list[str] = []
@@ -2722,6 +3350,13 @@ class LinksProvider(BaseProvider):
                 resp = await client.get(api_url)
                 resp.raise_for_status()
                 data = resp.json()
+            pd_title = str(data.get("title") or "").strip()
+            if pd_title:
+                titles = getattr(self, "_last_folder_titles", None)
+                if not isinstance(titles, dict):
+                    titles = {}
+                    self._last_folder_titles = titles
+                titles[url] = pd_title
             files = data.get("files") or []
             out: list[dict[str, Any]] = []
             for f in files:
@@ -3949,14 +4584,25 @@ class LinksProvider(BaseProvider):
         if not url:
             return {"items": []}
         ltype = self._classify_link(url)
+        titles = getattr(self, "_last_folder_titles", None)
+        if not isinstance(titles, dict):
+            titles = {}
+            self._last_folder_titles = titles
+        if ltype == "gdrive_folder":
+            title, items = await self._list_gdrive_folder_items(url, credentials=credentials)
+            return {"name": title, "items": items}
         if ltype == "mega_folder":
-            return {"items": await self._list_mega_folder_nodes(url)}
+            items = await self._list_mega_folder_nodes(url)
+            return {"name": titles.get(url, ""), "items": items}
         if ltype == "gofile_page":
-            return {"items": await self._list_gofile_items(url)}
+            items = await self._list_gofile_items(url)
+            return {"name": titles.get(url, ""), "items": items}
         if ltype == "pixeldrain_list":
-            return {"items": await self._list_pixeldrain_items(url)}
+            items = await self._list_pixeldrain_items(url)
+            return {"name": titles.get(url, ""), "items": items}
         if ltype == "mediafire_folder":
-            return {"items": await self._list_mediafire_folder_items(url)}
+            items = await self._list_mediafire_folder_items(url)
+            return {"name": titles.get(url, ""), "items": items}
         return {"items": []}
 
     async def download_folder(
@@ -3974,16 +4620,27 @@ class LinksProvider(BaseProvider):
         local_dir.mkdir(parents=True, exist_ok=True)
         ltype = self._classify_link(url)
 
-        listing = await self.list_files(credentials, url)
+        listing = folder_ref.pop("_prefetched_listing", None) if isinstance(folder_ref.get("_prefetched_listing"), dict) else None
+        if listing is None:
+            listing = await self.list_files(credentials, url)
+        resolved_folder_title = str(listing.get("name") or "").strip()
+        if resolved_folder_title and is_placeholder_link_name(folder_ref.get("name"), url):
+            folder_ref["name"] = safe_name(resolved_folder_title, is_dir=True)
         items = listing.get("items") or []
         if items:
-            progress.log(f"[links] Resolved {len(items)} file(s) in {ltype} folder: {folder_ref.get('name') or url[:80]}")
+            progress.log(f"[links] Resolved {len(items)} item(s) in {ltype} folder: {folder_ref.get('name') or url[:80]}")
             options = (progress.payload or {}).get("options", {}) if hasattr(progress, "payload") else {}
+            conc = max(1, int(options.get("download_concurrency") or 4))
+            sem = _sem or asyncio.Semaphore(conc)
+
+            subfolders = [c for c in items if (c.get("type") == "folder" or c.get("is_folder") or c.get("isdir"))]
+            file_children = [c for c in items if not (c.get("type") == "folder" or c.get("is_folder") or c.get("isdir"))]
+
             checker = getattr(progress, "_target_checker", None)
-            if checker is not None:
-                f_name = safe_name(str(folder_ref.get("name") or "folder"))
+            if checker is not None and file_children and (options.get("auto_skip") or options.get("autoSkip")):
+                f_name = safe_name(str(folder_ref.get("name") or local_dir.name or "folder"), is_dir=True)
                 missing_items: list[dict[str, Any]] = []
-                for child in items:
+                for child in file_children:
                     rel_raw = str(child.get("_relative_path") or child.get("name") or "file").replace("\\", "/").strip("/")
                     check_child = {**child, "_relative_path": f"{f_name}/{rel_raw}" if f_name else rel_raw}
                     if await checker.item_exists(check_child, options, folder_name=f_name):
@@ -3991,19 +4648,18 @@ class LinksProvider(BaseProvider):
                         progress.log(f"[Auto-Skip] File đã tồn tại ở đích, bỏ qua tải: {rel_raw}")
                     else:
                         missing_items.append(child)
-                items = missing_items
-                if not items:
+                file_children = missing_items
+                if not file_children and not subfolders:
                     progress.log(f"[Auto-Skip] Toàn bộ file trong link folder '{folder_ref.get('name') or url[:60]}' đã tồn tại ở đích!")
                     return []
-            progress.files_to_download += len(items)
-            conc = max(1, int(options.get("download_concurrency") or 4))
-            sem = _sem or asyncio.Semaphore(conc)
+
+            progress.files_to_download += len(file_children)
 
             async def _dl_child(child: dict[str, Any]) -> list[Path]:
                 progress.check_cancelled()
                 async with sem:
                     rel_raw = str(child.get("_relative_path") or child.get("name") or "file").replace("\\", "/").strip("/")
-                    rel_parts = [safe_name(p) for p in rel_raw.split("/") if p and p not in (".", "..")]
+                    rel_parts = [safe_name(p, is_dir=(idx < len(rel_raw.split("/")) - 1)) for idx, p in enumerate(rel_raw.split("/")) if p and p not in (".", "..")]
                     dest_dir = local_dir.joinpath(*rel_parts[:-1]) if len(rel_parts) > 1 else local_dir
                     dest_dir.mkdir(parents=True, exist_ok=True)
                     fname = rel_parts[-1] if rel_parts else safe_name(str(child.get("name") or "file"))
@@ -4019,7 +4675,7 @@ class LinksProvider(BaseProvider):
                         actual_sz = path.stat().st_size if (path and path.exists()) else fsize
                         progress.finish_file(fname, phase="download", size=actual_sz)
                         progress.files_downloaded += 1
-                        progress.log(f"[{progress.files_downloaded}/{progress.files_to_download}] Downloaded: {fname}")
+                        progress.log(f"[{progress.files_downloaded}/{progress.files_to_download}] Downloaded: {path.name if path else fname}")
                         return [path]
                     except ProviderFailure as exc:
                         progress.finish_file(fname, phase="download")
@@ -4032,7 +4688,16 @@ class LinksProvider(BaseProvider):
                         progress.finish_file(fname, phase="download")
                         raise
 
-            batches = await asyncio.gather(*(_dl_child(c) for c in items))
+            async def _dl_subfolder(sub: dict[str, Any]) -> list[Path]:
+                sub_name = safe_name(str(sub.get("name") or "folder"), is_dir=True)
+                sub_dir = local_dir / sub_name
+                sub_dir.mkdir(parents=True, exist_ok=True)
+                return await self.download_folder(credentials, sub, sub_dir, progress, _sem=sem)
+
+            batches = await asyncio.gather(
+                *(_dl_child(c) for c in file_children),
+                *(_dl_subfolder(s) for s in subfolders),
+            )
             return [p for batch in batches for p in batch if p and p.is_file()]
 
         # Direct folder handlers (e.g. gdrive_folder via gdown, dropbox_folder via zip extract)
@@ -4086,6 +4751,8 @@ class LinksProvider(BaseProvider):
 
         name = safe_name(raw_name) if raw_name else None
         link_type = self._classify_link(url)
+        if name and link_type in ("gdrive", "mega_file", "mediafire", "pixeldrain", "gofile_page", "dropbox") and is_placeholder_link_name(raw_name, url):
+            name = None
         if link_type == "direct":
             check_sources = f"{page_url} {headers.get('Referer', '')} {headers.get('referer', '')}".lower()
             if any(d in check_sources for d in ("archivebate.com", "playmogo.com", "doods.pro", "dooood.com", "doodstream", "cloudatacdn.com", "myvidplay.com", "livecamsrip.com", "ds2play", "dsvplay", "dood.")):
@@ -4304,6 +4971,8 @@ class LinksProvider(BaseProvider):
         self._validate_downloaded_files([result])
         if expected_size and result.stat().st_size < expected_size:
             raise ProviderFailure("DOWNLOAD_INCOMPLETE", f"Downloaded {result.stat().st_size} bytes, expected {expected_size}")
+        if is_placeholder_link_name(file_ref.get("name"), url):
+            file_ref["name"] = result.name
         return result
 
     async def upload_file(self, credentials: dict[str, Any], local_path: Path, target_ref: dict[str, Any], progress: JobState) -> dict[str, Any]:

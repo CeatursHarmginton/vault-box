@@ -7,6 +7,7 @@ import mimetypes
 import os
 import shutil
 import time
+import unicodedata
 import asyncio
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -14,7 +15,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from .base import BaseProvider, ProviderFailure, dict_lock, owner_store, safe_name, shared_client, stream_download
+from .base import BaseProvider, ProviderFailure, _loop_store, dict_lock, owner_store, safe_name, shared_client, stream_download
 from ..jobs.progress import JobState
 
 DRIVE_API = "https://www.googleapis.com/drive/v3"
@@ -103,6 +104,19 @@ def _is_rate_limit_or_transient_403(body: str) -> bool:
     lowered = (body or "").lower()
     return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
 
+def _norm_folder_name(name: str) -> str:
+    return unicodedata.normalize("NFC", str(name or "").strip()).casefold()
+
+
+def _parse_resp_json(resp: Any) -> Any:
+    raw_text = getattr(resp, "text", None)
+    if isinstance(raw_text, str):
+        stripped = raw_text.lstrip()
+        if stripped.startswith(")]}'"):
+            return json.loads(stripped[4:].lstrip())
+    return resp.json()
+
+
 class DriveProvider(BaseProvider):
     name = "drive"
 
@@ -110,11 +124,30 @@ class DriveProvider(BaseProvider):
         """One keep-alive client per job loop; Drive auth travels in headers, not in the client."""
         return shared_client("drive", timeout=None, follow_redirects=True)
 
+    def _cred_bucket(self, owner: Any) -> dict[str, Any]:
+        key = "default"
+        if isinstance(owner, dict):
+            acc = str(owner.get("account_id") or owner.get("accountId") or owner.get("email") or "").strip()
+            if acc:
+                key = f"acc:{acc}"
+            else:
+                tok = str(owner.get("access_token") or owner.get("token") or owner.get("web_access_token") or "").strip()
+                cks = owner.get("cookies")
+                ck_sig = ""
+                if isinstance(cks, dict):
+                    ck_sig = str(cks.get("SAPISID") or cks.get("__Secure-3PAPISID") or cks.get("SID") or "")
+                elif isinstance(cks, str) and cks:
+                    ck_sig = cks[:64]
+                sig = tok or ck_sig
+                if sig:
+                    key = "sig:" + hashlib.sha1(sig.encode("utf-8", errors="ignore")).hexdigest()[:16]
+        return _loop_store(f"{self.name}:folders").setdefault(key, {})
+
     def _folder_locks(self, owner: Any) -> dict[Any, asyncio.Lock]:
-        return owner_store(f"{self.name}:folders", owner).setdefault("locks", {})
+        return self._cred_bucket(owner).setdefault("locks", {})
 
     def _folder_cache(self, owner: Any) -> dict[Any, str]:
-        return owner_store(f"{self.name}:folders", owner).setdefault("cache", {})
+        return self._cred_bucket(owner).setdefault("cache", {})
 
     def _mounted(self) -> bool:
         return DRIVE_MOUNT.exists() and DRIVE_MOUNT.is_dir()
@@ -522,7 +555,9 @@ class DriveProvider(BaseProvider):
                             "x-goog-fieldmask": "items(id,title,mime_type,file_size,modified_date_millis,create_date_millis,thumbnail_version,alternate_link,explicitly_trashed,trashed,parent),continuation_token",
                         },
                     )
-                    data = resp.json()
+                    data = _parse_resp_json(resp)
+                    if isinstance(data, dict) and "error" in data:
+                        raise RuntimeError(str(data.get("error")))
                     raw_items = data[0] if isinstance(data, list) and data and isinstance(data[0], list) else []
                     for it in raw_items:
                         if not isinstance(it, list) or not it:
@@ -562,12 +597,15 @@ class DriveProvider(BaseProvider):
                         "q": f"'{_q_escape(parent)}' in parents and trashed = false",
                         "maxResults": "1000",
                         "supportsTeamDrives": "true",
+                        "includeTeamDriveItems": "true",
                     }
                     if v2_page_token:
                         params["pageToken"] = v2_page_token
                     resp = await self._web_request(credentials, "GET", f"{DRIVE_WEB_FILES_API}/files", params=params)
-                    body_json = resp.json()
+                    body_json = _parse_resp_json(resp)
                     for it in body_json.get("items") or []:
+                        if (it.get("labels") or {}).get("trashed") or it.get("explicitlyTrashed"):
+                            continue
                         v2_all_items.append({
                             "id": it.get("id"),
                             "name": it.get("title") or it.get("name"),
@@ -818,7 +856,8 @@ class DriveProvider(BaseProvider):
         locks = self._folder_locks(credentials)
         current = parent or "root"
         for part in _relative_folder_parts(relative_path):
-            key = ("api", current, part)
+            norm_part = _norm_folder_name(part)
+            key = ("api", current, norm_part)
             known = cache.get(key)
             if known:
                 current = known
@@ -828,7 +867,7 @@ class DriveProvider(BaseProvider):
                 known = cache.get(key)
                 if not known:
                     query = f"'{_q_escape(current)}' in parents and name='{_q_escape(part)}' and mimeType='{FOLDER_MIME}' and trashed=false"
-                    resp = await self._request(credentials, "GET", f"{DRIVE_API}/files", params={"q": query, "fields": "files(id,name)", "supportsAllDrives": "true", "includeItemsFromAllDrives": "true", "pageSize": "1"})
+                    resp = await self._request(credentials, "GET", f"{DRIVE_API}/files", params={"q": query, "fields": "files(id,name)", "supportsAllDrives": "true", "includeItemsFromAllDrives": "true", "pageSize": "5"})
                     match = next(iter(resp.json().get("files") or []), None)
                     if match:
                         known = str(match["id"])
@@ -912,7 +951,8 @@ class DriveProvider(BaseProvider):
         locks = self._folder_locks(credentials)
         current = parent or "root"
         for part in _relative_folder_parts(relative_path):
-            cache_key = ("web", current, part)
+            norm_part = _norm_folder_name(part)
+            cache_key = ("web", current, norm_part)
             known = cache.get(cache_key)
             if known:
                 current = known
@@ -926,9 +966,9 @@ class DriveProvider(BaseProvider):
                             credentials,
                             "GET",
                             f"{DRIVE_WEB_FILES_API}/files",
-                            params={"supportsTeamDrives": "true", "q": query, "fields": "items(id,title,mimeType)"},
+                            params={"supportsTeamDrives": "true", "includeTeamDriveItems": "true", "q": query, "fields": "items(id,title,mimeType)"},
                         )
-                        match = next(iter(resp.json().get("items") or []), None)
+                        match = next(iter(_parse_resp_json(resp).get("items") or []), None)
                         if match:
                             known = str(match.get("id") or "")
                     except Exception:
@@ -936,9 +976,17 @@ class DriveProvider(BaseProvider):
                     if not known:
                         try:
                             listing = await self.list_files(credentials, current)
-                            match = next((it for it in (listing.get("items") or []) if it.get("name") == part and it.get("type") == "folder"), None)
-                            if match and match.get("id"):
-                                known = str(match["id"])
+                            dir_items = [it for it in (listing.get("items") or []) if it.get("type") == "folder" and it.get("id")]
+                            exact_m = next((it for it in dir_items if it.get("name") == part), None)
+                            norm_m = exact_m or next(
+                                (
+                                    it for it in dir_items
+                                    if _norm_folder_name(str(it.get("name") or "")) in {norm_part, _norm_folder_name(safe_name(part, is_dir=True))}
+                                ),
+                                None,
+                            )
+                            if norm_m and norm_m.get("id"):
+                                known = str(norm_m["id"])
                         except Exception:
                             pass
                     if not known:
@@ -949,7 +997,7 @@ class DriveProvider(BaseProvider):
                             params={"supportsTeamDrives": "true", "fields": "id,title,mimeType,parents"},
                             json={"title": part, "mimeType": FOLDER_MIME, "parents": [{"id": current}]},
                         )
-                        known = str(resp.json().get("id") or "")
+                        known = str(_parse_resp_json(resp).get("id") or "")
                     cache[cache_key] = known
             current = known
         return current
