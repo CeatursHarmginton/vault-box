@@ -6384,8 +6384,9 @@ def test_links_provider_telegram_download_writes_temp_kv_and_cleans_up(tmp_path,
     assert out.exists() and out.name == "demo_clip.mp4"
     assert file_ref["name"] == "demo_clip.mp4"
     assert out.read_bytes() == b"telegram-video-bytes"
-    assert any("[tdl] 50.0% - 10.00 MB (5.00 MB/s, ETA: 2s)" in line for line in job.logs)
+    assert not any("[tdl] 50.0% - 10.00 MB" in line for line in job.logs)
     assert job.progress.download >= 50.0
+    assert job.speed > 0
     assert "-n" in seen_cmd and seen_cmd[seen_cmd.index("-n") + 1] == "colab"
     assert seen_kv["exists_during_run"] is True
     assert seen_kv["content"]["colab"]["session"] == "eyJhdXRoX2tleSI6InNlY3JldCJ9"

@@ -4614,7 +4614,7 @@ class LinksProvider(BaseProvider):
 
         tdl_bin = await self._ensure_tdl_binary(progress)
         opt = (progress.payload or {}).get("options", {}) if hasattr(progress, "payload") else {}
-        threads = max(1, min(8, int(opt.get("download_threads") or opt.get("threads_per_item") or 4)))
+        base_threads = max(1, min(4, int(opt.get("download_threads") or opt.get("threads_per_item") or 4)))
         try:
             expected_size = int((file_ref or {}).get("size") or (file_ref or {}).get("file_size") or 0)
         except (TypeError, ValueError):
@@ -4624,7 +4624,6 @@ class LinksProvider(BaseProvider):
         tmp_root = Path(tempfile.mkdtemp(prefix="vb_tdl_"))
         kv_path = tmp_root / "tdl_kv.json"
         dl_stage = dest_dir / f".tdl_stage_{uuid.uuid4().hex[:8]}"
-        dl_stage.mkdir(parents=True, exist_ok=True)
         ansi_re = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
         tdl_prog_re = re.compile(
             r"(\d+(?:\.\d+)?)%\s+\[[^\]]+\]\s+\[([0-9.]+\s*[KMGT]?i?B)\s+in\s+([^;\]]+)(?:;\s*~?ETA:\s*([^;\]]+))?(?:;\s*([0-9.]+\s*[KMGT]?i?B/s))?\]",
@@ -4640,6 +4639,17 @@ class LinksProvider(BaseProvider):
             mult = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}.get(unit, 1)
             return int(val * mult)
 
+        def _read_tdl_log_tail(max_lines: int = 10) -> str:
+            try:
+                tdl_log = Path.home() / ".tdl" / "log" / "latest.log"
+                if tdl_log.is_file():
+                    lines = tdl_log.read_text(encoding="utf-8", errors="replace").splitlines()[-max_lines:]
+                    if lines:
+                        return " ; ".join(lines[-3:])
+            except Exception:
+                pass
+            return ""
+
         try:
             kv_path.write_text(json.dumps({ns: kv_file[ns]}), encoding="utf-8")
             try:
@@ -4647,123 +4657,150 @@ class LinksProvider(BaseProvider):
             except Exception:
                 pass
 
-            cmd = [
-                tdl_bin,
-                "--storage", f"type=file,path={kv_path.as_posix()}",
-                "-n", ns,
-                "--pool", "16",
-                "dl",
-                "-u", url,
-                "-d", str(dl_stage),
-                "--continue",
-                "--rewrite-ext",
-                "--template", "{{ filenamify .FileName }}",
-                "--threads", str(threads),
-            ]
-            progress.log(f"[Telegram] Downloading via tdl (ns={ns}, threads={threads}): {url}")
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
+            thread_schedule = [base_threads]
+            for fallback_t in (2, 1):
+                if fallback_t < thread_schedule[-1]:
+                    thread_schedule.append(fallback_t)
+            if len(thread_schedule) == 1:
+                thread_schedule.append(1)
 
-            output_lines: list[str] = []
-            buf = ""
-            last_prog_log_at = 0.0
-            last_pct = -1.0
+            downloaded_files: list[Path] = []
+            last_error_msg = ""
 
-            def _handle_line(raw_line: str) -> None:
-                nonlocal last_prog_log_at, last_pct
-                clean = ansi_re.sub("", raw_line).strip()
-                if not clean:
-                    return
-                if clean.startswith("CPU:") and "Goroutines:" in clean:
-                    return
-                if re.match(r"^\[[.#]+\]\s+\[[^\]]+\]$", clean):
-                    return
-
-                m_prog = tdl_prog_re.search(clean)
-                if m_prog:
-                    pct = float(m_prog.group(1))
-                    done_str = m_prog.group(2)
-                    eta_str = (m_prog.group(4) or "").strip()
-                    spd_str = (m_prog.group(5) or "").strip()
-                    done_bytes = _parse_size_str(done_str)
-                    speed_bps = float(_parse_size_str(spd_str[:-2])) if spd_str.lower().endswith("/s") else 0.0
-                    total_bytes = expected_size or (int(done_bytes / (pct / 100.0)) if pct > 0.2 and done_bytes > 0 else 0)
-                    if hasattr(progress, "set_phase_progress"):
-                        progress.set_phase_progress(
-                            done_bytes=done_bytes,
-                            total_bytes=total_bytes or getattr(progress, "bytes_total", 0),
-                            pct=pct,
-                            speed=speed_bps,
-                            phase="download",
-                        )
-                    now = time.monotonic()
-                    if (now - last_prog_log_at >= 3.0 and (pct != last_pct or done_bytes > 0)) or pct >= 100.0:
-                        last_prog_log_at = now
-                        last_pct = pct
-                        extra = f"{spd_str}" if spd_str else ""
-                        if eta_str:
-                            extra = f"{extra}, ETA: {eta_str}".strip(", ")
-                        progress.log(f"[tdl] {pct:.1f}% - {done_str}" + (f" ({extra})" if extra else ""))
-                    return
-
-                output_lines.append(clean)
-                if len(output_lines) > 50:
-                    del output_lines[:-50]
-                if not clean.startswith("WARN: If data exists"):
-                    progress.log(f"[tdl] {clean[:200]}")
-
-            while True:
+            for attempt_idx, cur_threads in enumerate(thread_schedule, start=1):
                 progress.check_cancelled()
-                if proc.stdout is None:
-                    break
-                try:
-                    chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=1.0)
-                except asyncio.TimeoutError:
-                    if proc.returncode is not None:
+                shutil.rmtree(dl_stage, ignore_errors=True)
+                dl_stage.mkdir(parents=True, exist_ok=True)
+
+                cmd = [
+                    tdl_bin,
+                    "--storage", f"type=file,path={kv_path.as_posix()}",
+                    "-n", ns,
+                    "--pool", "12",
+                    "--reconnect-timeout", "20s",
+                    "dl",
+                    "-u", url,
+                    "-d", str(dl_stage),
+                    "--continue",
+                    "--rewrite-ext",
+                    "--template", "{{ filenamify .FileName }}",
+                    "--threads", str(cur_threads),
+                ]
+                progress.log(f"[Telegram] Downloading via tdl (ns={ns}, threads={cur_threads}): {url}")
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+
+                output_lines: list[str] = []
+                buf = ""
+                max_done_bytes = -1
+                last_pct_seen = -1.0
+                last_progress_at = time.monotonic()
+                stalled = False
+
+                def _handle_line(raw_line: str) -> None:
+                    nonlocal max_done_bytes, last_pct_seen, last_progress_at
+                    clean = ansi_re.sub("", raw_line).strip()
+                    if not clean:
+                        return
+                    if clean.startswith("CPU:") and "Goroutines:" in clean:
+                        return
+                    if re.match(r"^\[[.#]+\]\s+\[[^\]]+\]$", clean):
+                        return
+
+                    m_prog = tdl_prog_re.search(clean)
+                    if m_prog:
+                        pct = float(m_prog.group(1))
+                        done_str = m_prog.group(2)
+                        spd_str = (m_prog.group(5) or "").strip()
+                        done_bytes = _parse_size_str(done_str)
+                        speed_bps = float(_parse_size_str(spd_str[:-2])) if spd_str.lower().endswith("/s") else 0.0
+                        total_bytes = expected_size or (int(done_bytes / (pct / 100.0)) if pct > 0.2 and done_bytes > 0 else 0)
+                        if done_bytes > max_done_bytes or pct > last_pct_seen:
+                            max_done_bytes = max(max_done_bytes, done_bytes)
+                            last_pct_seen = max(last_pct_seen, pct)
+                            last_progress_at = time.monotonic()
+                        if hasattr(progress, "set_phase_progress"):
+                            progress.set_phase_progress(
+                                done_bytes=done_bytes,
+                                total_bytes=total_bytes or getattr(progress, "bytes_total", 0),
+                                pct=pct,
+                                speed=speed_bps,
+                                phase="download",
+                            )
+                        return
+
+                    output_lines.append(clean)
+                    if len(output_lines) > 50:
+                        del output_lines[:-50]
+                    if any(k in clean.lower() for k in ("error", "fail", "flood", "deleted", "skipped")):
+                        progress.log(f"[tdl] {clean[:200]}")
+
+                while True:
+                    progress.check_cancelled()
+                    stall_limit = 25.0 if max_done_bytes > 0 else 45.0
+                    if time.monotonic() - last_progress_at > stall_limit:
+                        stalled = True
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        await proc.wait()
                         break
-                    continue
-                if not chunk:
+
+                    if proc.stdout is None:
+                        break
+                    try:
+                        chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        if proc.returncode is not None:
+                            break
+                        continue
+                    if not chunk:
+                        break
+                    buf += chunk.decode("utf-8", errors="replace")
+                    parts = re.split(r"[\r\n]+", buf)
+                    buf = parts.pop()
+                    for part in parts:
+                        _handle_line(part)
+
+                if not stalled and buf.strip():
+                    _handle_line(buf)
+
+                if stalled:
+                    last_error_msg = f"tdl stalled at {max(0.0, last_pct_seen):.1f}% ({max(0, max_done_bytes)} bytes)"
+                    if attempt_idx < len(thread_schedule):
+                        progress.log(f"[Telegram] {last_error_msg}; retrying with threads={thread_schedule[attempt_idx]}...")
+                        continue
                     break
-                buf += chunk.decode("utf-8", errors="replace")
-                parts = re.split(r"[\r\n]+", buf)
-                buf = parts.pop()
-                for part in parts:
-                    _handle_line(part)
-            if buf.strip():
-                _handle_line(buf)
 
-            rc = await proc.wait()
-            if rc != 0:
-                log_tail = ""
-                try:
-                    tdl_log = Path.home() / ".tdl" / "log" / "latest.log"
-                    if tdl_log.is_file():
-                        lines = tdl_log.read_text(encoding="utf-8", errors="replace").splitlines()[-10:]
-                        if lines:
-                            log_tail = " | tdl.log: " + " ; ".join(lines[-3:])
-                except Exception:
-                    pass
-                tail = " | ".join(output_lines[-5:])
-                raise ProviderFailure("DOWNLOAD_FAILED", f"tdl exited with code {rc}: {tail}{log_tail}")
+                rc = await proc.wait()
+                if rc != 0:
+                    log_tail = _read_tdl_log_tail()
+                    tail = " | ".join(output_lines[-5:])
+                    last_error_msg = f"tdl exited with code {rc}: {tail}" + (f" | tdl.log: {log_tail}" if log_tail else "")
+                    if attempt_idx < len(thread_schedule):
+                        progress.log(f"[Telegram] Attempt {attempt_idx} failed ({last_error_msg[:140]}); retrying...")
+                        continue
+                    raise ProviderFailure("DOWNLOAD_FAILED", last_error_msg)
 
-            downloaded_files = [
-                p for p in dl_stage.rglob("*")
-                if p.is_file() and not p.name.endswith(".tmp") and p.stat().st_size > 0
-            ]
+                downloaded_files = [
+                    p for p in dl_stage.rglob("*")
+                    if p.is_file() and not p.name.endswith(".tmp") and p.stat().st_size > 0
+                ]
+                if downloaded_files:
+                    break
+
+                log_tail = _read_tdl_log_tail()
+                last_error_msg = f"tdl finished without producing any file for {url}" + (f" ({log_tail})" if log_tail else "")
+                if attempt_idx < len(thread_schedule):
+                    progress.log(f"[Telegram] Attempt {attempt_idx} produced no output; retrying...")
+                    continue
+
             if not downloaded_files:
-                log_tail = ""
-                try:
-                    tdl_log = Path.home() / ".tdl" / "log" / "latest.log"
-                    if tdl_log.is_file():
-                        lines = tdl_log.read_text(encoding="utf-8", errors="replace").splitlines()[-5:]
-                        if lines:
-                            log_tail = " (" + " ; ".join(lines) + ")"
-                except Exception:
-                    pass
-                raise ProviderFailure("DOWNLOAD_FAILED", f"tdl finished without producing any file for {url}{log_tail}")
+                raise ProviderFailure("DOWNLOAD_FAILED", last_error_msg or f"tdl failed for {url}")
 
             out_paths: list[Path] = []
             for idx, src_f in enumerate(downloaded_files):
