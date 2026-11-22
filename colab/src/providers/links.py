@@ -56,6 +56,8 @@ _PLACEHOLDER_LINK_NAME_RE = re.compile(
     r"Pixeldrain_[A-Za-z0-9_-]+|"
     r"Gofile_[A-Za-z0-9_-]+|"
     r"Dropbox_Folder_[A-Za-z0-9_-]+|"
+    r"tg_[A-Za-z0-9_]+_\d+|"
+    r"Telegram_Media|"
     r"cloud_folder|folder|"
     r"(?:video_)?download_\d+(?:\.[A-Za-z0-9]{2,5})?"
     r")$",
@@ -4612,12 +4614,32 @@ class LinksProvider(BaseProvider):
 
         tdl_bin = await self._ensure_tdl_binary(progress)
         opt = (progress.payload or {}).get("options", {}) if hasattr(progress, "payload") else {}
-        threads = max(1, min(16, int(opt.get("download_threads") or opt.get("threads_per_item") or 4)))
+        threads = max(1, min(8, int(opt.get("download_threads") or opt.get("threads_per_item") or 4)))
+        try:
+            expected_size = int((file_ref or {}).get("size") or (file_ref or {}).get("file_size") or 0)
+        except (TypeError, ValueError):
+            expected_size = 0
 
+        dest_dir.mkdir(parents=True, exist_ok=True)
         tmp_root = Path(tempfile.mkdtemp(prefix="vb_tdl_"))
         kv_path = tmp_root / "tdl_kv.json"
-        dl_stage = tmp_root / "dl"
+        dl_stage = dest_dir / f".tdl_stage_{uuid.uuid4().hex[:8]}"
         dl_stage.mkdir(parents=True, exist_ok=True)
+        ansi_re = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+        tdl_prog_re = re.compile(
+            r"(\d+(?:\.\d+)?)%\s+\[[^\]]+\]\s+\[([0-9.]+\s*[KMGT]?i?B)\s+in\s+([^;\]]+)(?:;\s*~?ETA:\s*([^;\]]+))?(?:;\s*([0-9.]+\s*[KMGT]?i?B/s))?\]",
+            re.IGNORECASE,
+        )
+
+        def _parse_size_str(raw_sz: str) -> int:
+            m = re.match(r"([0-9.]+)\s*([KMGT]?i?B)", str(raw_sz or "").strip(), re.IGNORECASE)
+            if not m:
+                return 0
+            val = float(m.group(1))
+            unit = m.group(2).upper().replace("I", "")
+            mult = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}.get(unit, 1)
+            return int(val * mult)
+
         try:
             kv_path.write_text(json.dumps({ns: kv_file[ns]}), encoding="utf-8")
             try:
@@ -4629,6 +4651,7 @@ class LinksProvider(BaseProvider):
                 tdl_bin,
                 "--storage", f"type=file,path={kv_path.as_posix()}",
                 "-n", ns,
+                "--pool", "16",
                 "dl",
                 "-u", url,
                 "-d", str(dl_stage),
@@ -4645,45 +4668,107 @@ class LinksProvider(BaseProvider):
             )
 
             output_lines: list[str] = []
+            buf = ""
+            last_prog_log_at = 0.0
+            last_pct = -1.0
+
+            def _handle_line(raw_line: str) -> None:
+                nonlocal last_prog_log_at, last_pct
+                clean = ansi_re.sub("", raw_line).strip()
+                if not clean:
+                    return
+                if clean.startswith("CPU:") and "Goroutines:" in clean:
+                    return
+                if re.match(r"^\[[.#]+\]\s+\[[^\]]+\]$", clean):
+                    return
+
+                m_prog = tdl_prog_re.search(clean)
+                if m_prog:
+                    pct = float(m_prog.group(1))
+                    done_str = m_prog.group(2)
+                    eta_str = (m_prog.group(4) or "").strip()
+                    spd_str = (m_prog.group(5) or "").strip()
+                    done_bytes = _parse_size_str(done_str)
+                    speed_bps = float(_parse_size_str(spd_str[:-2])) if spd_str.lower().endswith("/s") else 0.0
+                    total_bytes = expected_size or (int(done_bytes / (pct / 100.0)) if pct > 0.2 and done_bytes > 0 else 0)
+                    if hasattr(progress, "set_phase_progress"):
+                        progress.set_phase_progress(
+                            done_bytes=done_bytes,
+                            total_bytes=total_bytes or getattr(progress, "bytes_total", 0),
+                            pct=pct,
+                            speed=speed_bps,
+                            phase="download",
+                        )
+                    now = time.monotonic()
+                    if (now - last_prog_log_at >= 3.0 and (pct != last_pct or done_bytes > 0)) or pct >= 100.0:
+                        last_prog_log_at = now
+                        last_pct = pct
+                        extra = f"{spd_str}" if spd_str else ""
+                        if eta_str:
+                            extra = f"{extra}, ETA: {eta_str}".strip(", ")
+                        progress.log(f"[tdl] {pct:.1f}% - {done_str}" + (f" ({extra})" if extra else ""))
+                    return
+
+                output_lines.append(clean)
+                if len(output_lines) > 50:
+                    del output_lines[:-50]
+                if not clean.startswith("WARN: If data exists"):
+                    progress.log(f"[tdl] {clean[:200]}")
+
             while True:
                 progress.check_cancelled()
                 if proc.stdout is None:
                     break
                 try:
-                    raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=1.0)
+                    chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=1.0)
                 except asyncio.TimeoutError:
                     if proc.returncode is not None:
                         break
                     continue
-                if not raw_line:
+                if not chunk:
                     break
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if line:
-                    output_lines.append(line)
-                    if len(output_lines) > 40:
-                        output_lines = output_lines[-40:]
-                    if any(k in line.lower() for k in ("error", "warn", "flood", "done")):
-                        progress.log(f"[tdl] {line[:180]}")
+                buf += chunk.decode("utf-8", errors="replace")
+                parts = re.split(r"[\r\n]+", buf)
+                buf = parts.pop()
+                for part in parts:
+                    _handle_line(part)
+            if buf.strip():
+                _handle_line(buf)
 
             rc = await proc.wait()
             if rc != 0:
+                log_tail = ""
+                try:
+                    tdl_log = Path.home() / ".tdl" / "log" / "latest.log"
+                    if tdl_log.is_file():
+                        lines = tdl_log.read_text(encoding="utf-8", errors="replace").splitlines()[-10:]
+                        if lines:
+                            log_tail = " | tdl.log: " + " ; ".join(lines[-3:])
+                except Exception:
+                    pass
                 tail = " | ".join(output_lines[-5:])
-                raise ProviderFailure("DOWNLOAD_FAILED", f"tdl exited with code {rc}: {tail}")
+                raise ProviderFailure("DOWNLOAD_FAILED", f"tdl exited with code {rc}: {tail}{log_tail}")
 
             downloaded_files = [
                 p for p in dl_stage.rglob("*")
                 if p.is_file() and not p.name.endswith(".tmp") and p.stat().st_size > 0
             ]
             if not downloaded_files:
-                raise ProviderFailure("DOWNLOAD_FAILED", f"tdl finished without producing any file for {url}")
+                log_tail = ""
+                try:
+                    tdl_log = Path.home() / ".tdl" / "log" / "latest.log"
+                    if tdl_log.is_file():
+                        lines = tdl_log.read_text(encoding="utf-8", errors="replace").splitlines()[-5:]
+                        if lines:
+                            log_tail = " (" + " ; ".join(lines) + ")"
+                except Exception:
+                    pass
+                raise ProviderFailure("DOWNLOAD_FAILED", f"tdl finished without producing any file for {url}{log_tail}")
 
-            dest_dir.mkdir(parents=True, exist_ok=True)
             out_paths: list[Path] = []
             for idx, src_f in enumerate(downloaded_files):
                 if name and idx == 0 and Path(name).suffix:
                     target_name = safe_name(name)
-                elif name and idx == 0 and not Path(name).suffix and src_f.suffix:
-                    target_name = safe_name(src_f.name)
                 else:
                     target_name = safe_name(src_f.name)
                 dest_file = dest_dir / target_name
@@ -4697,6 +4782,7 @@ class LinksProvider(BaseProvider):
             raise
         finally:
             shutil.rmtree(tmp_root, ignore_errors=True)
+            shutil.rmtree(dl_stage, ignore_errors=True)
 
     async def _dispatch_download(
         self, link_type: str, is_stream: bool, url: str, urls: list[str],
@@ -4957,7 +5043,7 @@ class LinksProvider(BaseProvider):
 
         name = safe_name(raw_name) if raw_name else None
         link_type = "telegram" if str(file_ref.get("type") or "").lower() == "telegram" else self._classify_link(url)
-        if name and link_type in ("gdrive", "mega_file", "mediafire", "pixeldrain", "gofile_page", "dropbox") and is_placeholder_link_name(raw_name, url):
+        if name and link_type in ("gdrive", "mega_file", "mediafire", "pixeldrain", "gofile_page", "dropbox", "telegram") and is_placeholder_link_name(raw_name, url):
             name = None
         if link_type == "direct":
             check_sources = f"{page_url} {headers.get('Referer', '')} {headers.get('referer', '')}".lower()

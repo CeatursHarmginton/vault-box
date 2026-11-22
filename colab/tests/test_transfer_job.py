@@ -6344,10 +6344,15 @@ def test_links_provider_telegram_download_writes_temp_kv_and_cleans_up(tmp_path,
 
         class _FakeStdout:
             def __init__(self):
-                self._lines = [b"done!\n", b""]
+                self._chunks = [
+                    b"All files will be downloaded to '/tmp/dl' dir\n",
+                    b"sweetrabbit(3287969807):2 -> ~ ...  50.0% [####....] [10.00 MB in 2.0s; ~ETA: 2s; 5.00 MB/s]\r",
+                    b"sweetrabbit(3287969807):2 -> ~ ... done!\n",
+                    b"",
+                ]
 
-            async def readline(self):
-                return self._lines.pop(0) if self._lines else b""
+            async def read(self, n=-1):
+                return self._chunks.pop(0) if self._chunks else b""
 
         async def wait(self):
             return 0
@@ -6368,15 +6373,19 @@ def test_links_provider_telegram_download_writes_temp_kv_and_cleans_up(tmp_path,
         },
     }
     file_ref = {
-        "id": "https://t.me/c/3105153632/102",
-        "name": "demo_clip.mp4",
+        "id": "https://t.me/c/3287969807/2",
+        "name": "tg_3287969807_2",
         "type": "telegram",
-        "size": 20,
+        "size": 0,
     }
-    out = asyncio.run(provider.download_file(creds, file_ref, tmp_path, JobState("tg-dl", {})))
+    job = JobState("tg-dl", {})
+    out = asyncio.run(provider.download_file(creds, file_ref, tmp_path, job))
 
     assert out.exists() and out.name == "demo_clip.mp4"
+    assert file_ref["name"] == "demo_clip.mp4"
     assert out.read_bytes() == b"telegram-video-bytes"
+    assert any("[tdl] 50.0% - 10.00 MB (5.00 MB/s, ETA: 2s)" in line for line in job.logs)
+    assert job.progress.download >= 50.0
     assert "-n" in seen_cmd and seen_cmd[seen_cmd.index("-n") + 1] == "colab"
     assert seen_kv["exists_during_run"] is True
     assert seen_kv["content"]["colab"]["session"] == "eyJhdXRoX2tleSI6InNlY3JldCJ9"
