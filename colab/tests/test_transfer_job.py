@@ -6416,6 +6416,203 @@ def test_links_provider_telegram_download_writes_temp_kv_and_cleans_up(tmp_path,
     assert redacted["auth_key"] == "***"
 
 
+def test_telegram_gotd_session_parse_and_url_formats():
+    import base64
+    import json
+    from src.providers.links import LinksProvider
+
+    assert LinksProvider._parse_telegram_url("https://t.me/c/3287969807/2") == ("channel_id", 3287969807, 2)
+    assert LinksProvider._parse_telegram_url("https://t.me/c/3287969807/12/45?single") == ("channel_id", 3287969807, 45)
+    assert LinksProvider._parse_telegram_url("https://t.me/publicchan/99") == ("username", "publicchan", 99)
+
+    fake_key = bytes(range(256))
+    gotd_payload = {
+        "Version": 1,
+        "Data": {
+            "DC": 5,
+            "Addr": "",
+            "AuthKey": base64.b64encode(fake_key).decode("ascii"),
+            "Config": {
+                "DCOptions": [
+                    {"ID": 5, "IPAddress": "2001:b28:f23f:f005::a", "Port": 443, "Ipv6": True, "MediaOnly": False},
+                    {"ID": 5, "IPAddress": "91.108.56.199", "Port": 443, "Ipv6": False, "MediaOnly": True},
+                    {"ID": 5, "IPAddress": "91.108.56.166", "Port": 443, "Ipv6": False, "MediaOnly": False},
+                ]
+            },
+        },
+    }
+    kv_ns = {
+        "app": base64.b64encode(b"desktop").decode("ascii"),
+        "session": base64.b64encode(json.dumps(gotd_payload).encode("utf-8")).decode("ascii"),
+    }
+    parsed = LinksProvider._parse_tdl_gotd_session(kv_ns)
+    assert parsed["app_id"] == 2040
+    assert parsed["dc_id"] == 5
+    assert parsed["dc_ip"] == "91.108.56.166"
+    assert parsed["dc_port"] == 443
+    assert parsed["auth_key"] == fake_key
+
+
+def test_telegram_tdl_failure_falls_back_to_telethon_part_resume(monkeypatch, tmp_path):
+    import base64
+    import hashlib
+    import json
+    import sys
+    import types
+    from src.providers.links import LinksProvider
+    from src.providers.base import ProviderFailure
+    from src.jobs.progress import JobState
+
+    provider = LinksProvider()
+    monkeypatch.setattr(provider, "_ensure_deps", lambda: asyncio.sleep(0))
+
+    async def fake_ensure_tdl(progress=None):
+        return "/usr/local/bin/tdl"
+
+    async def fake_ensure_telethon(progress=None):
+        return None
+
+    class FailingProc:
+        returncode = 1
+        stdout = None
+
+        async def wait(self):
+            return 1
+
+    async def fail_tdl_exec(*args, **kwargs):
+        return FailingProc()
+
+    monkeypatch.setattr(provider, "_ensure_tdl_binary", fake_ensure_tdl)
+    monkeypatch.setattr(provider, "_ensure_telethon", fake_ensure_telethon)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_tdl_exec)
+    monkeypatch.setattr(shutil, "which", lambda cmd: None if cmd == "ffprobe" else shutil.which(cmd))
+
+    full_payload = (b"A" * 4096) + (b"B" * 4096) + (b"C" * 1024)
+    total_len = len(full_payload)
+
+    # Pre-seed an unaligned 4500-byte .part file to verify 4096-byte resume alignment & zero wasted bytes
+    url = "https://t.me/c/3287969807/2"
+    target_name = "sweetrabbit.mp4"
+    dest_dir = tmp_path / "dl"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    part_hash = hashlib.sha1(f"{url}:{target_name}".encode("utf-8")).hexdigest()[:12]
+    part_file = dest_dir / f".tg_part_{part_hash}.part"
+    part_file.write_bytes(full_payload[:4096] + b"GARBAGE_TAIL")
+
+    seen_offsets = []
+
+    class FakeFloodWaitError(Exception):
+        def __init__(self, seconds):
+            self.seconds = seconds
+
+    class FakeAuthKey:
+        def __init__(self, data):
+            self.key = data
+
+    class FakeMemorySession:
+        def __init__(self):
+            self.dc = None
+            self.auth_key = None
+
+        def set_dc(self, dc_id, ip, port):
+            self.dc = (dc_id, ip, port)
+
+    class FakePeerChannel:
+        def __init__(self, cid):
+            self.channel_id = cid
+
+    class FakeTelegramClient:
+        def __init__(self, session, api_id, api_hash, **kwargs):
+            self.session = session
+            self.api_id = api_id
+            self.flood_raises_left = 1
+
+        async def connect(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+        async def is_user_authorized(self):
+            return True
+
+        async def get_input_entity(self, target):
+            return target
+
+        async def get_messages(self, entity, ids=None):
+            return types.SimpleNamespace(
+                id=ids,
+                media=object(),
+                file=types.SimpleNamespace(name=target_name, size=total_len, ext=".mp4"),
+            )
+
+        async def iter_download(self, media, offset=0, request_size=524288):
+            seen_offsets.append(offset)
+            if self.flood_raises_left > 0 and offset == 4096:
+                self.flood_raises_left -= 1
+                yield full_payload[4096:8192]
+                raise FakeFloodWaitError(0)
+            yield full_payload[offset:]
+
+    fake_telethon = types.ModuleType("telethon")
+    fake_telethon.TelegramClient = FakeTelegramClient
+    fake_errors = types.ModuleType("telethon.errors")
+    fake_errors.FloodWaitError = FakeFloodWaitError
+    fake_errors.AuthKeyUnregisteredError = type("AuthKeyUnregisteredError", (Exception,), {})
+    fake_errors.SessionRevokedError = type("SessionRevokedError", (Exception,), {})
+    fake_errors.UnauthorizedError = type("UnauthorizedError", (Exception,), {})
+    fake_errors.TimeoutError = type("TimeoutError", (Exception,), {})
+    fake_crypto = types.ModuleType("telethon.crypto")
+    fake_crypto.AuthKey = FakeAuthKey
+    fake_sessions = types.ModuleType("telethon.sessions")
+    fake_sessions.MemorySession = FakeMemorySession
+    fake_tl = types.ModuleType("telethon.tl")
+    fake_tl_types = types.ModuleType("telethon.tl.types")
+    fake_tl_types.PeerChannel = FakePeerChannel
+    fake_telethon.errors = fake_errors
+
+    monkeypatch.setitem(sys.modules, "telethon", fake_telethon)
+    monkeypatch.setitem(sys.modules, "telethon.errors", fake_errors)
+    monkeypatch.setitem(sys.modules, "telethon.crypto", fake_crypto)
+    monkeypatch.setitem(sys.modules, "telethon.sessions", fake_sessions)
+    monkeypatch.setitem(sys.modules, "telethon.tl", fake_tl)
+    monkeypatch.setitem(sys.modules, "telethon.tl.types", fake_tl_types)
+
+    fake_key = b"K" * 256
+    gotd_payload = {"Version": 1, "Data": {"DC": 5, "AuthKey": base64.b64encode(fake_key).decode("ascii")}}
+    creds = {
+        "provider": "telegram",
+        "namespace": "colab",
+        "kv_file": {
+            "colab": {
+                "app": base64.b64encode(b"desktop").decode("ascii"),
+                "session": base64.b64encode(json.dumps(gotd_payload).encode("utf-8")).decode("ascii"),
+            }
+        },
+    }
+    file_ref = {"id": url, "name": "tg_3287969807_2", "type": "telegram", "size": total_len}
+    job = JobState("tg-fallback", {})
+
+    out = asyncio.run(provider.download_file(creds, file_ref, dest_dir, job))
+    assert out.exists() and out.name == target_name
+    assert out.read_bytes() == full_payload
+    assert not part_file.exists()
+    assert seen_offsets == [4096, 8192]
+    assert any("Switching to Telethon byte-resume engine" in line for line in job.logs)
+    assert any("FloodWait" in line for line in job.logs)
+
+    # Integrity guard rejects size mismatch
+    bad_file = tmp_path / "bad.mp4"
+    bad_file.write_bytes(b"123")
+    err_raised = False
+    try:
+        asyncio.run(provider._verify_downloaded_media_integrity(bad_file, expected_size=10))
+    except ProviderFailure:
+        err_raised = True
+    assert err_raised
+
+
+
 
 
 

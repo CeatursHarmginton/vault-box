@@ -11,3 +11,5 @@ yt-dlp>=2024.0
 curl_cffi>=0.7.0
 gdown>=5.0
 cryptography>=41.0
+telethon>=1.36
+cryptg>=0.4

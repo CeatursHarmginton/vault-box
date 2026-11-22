@@ -91,6 +91,53 @@ class LinksProvider(BaseProvider):
     
     name = "links"
     _deps_checked = False
+    _telethon_checked = False
+
+    @classmethod
+    async def _ensure_telethon(cls, progress: JobState | None = None) -> None:
+        """Ensure telethon (and optional cryptg C-accelerator) are importable."""
+        if cls._telethon_checked:
+            return
+        from ..providers.base import _loop_store, dict_lock
+
+        lock = dict_lock(_loop_store("telethon_install_locks"), "telethon")
+        async with lock:
+            if cls._telethon_checked:
+                return
+            try:
+                import telethon  # noqa: F401
+                cls._telethon_checked = True
+                return
+            except ImportError:
+                pass
+
+            if progress:
+                progress.log("[Telegram] Installing Telethon fallback engine...")
+            try:
+                await asyncio.to_thread(
+                    subprocess.check_call,
+                    [sys.executable, "-m", "pip", "install", "-q", "telethon>=1.36", "cryptg>=0.4"],
+                )
+            except Exception:
+                try:
+                    await asyncio.to_thread(
+                        subprocess.check_call,
+                        [sys.executable, "-m", "pip", "install", "-q", "telethon>=1.36"],
+                    )
+                except Exception as exc:
+                    raise ProviderFailure(
+                        "MISSING_DEPENDENCY",
+                        f"Failed to install Telethon fallback package: {exc}",
+                    ) from exc
+
+            try:
+                import telethon  # noqa: F401
+            except ImportError as exc:
+                raise ProviderFailure(
+                    "MISSING_DEPENDENCY",
+                    f"Telethon package unavailable after installation: {exc}",
+                ) from exc
+            cls._telethon_checked = True
 
     @classmethod
     async def _ensure_deps(cls) -> None:
@@ -4593,6 +4640,479 @@ class LinksProvider(BaseProvider):
 
             raise ProviderFailure("MISSING_DEPENDENCY", "No writable bin directory to install tdl binary")
 
+    @staticmethod
+    def _parse_telegram_url(url: str) -> tuple[str, Any, int]:
+        """Parse t.me or tg:// message link into (kind, target, msg_id)."""
+        raw = str(url or "").strip()
+        parsed = urlparse(raw)
+        if parsed.scheme.lower() == "tg":
+            qs = parse_qs(parsed.query)
+            if parsed.netloc.lower() == "privatepost":
+                ch = (qs.get("channel") or [""])[0].strip()
+                post = (qs.get("post") or [""])[0].strip()
+                if ch.isdigit() and post.isdigit():
+                    return ("channel_id", int(ch), int(post))
+            elif parsed.netloc.lower() == "resolve":
+                dom = (qs.get("domain") or [""])[0].strip().lstrip("@")
+                post = (qs.get("post") or [""])[0].strip()
+                if dom and post.isdigit():
+                    return ("username", dom, int(post))
+            raise ProviderFailure("DOWNLOAD_FAILED", f"Unsupported Telegram URL format: {url}")
+
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) >= 3 and parts[0].lower() == "c" and parts[1].isdigit():
+            for seg in reversed(parts[2:]):
+                if seg.isdigit():
+                    return ("channel_id", int(parts[1]), int(seg))
+        elif len(parts) >= 3 and parts[0].lower() == "s" and parts[2].isdigit():
+            return ("username", parts[1].lstrip("@"), int(parts[2]))
+        elif len(parts) >= 2 and parts[1].isdigit():
+            return ("username", parts[0].lstrip("@"), int(parts[1]))
+        raise ProviderFailure("DOWNLOAD_FAILED", f"Unsupported Telegram URL format: {url}")
+
+    @staticmethod
+    def _parse_tdl_gotd_session(kv_ns_data: dict[str, Any]) -> dict[str, Any]:
+        """Decode tdl KV namespace (gotd session + app) into Telethon parameters in RAM."""
+        if not isinstance(kv_ns_data, dict):
+            raise ProviderFailure("AUTH_REQUIRED", "Invalid Telegram KV session payload.")
+
+        def _b64_decode_bytes(val: Any) -> bytes:
+            s = str(val or "").strip()
+            if not s:
+                return b""
+            padded = s + ("=" * ((4 - len(s) % 4) % 4))
+            return base64.b64decode(padded)
+
+        app_raw = str(kv_ns_data.get("app") or "").strip()
+        app_name = "desktop"
+        if app_raw:
+            if app_raw.lower() in ("desktop", "builtin") or ":" in app_raw:
+                app_name = app_raw
+            else:
+                try:
+                    decoded_app = _b64_decode_bytes(app_raw).decode("utf-8", errors="ignore").strip()
+                    if decoded_app:
+                        app_name = decoded_app
+                except Exception:
+                    app_name = "desktop"
+
+        tdl_apps = {
+            "builtin": (15055931, "021d433426cbb920eeb95164498fe3d3"),
+            "desktop": (2040, "b18441a1ff607e10a989891a5462e627"),
+        }
+        if ":" in app_name:
+            parts = app_name.split(":", 1)
+            if parts[0].strip().isdigit() and parts[1].strip():
+                app_id, app_hash = int(parts[0].strip()), parts[1].strip()
+            else:
+                app_id, app_hash = tdl_apps["desktop"]
+        else:
+            app_id, app_hash = tdl_apps.get(app_name.lower(), tdl_apps["desktop"])
+
+        sess_raw = kv_ns_data.get("session")
+        if not sess_raw:
+            raise ProviderFailure("AUTH_REQUIRED", "Missing gotd session data in Telegram KV credentials.")
+        try:
+            sess_bytes = _b64_decode_bytes(sess_raw)
+            sess_json = json.loads(sess_bytes.decode("utf-8"))
+        except Exception as exc:
+            raise ProviderFailure("AUTH_REQUIRED", f"Corrupted Telegram session payload: {exc}") from exc
+
+        data = sess_json.get("Data") if isinstance(sess_json.get("Data"), dict) else sess_json
+        if not isinstance(data, dict):
+            raise ProviderFailure("AUTH_REQUIRED", "Missing Data object inside gotd session JSON.")
+
+        try:
+            dc_id = int(data.get("DC") or 0)
+        except (TypeError, ValueError):
+            dc_id = 0
+        auth_key_bytes = _b64_decode_bytes(data.get("AuthKey"))
+        if dc_id <= 0 or len(auth_key_bytes) != 256:
+            raise ProviderFailure(
+                "AUTH_REQUIRED",
+                f"Invalid gotd session DC ({dc_id}) or AuthKey length ({len(auth_key_bytes)} bytes).",
+            )
+
+        dc_ip = ""
+        dc_port = 443
+        addr = str(data.get("Addr") or "").strip()
+        if addr and ":" in addr and not addr.startswith("["):
+            host, _, port_str = addr.rpartition(":")
+            if host and port_str.isdigit():
+                dc_ip = host.strip()
+                dc_port = int(port_str)
+
+        if not dc_ip:
+            dc_opts = (data.get("Config") or {}).get("DCOptions") or []
+            primary = [
+                opt for opt in dc_opts
+                if isinstance(opt, dict)
+                and int(opt.get("ID") or 0) == dc_id
+                and not opt.get("Ipv6")
+                and not opt.get("MediaOnly")
+                and not opt.get("CDN")
+                and not opt.get("TcpoOnly")
+                and str(opt.get("IPAddress") or "").strip()
+            ]
+            fallback = [
+                opt for opt in dc_opts
+                if isinstance(opt, dict)
+                and int(opt.get("ID") or 0) == dc_id
+                and not opt.get("Ipv6")
+                and not opt.get("CDN")
+                and str(opt.get("IPAddress") or "").strip()
+            ]
+            chosen = (primary or fallback or [None])[0]
+            if chosen:
+                dc_ip = str(chosen["IPAddress"]).strip()
+                try:
+                    dc_port = int(chosen.get("Port") or 443)
+                except (TypeError, ValueError):
+                    dc_port = 443
+
+        if not dc_ip:
+            prod_dc_ips = {
+                1: "149.154.175.53",
+                2: "149.154.167.51",
+                3: "149.154.175.100",
+                4: "149.154.167.91",
+                5: "91.108.56.130",
+            }
+            dc_ip = prod_dc_ips.get(dc_id, "149.154.167.51")
+
+        return {
+            "app_name": app_name,
+            "app_id": app_id,
+            "app_hash": app_hash,
+            "dc_id": dc_id,
+            "dc_ip": dc_ip,
+            "dc_port": dc_port,
+            "auth_key": auth_key_bytes,
+        }
+
+    @staticmethod
+    async def _verify_downloaded_media_integrity(
+        file_path: Path,
+        *,
+        expected_size: int = 0,
+        suffix_hint: str = "",
+    ) -> None:
+        """Verify exact byte completeness and non-corrupt video container via ffprobe."""
+        if not file_path.is_file():
+            raise ProviderFailure("DOWNLOAD_FAILED", f"Missing downloaded file: {file_path.name}")
+        actual_size = file_path.stat().st_size
+        if actual_size <= 0:
+            raise ProviderFailure("DOWNLOAD_FAILED", f"Downloaded Telegram file {file_path.name} is empty (0 bytes)")
+        if expected_size > 0 and actual_size != expected_size:
+            raise ProviderFailure(
+                "DOWNLOAD_FAILED",
+                f"Telegram file {file_path.name} incomplete: got {actual_size} bytes, expected {expected_size} bytes",
+            )
+
+        ext = (suffix_hint or file_path.suffix or "").lower()
+        video_exts = (".mp4", ".mkv", ".mov", ".webm", ".avi", ".flv", ".ts", ".m4v")
+        if ext in video_exts and actual_size > 4096 and shutil.which("ffprobe"):
+            def _probe() -> tuple[int, str, str]:
+                res = subprocess.run(
+                    [
+                        "ffprobe",
+                        "-v", "error",
+                        "-show_entries", "format=duration",
+                        "-show_entries", "stream=codec_type",
+                        "-of", "json",
+                        str(file_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=25,
+                )
+                return res.returncode, res.stdout, res.stderr
+
+            try:
+                rc, stdout_txt, stderr_txt = await asyncio.to_thread(_probe)
+            except Exception:
+                return
+            if rc != 0:
+                err_msg = (stderr_txt or "").strip()[:180]
+                raise ProviderFailure(
+                    "DOWNLOAD_FAILED",
+                    f"Video integrity check failed for {file_path.name}: {err_msg or f'ffprobe rc={rc}'}",
+                )
+            try:
+                probe_data = json.loads(stdout_txt or "{}")
+            except Exception:
+                probe_data = {}
+            streams = probe_data.get("streams") or []
+            if not streams:
+                raise ProviderFailure(
+                    "DOWNLOAD_FAILED",
+                    f"Video integrity check failed for {file_path.name}: no valid media streams found",
+                )
+
+    async def _download_telegram_telethon(
+        self,
+        url: str,
+        dest_dir: Path,
+        name: str | None,
+        progress: JobState,
+        *,
+        credentials: dict[str, Any] | None = None,
+        file_ref: dict[str, Any] | None = None,
+        fallback_reason: str = "",
+    ) -> list[Path]:
+        """Download Telegram media using Telethon sequential chunking with contiguous .part resume."""
+        progress.check_cancelled()
+        creds = credentials or (file_ref or {}).get("credentials") or {}
+        kv_file = creds.get("kv_file") if isinstance(creds, dict) else None
+        ns = str((creds.get("namespace") if isinstance(creds, dict) else "") or "colab").strip() or "colab"
+        if not isinstance(kv_file, dict) or not kv_file.get(ns):
+            raise ProviderFailure("AUTH_REQUIRED", "Missing Telegram KV session for Telethon fallback.")
+
+        sess_info = self._parse_tdl_gotd_session(kv_file[ns])
+        kind, target, msg_id = self._parse_telegram_url(url)
+
+        await self._ensure_telethon(progress)
+        from telethon import TelegramClient, errors as tl_errors
+        from telethon.crypto import AuthKey
+        from telethon.sessions import MemorySession
+        from telethon.tl.types import PeerChannel
+
+        try:
+            expected_ref_size = int((file_ref or {}).get("size") or (file_ref or {}).get("file_size") or 0)
+        except (TypeError, ValueError):
+            expected_ref_size = 0
+
+        if fallback_reason:
+            progress.log(f"[Telegram] Switching to Telethon byte-resume engine ({fallback_reason[:120]})...")
+        else:
+            progress.log(f"[Telegram] Downloading via Telethon byte-resume engine (ns={ns}): {url}")
+
+        mem_session = MemorySession()
+        mem_session.set_dc(sess_info["dc_id"], sess_info["dc_ip"], sess_info["dc_port"])
+        mem_session.auth_key = AuthKey(data=sess_info["auth_key"])
+
+        client = TelegramClient(
+            mem_session,
+            sess_info["app_id"],
+            sess_info["app_hash"],
+            flood_sleep_threshold=0,
+            use_ipv6=False,
+            connection_retries=5,
+            request_retries=5,
+            retry_delay=2,
+        )
+
+        async def _sleep_cancellable(total_sec: float) -> None:
+            end_at = time.monotonic() + max(0.0, float(total_sec))
+            while True:
+                progress.check_cancelled()
+                rem = end_at - time.monotonic()
+                if rem <= 0:
+                    return
+                await asyncio.sleep(min(0.5, rem))
+
+        async def _with_flood_retry(coro_fn, op_label: str):
+            for attempt in range(1, 7):
+                progress.check_cancelled()
+                try:
+                    return await coro_fn()
+                except tl_errors.FloodWaitError as fw:
+                    wait_s = max(1, int(getattr(fw, "seconds", 5) or 5)) + 1
+                    progress.log(f"[Telegram/Telethon] FloodWait {wait_s}s during {op_label}; waiting safely...")
+                    await _sleep_cancellable(wait_s)
+                except (tl_errors.AuthKeyUnregisteredError, tl_errors.SessionRevokedError, tl_errors.UnauthorizedError) as auth_exc:
+                    raise ProviderFailure(
+                        "AUTH_REQUIRED",
+                        "Session Telegram đã hết hạn hoặc bị thu hồi. Vui lòng đăng nhập lại Session Colab và Export lại.",
+                    ) from auth_exc
+                except (ConnectionError, TimeoutError, asyncio.TimeoutError, OSError) as net_exc:
+                    if attempt >= 6:
+                        raise ProviderFailure("DOWNLOAD_FAILED", f"Telethon {op_label} failed: {net_exc}") from net_exc
+                    await _sleep_cancellable(min(15.0, float(2 ** min(attempt, 4))))
+            raise ProviderFailure("DOWNLOAD_FAILED", f"Telethon {op_label} failed after retries")
+
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        part_path: Path | None = None
+        try:
+            await _with_flood_retry(lambda: client.connect(), "connect")
+            is_auth = await _with_flood_retry(lambda: client.is_user_authorized(), "auth check")
+            if not is_auth:
+                raise ProviderFailure(
+                    "AUTH_REQUIRED",
+                    "Session Telegram không còn hiệu lực. Vui lòng đăng nhập lại Session Colab và Export lại.",
+                )
+
+            async def _resolve_entity():
+                if kind == "channel_id":
+                    try:
+                        return await client.get_input_entity(PeerChannel(int(target)))
+                    except Exception:
+                        async for dialog in client.iter_dialogs(limit=500):
+                            progress.check_cancelled()
+                            ent = getattr(dialog, "entity", None)
+                            if ent is not None and getattr(ent, "id", None) == int(target):
+                                return await client.get_input_entity(ent)
+                        raise ProviderFailure(
+                            "DOWNLOAD_FAILED",
+                            f"Cannot resolve Telegram private channel c/{target}. Ensure account is a member.",
+                        )
+                return await client.get_input_entity(str(target))
+
+            entity = await _with_flood_retry(_resolve_entity, "entity resolve")
+            msg = await _with_flood_retry(lambda: client.get_messages(entity, ids=msg_id), "get_messages")
+            if isinstance(msg, list):
+                msg = msg[0] if msg else None
+            if not msg or not getattr(msg, "media", None):
+                raise ProviderFailure("DOWNLOAD_FAILED", f"Telegram message {url} has no downloadable media")
+
+            msg_file = getattr(msg, "file", None)
+            total_size = int(getattr(msg_file, "size", 0) or expected_ref_size or 0)
+            raw_fname = ""
+            if name and Path(name).suffix:
+                raw_fname = name
+            elif msg_file and getattr(msg_file, "name", None):
+                raw_fname = str(msg_file.name)
+            else:
+                ext_guess = str(getattr(msg_file, "ext", "") or "")
+                raw_fname = f"tg_{target}_{msg_id}{ext_guess}"
+            target_name = safe_name(raw_fname)
+            dest_file = dest_dir / target_name
+            if dest_file.exists():
+                stem, ext = dest_file.stem, dest_file.suffix
+                dest_file = dest_dir / f"{stem}_{msg_id}{ext}"
+
+            safe_part_id = hashlib.sha1(f"{url}:{dest_file.name}".encode("utf-8", errors="ignore")).hexdigest()[:12]
+            part_path = dest_dir / f".tg_part_{safe_part_id}.part"
+
+            chunk_align = 4096
+            request_size = 512 * 1024
+            existing_size = part_path.stat().st_size if part_path.is_file() else 0
+            if total_size > 0 and existing_size > total_size:
+                existing_size = 0
+            offset = (existing_size // chunk_align) * chunk_align
+
+            if total_size > 0 and existing_size == total_size:
+                await self._verify_downloaded_media_integrity(
+                    part_path, expected_size=total_size, suffix_hint=dest_file.suffix
+                )
+                os.replace(part_path, dest_file)
+                return [dest_file]
+
+            mode = "r+b" if offset > 0 and part_path.is_file() else "wb"
+            if offset > 0:
+                progress.log(
+                    f"[Telegram/Telethon] Resuming {dest_file.name} from {offset / 1048576:.1f} MB"
+                    + (f" / {total_size / 1048576:.1f} MB" if total_size > 0 else "")
+                )
+
+            max_cycles = 16
+            cycle = 0
+            last_ui_ts = 0.0
+            win_start_ts = time.monotonic()
+            win_start_bytes = offset
+
+            with open(part_path, mode) as fh:
+                if mode == "r+b":
+                    fh.seek(offset)
+                    fh.truncate(offset)
+
+                while total_size <= 0 or offset < total_size:
+                    progress.check_cancelled()
+                    try:
+                        async for chunk in client.iter_download(
+                            msg.media,
+                            offset=offset,
+                            request_size=request_size,
+                        ):
+                            progress.check_cancelled()
+                            if not chunk:
+                                continue
+                            fh.write(chunk)
+                            offset += len(chunk)
+                            now = time.monotonic()
+                            if now - last_ui_ts >= 0.4 or (total_size > 0 and offset >= total_size):
+                                elapsed = max(0.05, now - win_start_ts)
+                                speed_bps = max(0.0, (offset - win_start_bytes) / elapsed)
+                                if elapsed >= 5.0:
+                                    win_start_ts = now
+                                    win_start_bytes = offset
+                                pct = (offset * 100.0 / total_size) if total_size > 0 else 0.0
+                                if hasattr(progress, "set_phase_progress"):
+                                    progress.set_phase_progress(
+                                        done_bytes=offset,
+                                        total_bytes=total_size or getattr(progress, "bytes_total", 0),
+                                        pct=min(100.0, pct),
+                                        speed=speed_bps,
+                                        phase="download",
+                                    )
+                                last_ui_ts = now
+                            if total_size > 0 and offset >= total_size:
+                                break
+                        # Stream finished naturally
+                        break
+                    except tl_errors.FloodWaitError as fw:
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                        cycle += 1
+                        if cycle > max_cycles:
+                            raise ProviderFailure(
+                                "DOWNLOAD_FAILED",
+                                f"Telethon exceeded max FloodWait retries at {offset}/{total_size} bytes",
+                            ) from fw
+                        wait_s = max(1, int(getattr(fw, "seconds", 5) or 5)) + 1
+                        progress.log(
+                            f"[Telegram/Telethon] FloodWait {wait_s}s at {offset / 1048576:.1f}"
+                            + (f"/{total_size / 1048576:.1f} MB" if total_size > 0 else " MB")
+                            + " — .part saved, resuming automatically..."
+                        )
+                        await _sleep_cancellable(wait_s)
+                        offset = (fh.tell() // chunk_align) * chunk_align
+                        fh.seek(offset)
+                        fh.truncate(offset)
+                        win_start_ts = time.monotonic()
+                        win_start_bytes = offset
+                    except (
+                        tl_errors.TimeoutError,
+                        ConnectionError,
+                        TimeoutError,
+                        asyncio.TimeoutError,
+                        OSError,
+                    ) as net_exc:
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                        cycle += 1
+                        if cycle > max_cycles:
+                            raise ProviderFailure(
+                                "DOWNLOAD_FAILED",
+                                f"Telethon interrupted after {max_cycles} retries at {offset}/{total_size} bytes: {net_exc}",
+                            ) from net_exc
+                        backoff_s = min(30.0, float(2 ** min(cycle, 4)))
+                        progress.log(
+                            f"[Telegram/Telethon] Connection reset at {offset / 1048576:.1f} MB ({net_exc}); "
+                            f"retrying in {backoff_s:.0f}s..."
+                        )
+                        await _sleep_cancellable(backoff_s)
+                        offset = (fh.tell() // chunk_align) * chunk_align
+                        fh.seek(offset)
+                        fh.truncate(offset)
+                        win_start_ts = time.monotonic()
+                        win_start_bytes = offset
+
+                fh.flush()
+                os.fsync(fh.fileno())
+
+            verify_size = total_size or expected_ref_size
+            await self._verify_downloaded_media_integrity(
+                part_path, expected_size=verify_size, suffix_hint=dest_file.suffix
+            )
+            os.replace(part_path, dest_file)
+            return [dest_file]
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
     async def _download_telegram(
         self,
         url: str,
@@ -4612,12 +5132,25 @@ class LinksProvider(BaseProvider):
                 "Thiếu session Telegram (namespace: colab) trong file Packed JSON. Vui lòng đăng nhập Session Colab và Export lại.",
             )
 
-        tdl_bin = await self._ensure_tdl_binary(progress)
+        tdl_bin: str | None = None
+        tdl_init_err = ""
+        try:
+            tdl_bin = await self._ensure_tdl_binary(progress)
+        except Exception as init_exc:
+            tdl_init_err = str(init_exc)
+
         opt = (progress.payload or {}).get("options", {}) if hasattr(progress, "payload") else {}
         try:
             expected_size = int((file_ref or {}).get("size") or (file_ref or {}).get("file_size") or 0)
         except (TypeError, ValueError):
             expected_size = 0
+
+        if not tdl_bin:
+            return await self._download_telegram_telethon(
+                url, dest_dir, name, progress,
+                credentials=creds, file_ref=file_ref,
+                fallback_reason=tdl_init_err or "tdl unavailable",
+            )
 
         source_items = ((progress.payload or {}).get("source") or {}).get("items") or [] if hasattr(progress, "payload") else []
         total_items = max(int(getattr(progress, "files_to_download", 0) or 0), len(source_items))
@@ -4657,17 +5190,24 @@ class LinksProvider(BaseProvider):
             mult = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}.get(unit, 1)
             return int(val * mult)
 
-        def _read_tdl_log_tail(max_lines: int = 10) -> str:
+        def _read_tdl_log_tail(max_lines: int = 12) -> str:
             try:
                 tdl_log = Path.home() / ".tdl" / "log" / "latest.log"
                 if tdl_log.is_file():
                     lines = tdl_log.read_text(encoding="utf-8", errors="replace").splitlines()[-max_lines:]
-                    if lines:
-                        return " ; ".join(lines[-3:])
+                    interesting = [
+                        ln for ln in lines
+                        if any(k in ln.lower() for k in ("flood", "wait", "error", "warn", "timeout", "retry", "recover"))
+                    ]
+                    chosen = interesting[-3:] if interesting else lines[-3:]
+                    if chosen:
+                        return " ; ".join(chosen)
             except Exception:
                 pass
             return ""
 
+        last_error_msg = ""
+        downloaded_files: list[Path] = []
         try:
             kv_path.write_text(json.dumps({ns: kv_file[ns]}), encoding="utf-8")
             try:
@@ -4675,166 +5215,171 @@ class LinksProvider(BaseProvider):
             except Exception:
                 pass
 
-            thread_schedule = [base_threads]
-            if base_threads > 1:
-                thread_schedule.append(1)
+            progress.check_cancelled()
+            dl_stage.mkdir(parents=True, exist_ok=True)
 
-            downloaded_files: list[Path] = []
-            last_error_msg = ""
+            cmd = [
+                tdl_bin,
+                "--storage", f"type=file,path={kv_path.as_posix()}",
+                "-n", ns,
+                "--pool", str(pool_size),
+                "--reconnect-timeout", "30s",
+                "--debug",
+                "dl",
+                "-u", url,
+                "-d", str(dl_stage),
+                "--continue",
+                "--rewrite-ext",
+                "--template", "{{ filenamify .FileName }}",
+                "--threads", str(base_threads),
+            ]
+            progress.log(f"[Telegram] Downloading via tdl (ns={ns}, threads={base_threads}, pool={pool_size}, {profile_mode}): {url}")
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
 
-            for attempt_idx, cur_threads in enumerate(thread_schedule, start=1):
+            output_lines: list[str] = []
+            buf = ""
+            max_done_bytes = -1
+            last_pct_seen = -1.0
+            last_progress_at = time.monotonic()
+            stalled = False
+
+            def _handle_line(raw_line: str) -> None:
+                nonlocal max_done_bytes, last_pct_seen, last_progress_at
+                clean = ansi_re.sub("", raw_line).strip()
+                if not clean:
+                    return
+                if clean.startswith("CPU:") and "Goroutines:" in clean:
+                    return
+                if re.match(r"^\[[.#]+\]\s+\[[^\]]+\]$", clean):
+                    return
+
+                m_prog = tdl_prog_re.search(clean)
+                if m_prog:
+                    pct = float(m_prog.group(1))
+                    done_str = m_prog.group(2)
+                    spd_str = (m_prog.group(5) or "").strip()
+                    done_bytes = _parse_size_str(done_str)
+                    speed_bps = float(_parse_size_str(spd_str[:-2])) if spd_str.lower().endswith("/s") else 0.0
+                    total_bytes = expected_size or (int(done_bytes / (pct / 100.0)) if pct > 0.2 and done_bytes > 0 else 0)
+                    if done_bytes > max_done_bytes or pct > last_pct_seen:
+                        max_done_bytes = max(max_done_bytes, done_bytes)
+                        last_pct_seen = max(last_pct_seen, pct)
+                        last_progress_at = time.monotonic()
+                    if hasattr(progress, "set_phase_progress"):
+                        progress.set_phase_progress(
+                            done_bytes=done_bytes,
+                            total_bytes=total_bytes or getattr(progress, "bytes_total", 0),
+                            pct=pct,
+                            speed=speed_bps,
+                            phase="download",
+                        )
+                    return
+
+                output_lines.append(clean)
+                if len(output_lines) > 50:
+                    del output_lines[:-50]
+                if any(k in clean.lower() for k in ("error", "fail", "flood", "deleted", "skipped")):
+                    progress.log(f"[tdl] {clean[:200]}")
+
+            while True:
                 progress.check_cancelled()
-                shutil.rmtree(dl_stage, ignore_errors=True)
-                dl_stage.mkdir(parents=True, exist_ok=True)
-
-                cmd = [
-                    tdl_bin,
-                    "--storage", f"type=file,path={kv_path.as_posix()}",
-                    "-n", ns,
-                    "--pool", str(pool_size),
-                    "--reconnect-timeout", "20s",
-                    "dl",
-                    "-u", url,
-                    "-d", str(dl_stage),
-                    "--continue",
-                    "--rewrite-ext",
-                    "--template", "{{ filenamify .FileName }}",
-                    "--threads", str(cur_threads),
-                ]
-                progress.log(f"[Telegram] Downloading via tdl (ns={ns}, threads={cur_threads}, pool={pool_size}, {profile_mode}): {url}")
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                )
-
-                output_lines: list[str] = []
-                buf = ""
-                max_done_bytes = -1
-                last_pct_seen = -1.0
-                last_progress_at = time.monotonic()
-                stalled = False
-
-                def _handle_line(raw_line: str) -> None:
-                    nonlocal max_done_bytes, last_pct_seen, last_progress_at
-                    clean = ansi_re.sub("", raw_line).strip()
-                    if not clean:
-                        return
-                    if clean.startswith("CPU:") and "Goroutines:" in clean:
-                        return
-                    if re.match(r"^\[[.#]+\]\s+\[[^\]]+\]$", clean):
-                        return
-
-                    m_prog = tdl_prog_re.search(clean)
-                    if m_prog:
-                        pct = float(m_prog.group(1))
-                        done_str = m_prog.group(2)
-                        spd_str = (m_prog.group(5) or "").strip()
-                        done_bytes = _parse_size_str(done_str)
-                        speed_bps = float(_parse_size_str(spd_str[:-2])) if spd_str.lower().endswith("/s") else 0.0
-                        total_bytes = expected_size or (int(done_bytes / (pct / 100.0)) if pct > 0.2 and done_bytes > 0 else 0)
-                        if done_bytes > max_done_bytes or pct > last_pct_seen:
-                            max_done_bytes = max(max_done_bytes, done_bytes)
-                            last_pct_seen = max(last_pct_seen, pct)
-                            last_progress_at = time.monotonic()
-                        if hasattr(progress, "set_phase_progress"):
-                            progress.set_phase_progress(
-                                done_bytes=done_bytes,
-                                total_bytes=total_bytes or getattr(progress, "bytes_total", 0),
-                                pct=pct,
-                                speed=speed_bps,
-                                phase="download",
-                            )
-                        return
-
-                    output_lines.append(clean)
-                    if len(output_lines) > 50:
-                        del output_lines[:-50]
-                    if any(k in clean.lower() for k in ("error", "fail", "flood", "deleted", "skipped")):
-                        progress.log(f"[tdl] {clean[:200]}")
-
-                while True:
-                    progress.check_cancelled()
-                    stall_limit = 25.0 if max_done_bytes > 0 else 45.0
-                    if time.monotonic() - last_progress_at > stall_limit:
-                        stalled = True
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
-                        await proc.wait()
-                        break
-
-                    if proc.stdout is None:
-                        break
+                # Allow FloodWait pauses (commonly 30-90s near the end) to finish before declaring a stall
+                if last_pct_seen >= 90.0:
+                    stall_limit = 120.0
+                elif max_done_bytes > 0:
+                    stall_limit = 90.0
+                else:
+                    stall_limit = 45.0
+                if time.monotonic() - last_progress_at > stall_limit:
+                    stalled = True
                     try:
-                        chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=1.0)
-                    except asyncio.TimeoutError:
-                        if proc.returncode is not None:
-                            break
-                        continue
-                    if not chunk:
-                        break
-                    buf += chunk.decode("utf-8", errors="replace")
-                    parts = re.split(r"[\r\n]+", buf)
-                    buf = parts.pop()
-                    for part in parts:
-                        _handle_line(part)
-
-                if not stalled and buf.strip():
-                    _handle_line(buf)
-
-                if stalled:
-                    last_error_msg = f"tdl stalled at {max(0.0, last_pct_seen):.1f}% ({max(0, max_done_bytes)} bytes)"
-                    if attempt_idx < len(thread_schedule):
-                        progress.log(f"[Telegram] {last_error_msg}; retrying with threads={thread_schedule[attempt_idx]}...")
-                        continue
+                        proc.kill()
+                    except Exception:
+                        pass
+                    await proc.wait()
                     break
 
+                if proc.stdout is None:
+                    break
+                try:
+                    chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=1.0)
+                except asyncio.TimeoutError:
+                    if proc.returncode is not None:
+                        break
+                    continue
+                if not chunk:
+                    break
+                buf += chunk.decode("utf-8", errors="replace")
+                parts = re.split(r"[\r\n]+", buf)
+                buf = parts.pop()
+                for part in parts:
+                    _handle_line(part)
+
+            if not stalled and buf.strip():
+                _handle_line(buf)
+
+            if stalled:
+                log_tail = _read_tdl_log_tail()
+                last_error_msg = (
+                    f"tdl stalled at {max(0.0, last_pct_seen):.1f}% ({max(0, max_done_bytes)} bytes)"
+                    + (f" | {log_tail}" if log_tail else "")
+                )
+            else:
                 rc = await proc.wait()
                 if rc != 0:
                     log_tail = _read_tdl_log_tail()
                     tail = " | ".join(output_lines[-5:])
                     last_error_msg = f"tdl exited with code {rc}: {tail}" + (f" | tdl.log: {log_tail}" if log_tail else "")
-                    if attempt_idx < len(thread_schedule):
-                        progress.log(f"[Telegram] Attempt {attempt_idx} failed ({last_error_msg[:140]}); retrying...")
-                        continue
-                    raise ProviderFailure("DOWNLOAD_FAILED", last_error_msg)
-
-                downloaded_files = [
-                    p for p in dl_stage.rglob("*")
-                    if p.is_file() and not p.name.endswith(".tmp") and p.stat().st_size > 0
-                ]
-                if downloaded_files:
-                    break
-
-                log_tail = _read_tdl_log_tail()
-                last_error_msg = f"tdl finished without producing any file for {url}" + (f" ({log_tail})" if log_tail else "")
-                if attempt_idx < len(thread_schedule):
-                    progress.log(f"[Telegram] Attempt {attempt_idx} produced no output; retrying...")
-                    continue
-
-            if not downloaded_files:
-                raise ProviderFailure("DOWNLOAD_FAILED", last_error_msg or f"tdl failed for {url}")
-
-            out_paths: list[Path] = []
-            for idx, src_f in enumerate(downloaded_files):
-                if name and idx == 0 and Path(name).suffix:
-                    target_name = safe_name(name)
                 else:
-                    target_name = safe_name(src_f.name)
-                dest_file = dest_dir / target_name
-                if dest_file.exists():
-                    stem, ext = dest_file.stem, dest_file.suffix
-                    dest_file = dest_dir / f"{stem}_{idx + 1}{ext}"
-                shutil.move(str(src_f), str(dest_file))
-                out_paths.append(dest_file)
-            return out_paths
-        except BaseException:
-            raise
+                    cands = [
+                        p for p in dl_stage.rglob("*")
+                        if p.is_file() and not p.name.endswith(".tmp") and p.stat().st_size > 0
+                    ]
+                    if not cands:
+                        log_tail = _read_tdl_log_tail()
+                        last_error_msg = f"tdl finished without producing any file for {url}" + (f" ({log_tail})" if log_tail else "")
+                    else:
+                        valid_cands: list[Path] = []
+                        try:
+                            for cand in cands:
+                                await self._verify_downloaded_media_integrity(cand, expected_size=expected_size)
+                                valid_cands.append(cand)
+                            downloaded_files = valid_cands
+                        except ProviderFailure as val_exc:
+                            last_error_msg = str(val_exc.message)
+
+            if downloaded_files:
+                out_paths: list[Path] = []
+                for idx, src_f in enumerate(downloaded_files):
+                    if name and idx == 0 and Path(name).suffix:
+                        target_name = safe_name(name)
+                    else:
+                        target_name = safe_name(src_f.name)
+                    dest_file = dest_dir / target_name
+                    if dest_file.exists():
+                        stem, ext = dest_file.stem, dest_file.suffix
+                        dest_file = dest_dir / f"{stem}_{idx + 1}{ext}"
+                    shutil.move(str(src_f), str(dest_file))
+                    out_paths.append(dest_file)
+                return out_paths
         finally:
             shutil.rmtree(tmp_root, ignore_errors=True)
             shutil.rmtree(dl_stage, ignore_errors=True)
+
+        # Fallback to Telethon contiguous .part engine when tdl stalled, exited non-zero, or failed integrity validation
+        return await self._download_telegram_telethon(
+            url,
+            dest_dir,
+            name,
+            progress,
+            credentials=creds,
+            file_ref=file_ref,
+            fallback_reason=last_error_msg or "tdl failed",
+        )
 
     async def _dispatch_download(
         self, link_type: str, is_stream: bool, url: str, urls: list[str],
