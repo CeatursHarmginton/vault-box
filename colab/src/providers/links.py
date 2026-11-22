@@ -599,6 +599,8 @@ class LinksProvider(BaseProvider):
             return "torrent"
 
         parsed = urlparse(url_lower)
+        if parsed.netloc in ("t.me", "telegram.me", "www.t.me") or parsed.netloc.endswith((".t.me", ".telegram.me")):
+            return "telegram"
         if parsed.netloc.endswith("gofile.io"):
             return "direct" if parsed.path.startswith("/download/web/") else "gofile_page"
 
@@ -4516,6 +4518,186 @@ class LinksProvider(BaseProvider):
         self._validate_downloaded_files(downloaded)
         return downloaded
 
+    async def _ensure_tdl_binary(self, progress: JobState | None = None) -> str:
+        """Locate or install the tdl CLI binary (Linux on Colab/Kaggle, .exe on Windows)."""
+        from ..providers.base import _loop_store, dict_lock
+
+        def _find_existing() -> str | None:
+            for cand in (shutil.which("tdl"), "/usr/local/bin/tdl", str(Path.home() / ".local" / "bin" / "tdl")):
+                if cand and Path(cand).is_file():
+                    return str(cand)
+            if os.name == "nt":
+                for cand in (shutil.which("tdl.exe"), r"D:\My Application\Telegram Downloader\tdl.exe"):
+                    if cand and Path(cand).is_file():
+                        return str(cand)
+            return None
+
+        existing = _find_existing()
+        if existing:
+            return existing
+
+        if not sys.platform.startswith("linux"):
+            raise ProviderFailure("MISSING_DEPENDENCY", "tdl CLI binary not found on non-Linux host")
+
+        lock = dict_lock(_loop_store("tdl_install_locks"), "tdl")
+        async with lock:
+            existing = _find_existing()
+            if existing:
+                return existing
+
+            import platform
+            import tarfile
+
+            machine = platform.machine().lower()
+            arch = "arm64" if machine in ("aarch64", "arm64") else "64bit"
+            if progress:
+                progress.log(f"[Telegram] Installing tdl Linux ({arch}) binary...")
+
+            url = f"https://github.com/iyear/tdl/releases/latest/download/tdl_Linux_{arch}.tar.gz"
+            with tempfile.TemporaryDirectory(prefix="vb_tdl_dl_") as tmpdir:
+                tgz_path = Path(tmpdir) / "tdl.tar.gz"
+                async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                    resp = await client.get(url)
+                    if resp.status_code != 200:
+                        api_resp = await client.get("https://api.github.com/repos/iyear/tdl/releases/latest")
+                        api_resp.raise_for_status()
+                        tag = api_resp.json().get("tag_name")
+                        if not tag:
+                            raise ProviderFailure("DOWNLOAD_FAILED", "Could not resolve latest tdl release tag")
+                        resp = await client.get(f"https://github.com/iyear/tdl/releases/download/{tag}/tdl_Linux_{arch}.tar.gz")
+                    resp.raise_for_status()
+                    tgz_path.write_bytes(resp.content)
+
+                with tarfile.open(tgz_path, "r:gz") as tf:
+                    member = next((m for m in tf.getmembers() if m.isfile() and Path(m.name).name == "tdl"), None)
+                    if not member:
+                        raise ProviderFailure("DOWNLOAD_FAILED", "tdl binary not found inside release archive")
+                    extracted = tf.extractfile(member)
+                    if extracted is None:
+                        raise ProviderFailure("DOWNLOAD_FAILED", "Failed to extract tdl binary")
+                    bin_bytes = extracted.read()
+
+            for target_dir in (Path("/usr/local/bin"), Path.home() / ".local" / "bin"):
+                try:
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    dest_bin = target_dir / "tdl"
+                    dest_bin.write_bytes(bin_bytes)
+                    os.chmod(dest_bin, 0o755)
+                    if progress:
+                        progress.log(f"[Telegram] Installed tdl binary to {dest_bin}")
+                    return str(dest_bin)
+                except PermissionError:
+                    continue
+
+            raise ProviderFailure("MISSING_DEPENDENCY", "No writable bin directory to install tdl binary")
+
+    async def _download_telegram(
+        self,
+        url: str,
+        dest_dir: Path,
+        name: str | None,
+        progress: JobState,
+        *,
+        credentials: dict[str, Any] | None = None,
+        file_ref: dict[str, Any] | None = None,
+    ) -> list[Path]:
+        creds = credentials or (file_ref or {}).get("credentials") or {}
+        kv_file = creds.get("kv_file") if isinstance(creds, dict) else None
+        ns = str((creds.get("namespace") if isinstance(creds, dict) else "") or "colab").strip() or "colab"
+        if not isinstance(kv_file, dict) or not kv_file.get(ns):
+            raise ProviderFailure(
+                "AUTH_REQUIRED",
+                "Thiếu session Telegram (namespace: colab) trong file Packed JSON. Vui lòng đăng nhập Session Colab và Export lại.",
+            )
+
+        tdl_bin = await self._ensure_tdl_binary(progress)
+        opt = (progress.payload or {}).get("options", {}) if hasattr(progress, "payload") else {}
+        threads = max(1, min(16, int(opt.get("download_threads") or opt.get("threads_per_item") or 4)))
+
+        tmp_root = Path(tempfile.mkdtemp(prefix="vb_tdl_"))
+        kv_path = tmp_root / "tdl_kv.json"
+        dl_stage = tmp_root / "dl"
+        dl_stage.mkdir(parents=True, exist_ok=True)
+        try:
+            kv_path.write_text(json.dumps({ns: kv_file[ns]}), encoding="utf-8")
+            try:
+                os.chmod(kv_path, 0o600)
+            except Exception:
+                pass
+
+            cmd = [
+                tdl_bin,
+                "--storage", f"type=file,path={kv_path.as_posix()}",
+                "-n", ns,
+                "dl",
+                "-u", url,
+                "-d", str(dl_stage),
+                "--continue",
+                "--rewrite-ext",
+                "--template", "{{ filenamify .FileName }}",
+                "--threads", str(threads),
+            ]
+            progress.log(f"[Telegram] Downloading via tdl (ns={ns}, threads={threads}): {url}")
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+
+            output_lines: list[str] = []
+            while True:
+                progress.check_cancelled()
+                if proc.stdout is None:
+                    break
+                try:
+                    raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    if proc.returncode is not None:
+                        break
+                    continue
+                if not raw_line:
+                    break
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if line:
+                    output_lines.append(line)
+                    if len(output_lines) > 40:
+                        output_lines = output_lines[-40:]
+                    if any(k in line.lower() for k in ("error", "warn", "flood", "done")):
+                        progress.log(f"[tdl] {line[:180]}")
+
+            rc = await proc.wait()
+            if rc != 0:
+                tail = " | ".join(output_lines[-5:])
+                raise ProviderFailure("DOWNLOAD_FAILED", f"tdl exited with code {rc}: {tail}")
+
+            downloaded_files = [
+                p for p in dl_stage.rglob("*")
+                if p.is_file() and not p.name.endswith(".tmp") and p.stat().st_size > 0
+            ]
+            if not downloaded_files:
+                raise ProviderFailure("DOWNLOAD_FAILED", f"tdl finished without producing any file for {url}")
+
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            out_paths: list[Path] = []
+            for idx, src_f in enumerate(downloaded_files):
+                if name and idx == 0 and Path(name).suffix:
+                    target_name = safe_name(name)
+                elif name and idx == 0 and not Path(name).suffix and src_f.suffix:
+                    target_name = safe_name(src_f.name)
+                else:
+                    target_name = safe_name(src_f.name)
+                dest_file = dest_dir / target_name
+                if dest_file.exists():
+                    stem, ext = dest_file.stem, dest_file.suffix
+                    dest_file = dest_dir / f"{stem}_{idx + 1}{ext}"
+                shutil.move(str(src_f), str(dest_file))
+                out_paths.append(dest_file)
+            return out_paths
+        except BaseException:
+            raise
+        finally:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+
     async def _dispatch_download(
         self, link_type: str, is_stream: bool, url: str, urls: list[str],
         dest_dir: Path, name: str | None, progress: JobState, *,
@@ -4523,9 +4705,14 @@ class LinksProvider(BaseProvider):
         dec_key: dict[str, Any] | None = None, file_ref: dict[str, Any] | None = None,
         proxy: str | None = None,
         page_url: str | None = None,
+        credentials: dict[str, Any] | None = None,
     ) -> list[Path]:
         """Central download dispatch. Extracted so proxy retry can re-call it."""
         file_ref = file_ref or {}
+        if link_type == "telegram":
+            return await self._download_telegram(
+                url, dest_dir, name, progress, credentials=credentials, file_ref=file_ref,
+            )
         if link_type == "torrent":
             return await self._download_torrent(url, dest_dir, progress)
         elif link_type == "mxdrop":
@@ -4769,7 +4956,7 @@ class LinksProvider(BaseProvider):
             raw_name = f"{safe_name(page_title)}.mp4"
 
         name = safe_name(raw_name) if raw_name else None
-        link_type = self._classify_link(url)
+        link_type = "telegram" if str(file_ref.get("type") or "").lower() == "telegram" else self._classify_link(url)
         if name and link_type in ("gdrive", "mega_file", "mediafire", "pixeldrain", "gofile_page", "dropbox") and is_placeholder_link_name(raw_name, url):
             name = None
         if link_type == "direct":
@@ -4851,7 +5038,7 @@ class LinksProvider(BaseProvider):
             downloaded = await self._dispatch_download(
                 link_type, is_stream, url, urls, dest_dir, name, progress,
                 headers=headers, cookies=cookies, dec_key=dec_key, file_ref=file_ref,
-                page_url=page_url,
+                page_url=page_url, credentials=credentials,
             )
         except ProviderFailure as exc:
             msg = str(exc.message).lower()

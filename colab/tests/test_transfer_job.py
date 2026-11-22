@@ -6310,6 +6310,87 @@ def test_auto_skip_pre_upload_prevents_duplicates_on_resolved_names_and_duplicat
     assert job.files_skipped >= 2
 
 
+def test_links_provider_telegram_download_writes_temp_kv_and_cleans_up(tmp_path, monkeypatch):
+    from src.providers.links import LinksProvider
+    from src.security import redact
+
+    provider = LinksProvider()
+    assert provider._classify_link("https://t.me/c/3105153632/102") == "telegram"
+    assert provider._classify_link("https://telegra.ph/Sample-01-01") == "direct"
+
+    seen_cmd = []
+    seen_kv = {}
+
+    async def fake_ensure_tdl(progress=None):
+        return "/usr/local/bin/tdl"
+
+    async def no_deps():
+        return None
+
+    class FakeProc:
+        def __init__(self, args):
+            self.args = args
+            self.returncode = 0
+            self.stdout = self._FakeStdout()
+            # Inspect storage KV file while running
+            storage_arg = args[args.index("--storage") + 1]
+            kv_file = Path(storage_arg.split("path=", 1)[1])
+            seen_kv["exists_during_run"] = kv_file.exists()
+            seen_kv["content"] = json.loads(kv_file.read_text(encoding="utf-8"))
+            seen_kv["kv_path"] = kv_file
+            # Create downloaded file in stage dir
+            dl_dir = Path(args[args.index("-d") + 1])
+            (dl_dir / "demo_clip.mp4").write_bytes(b"telegram-video-bytes")
+
+        class _FakeStdout:
+            def __init__(self):
+                self._lines = [b"done!\n", b""]
+
+            async def readline(self):
+                return self._lines.pop(0) if self._lines else b""
+
+        async def wait(self):
+            return 0
+
+    async def fake_exec(*args, **kwargs):
+        seen_cmd.extend(args)
+        return FakeProc(list(args))
+
+    monkeypatch.setattr(provider, "_ensure_deps", no_deps)
+    monkeypatch.setattr(provider, "_ensure_tdl_binary", fake_ensure_tdl)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    creds = {
+        "provider": "telegram",
+        "namespace": "colab",
+        "kv_file": {
+            "colab": {"app": "YnVpbHRpbg==", "session": "eyJhdXRoX2tleSI6InNlY3JldCJ9"}
+        },
+    }
+    file_ref = {
+        "id": "https://t.me/c/3105153632/102",
+        "name": "demo_clip.mp4",
+        "type": "telegram",
+        "size": 20,
+    }
+    out = asyncio.run(provider.download_file(creds, file_ref, tmp_path, JobState("tg-dl", {})))
+
+    assert out.exists() and out.name == "demo_clip.mp4"
+    assert out.read_bytes() == b"telegram-video-bytes"
+    assert "-n" in seen_cmd and seen_cmd[seen_cmd.index("-n") + 1] == "colab"
+    assert seen_kv["exists_during_run"] is True
+    assert seen_kv["content"]["colab"]["session"] == "eyJhdXRoX2tleSI6InNlY3JldCJ9"
+    # Temp KV storage directory must be deleted immediately after download
+    assert not seen_kv["kv_path"].exists()
+    assert not seen_kv["kv_path"].parent.exists()
+
+    # Security redaction masks Telegram session keys
+    redacted = redact({"kv_file": {"colab": {"session": "secret"}}, "auth_key": "deadbeef"})
+    assert redacted["kv_file"] == "***"
+    assert redacted["auth_key"] == "***"
+
+
+
 
 
 

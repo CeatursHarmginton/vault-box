@@ -8,7 +8,11 @@ from fastapi import Header, HTTPException
 
 from .config import NO_AUTH, SERVER_TOKEN
 
-SECRET_KEYS = ("token", "cookie", "authorization", "access", "refresh", "ndus", "bdstoken", "jstoken")
+SECRET_KEYS = (
+    "token", "cookie", "authorization", "access", "refresh",
+    "ndus", "bdstoken", "jstoken", "auth_key", "app_hash",
+    "session", "kv_file", "salt", "telegram_auth",
+)
 
 def require_token(authorization: str | None = Header(default=None)) -> None:
     if NO_AUTH or not SERVER_TOKEN:
