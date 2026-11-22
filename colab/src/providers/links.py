@@ -144,9 +144,10 @@ class LinksProvider(BaseProvider):
     @classmethod
     async def _ensure_tor_proxy(cls, progress: JobState | None = None) -> str | None:
         """Set up Tor as SOCKS5 proxy on 127.0.0.1:9050 (pure TCP, works 100% in Colab)."""
+        from ..providers.base import _loop_store, dict_lock
         from ..utils.http import ensure_socks_support
         ensure_socks_support()
-        global _proxy_ready, PROXY_SETUP_LOCK
+        global _proxy_ready
         import socket
 
         def _is_port_open(port: int = 9050) -> bool:
@@ -158,9 +159,8 @@ class LinksProvider(BaseProvider):
 
         if _proxy_ready and _is_port_open(9050):
             return TOR_PROXY
-        if PROXY_SETUP_LOCK is None:
-            PROXY_SETUP_LOCK = asyncio.Lock()
-        async with PROXY_SETUP_LOCK:
+        lock = dict_lock(_loop_store("proxy_setup_locks"), "tor")
+        async with lock:
             if _proxy_ready and _is_port_open(9050):
                 return TOR_PROXY
             if not sys.platform.startswith("linux"):
@@ -281,6 +281,8 @@ class LinksProvider(BaseProvider):
     _tor_turbo_daemons: list[str] = []
     _mega_direct_cooldown_until: float = 0.0
     _mega_direct_notice_ts: float = 0.0
+    _mega_direct_was_throttled: bool = False
+    _mega_direct_probe_ts: float = 0.0
 
     async def _ensure_mega_tor_pool(self, progress: JobState | None = None) -> list[str]:
         """Ensure primary Tor proxy plus up to 3 extra independent Tor daemons (ports 9050-9053) for multi-core parallel throughput."""
@@ -385,7 +387,7 @@ class LinksProvider(BaseProvider):
         if "idle" not in pool:
             pool["idle"] = []  # LIFO stack of verified fast (proxy_url, httpx.AsyncClient)
             pool["rr"] = 0
-            pool["sem"] = asyncio.Semaphore(64)
+            pool["sem"] = asyncio.Semaphore(36)
         return pool
 
     def _acquire_mega_circuit(self, daemons: list[str]) -> tuple[str, httpx.AsyncClient]:
@@ -2665,6 +2667,7 @@ class LinksProvider(BaseProvider):
     def _mark_mega_direct_quota_exceeded(self, progress: JobState | None = None) -> None:
         now = time.time()
         type(self)._mega_direct_cooldown_until = now + 600.0
+        type(self)._mega_direct_was_throttled = True
         if progress and (now - type(self)._mega_direct_notice_ts) >= 30.0:
             type(self)._mega_direct_notice_ts = now
             progress.log("[MEGA] Direct IP bandwidth limit reached; switching to Multi-Circuit Tor Turbo pool and resuming...")
@@ -2876,6 +2879,11 @@ class LinksProvider(BaseProvider):
                                         w_px, w_cli = self._acquire_mega_circuit(daemons)
                                 active_cli = w_cli
                             else:
+                                if type(self)._mega_direct_was_throttled:
+                                    now_probe = time.time()
+                                    if (now_probe - type(self)._mega_direct_probe_ts) >= 30.0:
+                                        type(self)._mega_direct_probe_ts = now_probe
+                                        progress.log("[MEGA] Direct IP cooldown expired; probing direct bandwidth recovery...")
                                 active_cli = shared_client(
                                     "mega_dl_direct",
                                     follow_redirects=True,
@@ -2907,18 +2915,29 @@ class LinksProvider(BaseProvider):
                                             else:
                                                 rotate_circuit = True
                                         elif resp.status_code in (403, 404, 410):
+                                            consecutive_403 += 1
                                             if not use_tor:
-                                                self._mark_mega_direct_quota_exceeded(progress)
+                                                # First 403/404/410 on direct IP is often an expired MEGA ticket URL;
+                                                # refresh URL first before blaming direct IP bandwidth quota.
+                                                if refresh_url is not None and consecutive_403 == 1:
+                                                    need_refresh = True
+                                                else:
+                                                    self._mark_mega_direct_quota_exceeded(progress)
+                                                    if consecutive_403 >= 2 and refresh_url is not None:
+                                                        need_refresh = True
+                                                        consecutive_403 = 0
                                             else:
                                                 rotate_circuit = True
-                                            consecutive_403 += 1
-                                            if consecutive_403 >= 2 and refresh_url is not None:
-                                                need_refresh = True
-                                                consecutive_403 = 0
+                                                if consecutive_403 >= 2 and refresh_url is not None:
+                                                    need_refresh = True
+                                                    consecutive_403 = 0
                                         else:
                                             resp.raise_for_status()
                                             consecutive_403 = 0
                                             saw_rate_limit = False
+                                            if not use_tor and type(self)._mega_direct_was_throttled:
+                                                type(self)._mega_direct_was_throttled = False
+                                                progress.log("[MEGA] Direct IP bandwidth recovered; resuming direct high-speed download!")
                                             ctype = (resp.headers.get("content-type") or "").lower()
                                             cl_hdr = resp.headers.get("content-length") or ""
                                             if "text/html" in ctype and cl_hdr.isdigit() and int(cl_hdr) < needed:
@@ -2960,8 +2979,8 @@ class LinksProvider(BaseProvider):
                                                 if use_tor and attempt < 20:
                                                     elapsed_s = time.monotonic() - t_stream
                                                     is_endgame = chunk_queue.empty() and (c_end - write_pos) > 512 * 1024
-                                                    grace_s = 3.5 if is_endgame else 5.0
-                                                    min_bps = 420 * 1024 if is_endgame else 160 * 1024
+                                                    grace_s = 3.5 if is_endgame else 4.5
+                                                    min_bps = 450 * 1024 if is_endgame else 240 * 1024
                                                     if elapsed_s >= grace_s and (bytes_attempt / elapsed_s) < min_bps:
                                                         raise _SlowMegaCircuit()
                             except _SlowMegaCircuit:
@@ -2995,7 +3014,7 @@ class LinksProvider(BaseProvider):
                             if write_pos > c_end:
                                 if use_tor and w_cli is not None and bytes_attempt >= 512 * 1024:
                                     rate = bytes_attempt / max(0.05, time.monotonic() - t_stream)
-                                    if rate < 220 * 1024:
+                                    if rate < 320 * 1024:
                                         await self._discard_mega_circuit(w_cli)
                                         w_px = None
                                         w_cli = None

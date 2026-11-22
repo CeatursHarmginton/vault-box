@@ -378,6 +378,10 @@ class _DynamicSemaphore:
         self._limit_fn = limit_fn if callable(limit_fn) else (lambda: int(limit_fn or 1))
         self._active = 0
         self._cond = asyncio.Condition()
+        try:
+            self._loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
         if job is not None:
             sems = getattr(job, "_dynamic_semaphores", None)
             if not isinstance(sems, list):
@@ -392,22 +396,42 @@ class _DynamicSemaphore:
             return 1
 
     def notify_limit_changed(self) -> None:
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
         try:
-            loop = asyncio.get_running_loop()
-            loop.call_soon_threadsafe(self._schedule_wakeup)
+            running: asyncio.AbstractEventLoop | None = None
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            if running is loop:
+                self._schedule_wakeup()
+            else:
+                # JobState.update_options() runs on the server/relay event loop thread while
+                # transfer jobs run on a dedicated worker thread event loop; always marshal
+                # wakeup onto the Condition's owning loop.
+                loop.call_soon_threadsafe(self._schedule_wakeup)
         except RuntimeError:
             pass
 
     def _schedule_wakeup(self) -> None:
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+
         async def _wake() -> None:
             async with self._cond:
                 self._cond.notify_all()
+
         try:
-            asyncio.create_task(_wake())
+            loop.create_task(_wake())
         except Exception:
             pass
 
     async def acquire(self) -> bool:
+        if self._loop is None:
+            self._loop = asyncio.get_running_loop()
         async with self._cond:
             while self._active >= self.current_limit():
                 await self._cond.wait()
@@ -416,7 +440,7 @@ class _DynamicSemaphore:
 
     def release(self) -> None:
         self._active = max(0, self._active - 1)
-        self._schedule_wakeup()
+        self.notify_limit_changed()
 
     async def __aenter__(self) -> "_DynamicSemaphore":
         await self.acquire()
@@ -432,6 +456,7 @@ async def run_transfer(job: JobState) -> None:
     dirs = job_dirs(job.job_id)
     payload = job.payload
     try:
+        job._dynamic_semaphores = []
         job.set(status="running", step="downloading")
         source = payload["source"]
         target = payload["target"]
@@ -860,7 +885,8 @@ async def run_transfer(job: JobState) -> None:
                 pass
             if job.status == "completed" and (payload.get("options") or {}).get("cleanupAfterFinish", True):
                 cleanup_job(job.job_id)
-            # Drop provider credential refs after run.
+            # Drop provider credential refs and loop-bound semaphores after run.
+            job._dynamic_semaphores = []
             payload.get("source", {}).pop("credentials", None)
             payload.get("target", {}).pop("credentials", None)
             job.save_state()
