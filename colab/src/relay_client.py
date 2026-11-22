@@ -42,7 +42,7 @@ async def _job_sync_and_heartbeat_loop(ws, manager: JobManager, monitors: dict[s
 
     while True:
         try:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.5)
             heartbeat_tick += 1
 
             # 1. Detect newly created or resumed jobs and launch monitors
@@ -70,7 +70,7 @@ async def _job_sync_and_heartbeat_loop(ws, manager: JobManager, monitors: dict[s
                         }))
 
             # 2. Periodic heartbeat every 5 seconds
-            if heartbeat_tick % 5 == 0:
+            if heartbeat_tick % 10 == 0:
                 await ws.send(json.dumps({
                     "type": "heartbeat",
                     "role": "colab",
@@ -231,7 +231,7 @@ async def _monitor(ws, manager: JobManager, job_id: str) -> None:
                     "environment": ENV_NAME,
                 }))
                 return
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.2)
     except asyncio.CancelledError:
         raise
     except Exception:
