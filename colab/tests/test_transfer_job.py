@@ -6591,7 +6591,7 @@ def test_telegram_tdl_failure_falls_back_to_telethon_part_resume(monkeypatch, tm
         },
     }
     file_ref = {"id": url, "name": "tg_3287969807_2", "type": "telegram", "size": total_len}
-    job = JobState("tg-fallback", {})
+    job = JobState("tg-fallback", {"options": {"telegram_engine": "tdl"}})
 
     out = asyncio.run(provider.download_file(creds, file_ref, dest_dir, job))
     assert out.exists() and out.name == target_name
@@ -6610,6 +6610,288 @@ def test_telegram_tdl_failure_falls_back_to_telethon_part_resume(monkeypatch, tm
     except ProviderFailure:
         err_raised = True
     assert err_raised
+
+
+def test_telegram_telethon_rpc_timeout_recovery_and_tail_probe(monkeypatch, tmp_path):
+    import base64
+    import json
+    import sys
+    import types
+    from src.providers.links import LinksProvider
+    from src.providers.base import ProviderFailure
+    from src.jobs.progress import JobState
+
+    provider = LinksProvider()
+    monkeypatch.setattr(provider, "_ensure_telethon", lambda progress=None: asyncio.sleep(0))
+
+    async def fast_sleep(_sec):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+
+    full_payload = (b"X" * 8192) + (b"Y" * 1024)
+    seen_calls = []
+    mode_state = {"fail_mode": "transient"}
+
+    class FakeAuthKey:
+        def __init__(self, data):
+            self.key = data
+
+    class FakeMemorySession:
+        def set_dc(self, dc_id, ip, port):
+            pass
+
+    class FakePeerChannel:
+        def __init__(self, cid):
+            self.channel_id = cid
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.fail_left = 2
+
+        async def connect(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+        async def is_user_authorized(self):
+            return True
+
+        async def get_input_entity(self, target):
+            return target
+
+        async def get_messages(self, entity, ids=None):
+            sz = (2 * 1024 * 1024) if mode_state["fail_mode"] == "dead_tail" else len(full_payload)
+            return types.SimpleNamespace(
+                id=ids,
+                media=object(),
+                file=types.SimpleNamespace(name="clip.mp4", size=sz, ext=".mp4"),
+            )
+
+        async def iter_download(self, media, offset=0, limit=None, request_size=524288):
+            seen_calls.append((offset, request_size))
+            if mode_state["fail_mode"] == "dead_tail":
+                raise ValueError("Request was unsuccessful 6 time(s)")
+            if self.fail_left > 0 and offset == 4096:
+                self.fail_left -= 1
+                raise ValueError("Request was unsuccessful 6 time(s)")
+            if offset == 0:
+                yield full_payload[:4096]
+                return
+            yield full_payload[offset:]
+
+    fake_telethon = types.ModuleType("telethon")
+    fake_telethon.TelegramClient = FakeClient
+    fake_errors = types.ModuleType("telethon.errors")
+    fake_errors.FloodWaitError = type("FloodWaitError", (Exception,), {})
+    fake_errors.AuthKeyUnregisteredError = type("AuthKeyUnregisteredError", (Exception,), {})
+    fake_errors.SessionRevokedError = type("SessionRevokedError", (Exception,), {})
+    fake_errors.UnauthorizedError = type("UnauthorizedError", (Exception,), {})
+    fake_errors.TimeoutError = type("TimeoutError", (Exception,), {})
+    fake_crypto = types.ModuleType("telethon.crypto")
+    fake_crypto.AuthKey = FakeAuthKey
+    fake_sessions = types.ModuleType("telethon.sessions")
+    fake_sessions.MemorySession = FakeMemorySession
+    fake_tl = types.ModuleType("telethon.tl")
+    fake_tl_types = types.ModuleType("telethon.tl.types")
+    fake_tl_types.PeerChannel = FakePeerChannel
+    fake_telethon.errors = fake_errors
+
+    monkeypatch.setitem(sys.modules, "telethon", fake_telethon)
+    monkeypatch.setitem(sys.modules, "telethon.errors", fake_errors)
+    monkeypatch.setitem(sys.modules, "telethon.crypto", fake_crypto)
+    monkeypatch.setitem(sys.modules, "telethon.sessions", fake_sessions)
+    monkeypatch.setitem(sys.modules, "telethon.tl", fake_tl)
+    monkeypatch.setitem(sys.modules, "telethon.tl.types", fake_tl_types)
+
+    fake_key = b"K" * 256
+    gotd_payload = {"Version": 1, "Data": {"DC": 5, "AuthKey": base64.b64encode(fake_key).decode("ascii")}}
+    creds = {
+        "provider": "telegram",
+        "namespace": "colab",
+        "kv_file": {"colab": {"app": base64.b64encode(b"desktop").decode("ascii"), "session": base64.b64encode(json.dumps(gotd_payload).encode("utf-8")).decode("ascii")}},
+    }
+
+    job1 = JobState("tg-rpc-recover", {})
+    out = asyncio.run(
+        provider._download_telegram_telethon(
+            "https://t.me/c/3287969807/2",
+            tmp_path / "rec",
+            None,
+            job1,
+            credentials=creds,
+            file_ref={"size": len(full_payload)},
+        )
+    )
+    assert out[0].read_bytes() == full_payload
+    assert (4096, 65536) in seen_calls
+
+    seen_calls.clear()
+    mode_state["fail_mode"] = "dead_tail"
+    job2 = JobState("tg-dead-tail", {})
+    err_msg = ""
+    try:
+        asyncio.run(
+            provider._download_telegram_telethon(
+                "https://t.me/c/3287969807/2",
+                tmp_path / "dead",
+                None,
+                job2,
+                credentials=creds,
+                file_ref={"size": 2 * 1024 * 1024},
+                probe_hint_offset=1024 * 1024,
+            )
+        )
+    except ProviderFailure as exc:
+        err_msg = str(exc.message)
+    assert "-503 Timeout" in err_msg
+    # Fast probe failed at probe_hint_offset without attempting chunk 0 download
+    assert seen_calls == [(1024 * 1024, 65536)]
+
+
+def test_telegram_telethon_primary_multi_connection_ordered_writer(monkeypatch, tmp_path):
+    import base64
+    import json
+    import sys
+    import types
+    from src.providers.links import LinksProvider
+    from src.jobs.progress import JobState
+
+    provider = LinksProvider()
+    monkeypatch.setattr(provider, "_ensure_deps", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(provider, "_ensure_telethon", lambda progress=None: asyncio.sleep(0))
+    monkeypatch.setattr(shutil, "which", lambda cmd: None if cmd == "ffprobe" else shutil.which(cmd))
+
+    async def fail_if_tdl_called(*args, **kwargs):
+        raise AssertionError("tdl should not be called when Telethon primary succeeds")
+
+    monkeypatch.setattr(provider, "_ensure_tdl_binary", fail_if_tdl_called)
+
+    # 2.5 MB -> 5 chunks of 512 KB (tests multi-worker out-of-order completion + ordered sliding-window disk write)
+    chunk_sz = 512 * 1024
+    full_payload = b"".join(bytes([65 + i]) * chunk_sz for i in range(4)) + (b"Z" * 100_000)
+    total_len = len(full_payload)
+    seen_req_offsets = []
+    client_count = {"n": 0}
+
+    class FakeAuthKey:
+        def __init__(self, data):
+            self.key = data
+
+    class FakeMemorySession:
+        def set_dc(self, dc_id, ip, port):
+            self.dc = (dc_id, ip, port)
+
+    class FakePeerChannel:
+        def __init__(self, cid):
+            self.channel_id = cid
+
+    class FakeGetFileRequest:
+        def __init__(self, location=None, offset=0, limit=524288):
+            self.location = location
+            self.offset = offset
+            self.limit = limit
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            client_count["n"] += 1
+
+        async def connect(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+        async def is_user_authorized(self):
+            return True
+
+        async def get_input_entity(self, target):
+            return target
+
+        async def get_messages(self, entity, ids=None):
+            return types.SimpleNamespace(
+                id=ids,
+                media=types.SimpleNamespace(dc_id=5),
+                file=types.SimpleNamespace(name="multi_fast.mp4", size=total_len, ext=".mp4"),
+            )
+
+        async def __call__(self, req):
+            off = req.offset
+            seen_req_offsets.append(off)
+            # Invert latency so later chunks finish BEFORE offset 0 -> proves ordered .part assembly
+            delay_map = {0: 0.06, chunk_sz: 0.04, 2 * chunk_sz: 0.02, 3 * chunk_sz: 0.005, 4 * chunk_sz: 0.01}
+            await asyncio.sleep(delay_map.get(off, 0.01))
+            return types.SimpleNamespace(bytes=full_payload[off:off + req.limit])
+
+    fake_telethon = types.ModuleType("telethon")
+    fake_telethon.TelegramClient = FakeClient
+    fake_errors = types.ModuleType("telethon.errors")
+    fake_errors.FloodWaitError = type("FloodWaitError", (Exception,), {})
+    fake_errors.AuthKeyUnregisteredError = type("AuthKeyUnregisteredError", (Exception,), {})
+    fake_errors.SessionRevokedError = type("SessionRevokedError", (Exception,), {})
+    fake_errors.UnauthorizedError = type("UnauthorizedError", (Exception,), {})
+    fake_errors.TimeoutError = type("TimeoutError", (Exception,), {})
+    fake_crypto = types.ModuleType("telethon.crypto")
+    fake_crypto.AuthKey = FakeAuthKey
+    fake_sessions = types.ModuleType("telethon.sessions")
+    fake_sessions.MemorySession = FakeMemorySession
+    fake_tl = types.ModuleType("telethon.tl")
+    fake_tl_types = types.ModuleType("telethon.tl.types")
+    fake_tl_types.PeerChannel = FakePeerChannel
+    fake_upload_ns = types.SimpleNamespace(FileCdnRedirect=type("FileCdnRedirect", (Exception,), {}))
+    fake_tl_types.upload = fake_upload_ns
+    fake_functions = types.SimpleNamespace(upload=types.SimpleNamespace(GetFileRequest=FakeGetFileRequest))
+    fake_utils = types.ModuleType("telethon.utils")
+    fake_utils.get_input_location = lambda media: (5, object())
+    fake_telethon.errors = fake_errors
+    fake_telethon.functions = fake_functions
+    fake_telethon.types = fake_tl_types
+    fake_telethon.utils = fake_utils
+
+    monkeypatch.setitem(sys.modules, "telethon", fake_telethon)
+    monkeypatch.setitem(sys.modules, "telethon.errors", fake_errors)
+    monkeypatch.setitem(sys.modules, "telethon.crypto", fake_crypto)
+    monkeypatch.setitem(sys.modules, "telethon.sessions", fake_sessions)
+    monkeypatch.setitem(sys.modules, "telethon.tl", fake_tl)
+    monkeypatch.setitem(sys.modules, "telethon.tl.types", fake_tl_types)
+    monkeypatch.setitem(sys.modules, "telethon.functions", fake_functions)
+    monkeypatch.setitem(sys.modules, "telethon.types", fake_tl_types)
+    monkeypatch.setitem(sys.modules, "telethon.utils", fake_utils)
+
+    fake_key = b"K" * 256
+    gotd_payload = {"Version": 1, "Data": {"DC": 5, "AuthKey": base64.b64encode(fake_key).decode("ascii")}}
+    creds = {
+        "provider": "telegram",
+        "namespace": "colab",
+        "kv_file": {"colab": {"app": base64.b64encode(b"desktop").decode("ascii"), "session": base64.b64encode(json.dumps(gotd_payload).encode("utf-8")).decode("ascii")}},
+    }
+
+    # Single file (size=0 unknown or >25MB) uses 4 parallel connections via Telethon primary (auto mode)
+    file_ref = {"id": "https://t.me/c/3287969807/2", "name": "tg_3287969807_2", "type": "telegram", "size": 0}
+    job = JobState("tg-multi-single", {})
+    out = asyncio.run(provider.download_file(creds, dict(file_ref), tmp_path / "single", job))
+    assert out.exists() and out.name == "multi_fast.mp4"
+    assert out.read_bytes() == full_payload
+    assert sorted(seen_req_offsets) == [0, chunk_sz, 2 * chunk_sz, 3 * chunk_sz, 4 * chunk_sz]
+    assert client_count["n"] == 4
+    assert any("workers=4" in line for line in job.logs)
+
+    # Batch parallel mode scales down Telethon workers to 2 connections/item
+    client_count["n"] = 0
+    seen_req_offsets.clear()
+    file_ref_sized = {**file_ref, "size": total_len}
+    batch_job = JobState("tg-multi-batch", {
+        "source": {"provider": "links", "items": [file_ref_sized, {**file_ref_sized, "id": "https://t.me/c/3287969807/3"}]},
+        "options": {"parallel_download": True, "download_concurrency": 4},
+    })
+    batch_job.files_to_download = 2
+    out_b = asyncio.run(provider.download_file(creds, dict(file_ref_sized), tmp_path / "batch", batch_job))
+    assert out_b.read_bytes() == full_payload
+    assert client_count["n"] == 2
+    assert any("workers=2" in line for line in batch_job.logs)
+
+
 
 
 

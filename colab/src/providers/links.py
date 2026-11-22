@@ -4859,14 +4859,16 @@ class LinksProvider(BaseProvider):
         credentials: dict[str, Any] | None = None,
         file_ref: dict[str, Any] | None = None,
         fallback_reason: str = "",
+        probe_hint_offset: int = 0,
+        num_workers: int | None = None,
     ) -> list[Path]:
-        """Download Telegram media using Telethon sequential chunking with contiguous .part resume."""
+        """Download Telegram media via Telethon multi-connection ordered chunks with contiguous .part resume."""
         progress.check_cancelled()
         creds = credentials or (file_ref or {}).get("credentials") or {}
         kv_file = creds.get("kv_file") if isinstance(creds, dict) else None
         ns = str((creds.get("namespace") if isinstance(creds, dict) else "") or "colab").strip() or "colab"
         if not isinstance(kv_file, dict) or not kv_file.get(ns):
-            raise ProviderFailure("AUTH_REQUIRED", "Missing Telegram KV session for Telethon fallback.")
+            raise ProviderFailure("AUTH_REQUIRED", "Missing Telegram KV session for Telethon downloader.")
 
         sess_info = self._parse_tdl_gotd_session(kv_file[ns])
         kind, target, msg_id = self._parse_telegram_url(url)
@@ -4877,15 +4879,35 @@ class LinksProvider(BaseProvider):
         from telethon.sessions import MemorySession
         from telethon.tl.types import PeerChannel
 
+        opt = (progress.payload or {}).get("options", {}) if hasattr(progress, "payload") else {}
+        source_items = ((progress.payload or {}).get("source") or {}).get("items") or [] if hasattr(progress, "payload") else []
+        total_items = max(int(getattr(progress, "files_to_download", 0) or 0), len(source_items))
+        dl_conc = 1 if opt.get("parallel_download") is False else max(1, int(opt.get("download_concurrency") or 4))
+
         try:
             expected_ref_size = int((file_ref or {}).get("size") or (file_ref or {}).get("file_size") or 0)
         except (TypeError, ValueError):
             expected_ref_size = 0
 
+        if num_workers is None:
+            try:
+                req_t = int(opt.get("telegram_threads") or opt.get("download_threads") or opt.get("threads_per_item") or 0)
+            except (TypeError, ValueError):
+                req_t = 0
+            if req_t == 1:
+                num_workers = 1
+            elif total_items >= 2 and dl_conc >= 2:
+                num_workers = 2
+            elif 0 < expected_ref_size <= 8 * 1024 * 1024:
+                num_workers = 1
+            else:
+                num_workers = 4
+        num_workers = max(1, min(4, int(num_workers)))
+
         if fallback_reason:
             progress.log(f"[Telegram] Switching to Telethon byte-resume engine ({fallback_reason[:120]})...")
         else:
-            progress.log(f"[Telegram] Downloading via Telethon byte-resume engine (ns={ns}): {url}")
+            progress.log(f"[Telegram] Downloading via Telethon (ns={ns}, workers={num_workers}, ordered-part): {url}")
 
         mem_session = MemorySession()
         mem_session.set_dc(sess_info["dc_id"], sess_info["dc_ip"], sess_info["dc_port"])
@@ -4899,7 +4921,8 @@ class LinksProvider(BaseProvider):
             use_ipv6=False,
             connection_retries=5,
             request_retries=5,
-            retry_delay=2,
+            retry_delay=3,
+            receive_updates=False,
         )
 
         async def _sleep_cancellable(total_sec: float) -> None:
@@ -4933,6 +4956,33 @@ class LinksProvider(BaseProvider):
 
         dest_dir.mkdir(parents=True, exist_ok=True)
         part_path: Path | None = None
+
+        import logging
+
+        last_dc_issue = ""
+
+        class _TelethonIssueCapture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                nonlocal last_dc_issue
+                msg_txt = self.format(record)
+                if "internal issues" in msg_txt or "Timeout" in msg_txt:
+                    last_dc_issue = msg_txt[-220:]
+
+        tl_logger = logging.getLogger("telethon")
+        issue_handler = _TelethonIssueCapture()
+        tl_logger.addHandler(issue_handler)
+
+        server_err_types = tuple(
+            cls for cls in (
+                getattr(tl_errors, "TimeoutError", None),
+                getattr(tl_errors, "TimedOutError", None),
+                getattr(tl_errors, "ServerError", None),
+                getattr(tl_errors, "RpcCallFailError", None),
+                getattr(tl_errors, "RpcMcgetFailError", None),
+            )
+            if isinstance(cls, type)
+        )
+
         try:
             await _with_flood_retry(lambda: client.connect(), "connect")
             is_auth = await _with_flood_retry(lambda: client.is_user_authorized(), "auth check")
@@ -4947,7 +4997,7 @@ class LinksProvider(BaseProvider):
                     try:
                         return await client.get_input_entity(PeerChannel(int(target)))
                     except Exception:
-                        async for dialog in client.iter_dialogs(limit=500):
+                        async for dialog in client.iter_dialogs(limit=None):
                             progress.check_cancelled()
                             ent = getattr(dialog, "entity", None)
                             if ent is not None and getattr(ent, "id", None) == int(target):
@@ -5005,30 +5055,374 @@ class LinksProvider(BaseProvider):
                     + (f" / {total_size / 1048576:.1f} MB" if total_size > 0 else "")
                 )
 
+            # Fast tail-probe before re-downloading hundreds of MBs if tdl died near the end
+            if probe_hint_offset >= 1024 * 1024 and offset == 0 and (total_size <= 0 or probe_hint_offset < total_size):
+                probe_off = (int(probe_hint_offset) // chunk_align) * chunk_align
+                try:
+                    async for _probe_chunk in client.iter_download(
+                        msg.media, offset=probe_off, limit=64 * 1024, request_size=64 * 1024
+                    ):
+                        break
+                except Exception as probe_exc:
+                    err_low = str(probe_exc).lower()
+                    is_server_timeout = (
+                        (server_err_types and isinstance(probe_exc, server_err_types))
+                        or ("request was unsuccessful" in err_low)
+                    )
+                    if is_server_timeout:
+                        detail = last_dc_issue or str(probe_exc)
+                        raise ProviderFailure(
+                            "DOWNLOAD_FAILED",
+                            f"Telegram server DC{sess_info['dc_id']} trả lỗi -503 Timeout tại cuối file "
+                            f"(offset {probe_off}/{total_size}): {detail}. Chunk cuối trên Telegram đang không tải được.",
+                        ) from probe_exc
+
             max_cycles = 16
             cycle = 0
             last_ui_ts = 0.0
             win_start_ts = time.monotonic()
             win_start_bytes = offset
+            cur_request_size = request_size
+            same_offset_fails = 0
+            last_fail_offset = -1
+
+            async def _run_parallel_ordered(fh_obj: Any, start_off: int) -> tuple[int, bool]:
+                nonlocal last_ui_ts, win_start_ts, win_start_bytes
+                if num_workers < 2 or total_size <= 0:
+                    return start_off, False
+                try:
+                    from collections import deque
+                    from telethon import functions as tl_functions, types as tl_types, utils as tl_utils
+                except Exception:
+                    return start_off, False
+
+                try:
+                    file_dc_id, input_loc = tl_utils.get_input_location(msg.media)
+                except Exception:
+                    return start_off, False
+                if input_loc is None:
+                    return start_off, False
+
+                target_dc = int(file_dc_id or sess_info["dc_id"])
+                exported_file_ref_cls = tuple(
+                    c for c in (
+                        getattr(tl_errors, "FileReferenceExpiredError", None),
+                        getattr(tl_errors, "FilerefUpgradeNeededError", None),
+                    )
+                    if isinstance(c, type)
+                )
+                migrate_err_cls = getattr(tl_errors, "FileMigrateError", None)
+                get_file_req_cls = tl_functions.upload.GetFileRequest
+                cdn_redir_cls = getattr(tl_types.upload, "FileCdnRedirect", None)
+
+                aux_clients: list[Any] = []
+                aux_senders: list[Any] = []
+                worker_callers: list[Any] = []
+                loc_state = {"loc": input_loc, "dc": target_dc}
+
+                try:
+                    if target_dc == sess_info["dc_id"]:
+                        async def _call_primary(req):
+                            return await client(req)
+                        worker_callers.append(_call_primary)
+                    else:
+                        if not hasattr(client, "_borrow_exported_sender") or not hasattr(client, "_call"):
+                            return start_off, False
+                        s0 = await client._borrow_exported_sender(target_dc)
+
+                        async def _call_exported0(req, _s=s0):
+                            return await client._call(_s, req)
+                        worker_callers.append(_call_exported0)
+
+                    for _w_idx in range(1, num_workers):
+                        try:
+                            if target_dc == sess_info["dc_id"]:
+                                aux_mem = MemorySession()
+                                aux_mem.set_dc(sess_info["dc_id"], sess_info["dc_ip"], sess_info["dc_port"])
+                                aux_mem.auth_key = AuthKey(data=sess_info["auth_key"])
+                                aux_c = TelegramClient(
+                                    aux_mem,
+                                    sess_info["app_id"],
+                                    sess_info["app_hash"],
+                                    flood_sleep_threshold=0,
+                                    use_ipv6=False,
+                                    connection_retries=5,
+                                    request_retries=5,
+                                    retry_delay=3,
+                                    receive_updates=False,
+                                )
+                                await aux_c.connect()
+                                aux_clients.append(aux_c)
+
+                                async def _call_aux(req, _c=aux_c):
+                                    return await _c(req)
+                                worker_callers.append(_call_aux)
+                            else:
+                                if not hasattr(client, "_create_exported_sender"):
+                                    break
+                                s_i = await client._create_exported_sender(target_dc)
+                                aux_senders.append(s_i)
+
+                                async def _call_exp(req, _s=s_i):
+                                    return await client._call(_s, req)
+                                worker_callers.append(_call_exp)
+                        except Exception:
+                            # Keep going with surviving connections rather than aborting parallel transfer
+                            continue
+
+                    if len(worker_callers) < 2:
+                        return start_off, False
+
+                    max_window_chunks = max(16, len(worker_callers) * 8)
+                    write_off = start_off
+                    next_off = start_off
+                    ready_chunks: dict[int, bytes] = {}
+                    retry_q: deque[int] = deque()
+                    chunk_fails: dict[int, int] = {}
+                    window_evt = asyncio.Event()
+                    ref_lock = asyncio.Lock()
+                    p_state: dict[str, Any] = {
+                        "pause_until": 0.0,
+                        "last_flood_log": 0.0,
+                        "in_flight": 0,
+                        "stop": False,
+                        "fallback_seq": False,
+                        "fatal": None,
+                    }
+
+                    async def _refresh_loc() -> None:
+                        async with ref_lock:
+                            refetched = await _with_flood_retry(
+                                lambda: client.get_messages(entity, ids=msg_id), "refresh file_reference"
+                            )
+                            if isinstance(refetched, list):
+                                refetched = refetched[0] if refetched else None
+                            if refetched and getattr(refetched, "media", None):
+                                _, new_loc = tl_utils.get_input_location(refetched.media)
+                                if new_loc is not None:
+                                    loc_state["loc"] = new_loc
+
+                    async def _fetch_chunk_64k(call_fn, base_off: int) -> bytes:
+                        buf_parts: list[bytes] = []
+                        sub_off = base_off
+                        end_off = min(total_size, base_off + request_size)
+                        while sub_off < end_off:
+                            progress.check_cancelled()
+                            req = get_file_req_cls(location=loc_state["loc"], offset=sub_off, limit=64 * 1024)
+                            resp = await call_fn(req)
+                            if cdn_redir_cls and isinstance(resp, cdn_redir_cls):
+                                raise RuntimeError("__CDN_REDIRECT__")
+                            chunk_b = getattr(resp, "bytes", b"") or b""
+                            if not chunk_b:
+                                break
+                            buf_parts.append(chunk_b)
+                            sub_off += len(chunk_b)
+                            if len(chunk_b) < 64 * 1024:
+                                break
+                        return b"".join(buf_parts)
+
+                    async def _worker_loop(call_fn) -> None:
+                        nonlocal write_off, next_off, last_ui_ts, win_start_ts, win_start_bytes
+                        while not p_state["stop"] and write_off < total_size:
+                            progress.check_cancelled()
+                            wait_rem = p_state["pause_until"] - time.monotonic()
+                            if wait_rem > 0:
+                                await _sleep_cancellable(wait_rem)
+                                continue
+
+                            claimed_off: int | None = None
+                            if retry_q:
+                                claimed_off = retry_q.popleft()
+                            elif next_off < total_size:
+                                if (len(ready_chunks) + p_state["in_flight"]) >= max_window_chunks:
+                                    window_evt.clear()
+                                    try:
+                                        await asyncio.wait_for(window_evt.wait(), timeout=0.5)
+                                    except asyncio.TimeoutError:
+                                        pass
+                                    continue
+                                claimed_off = next_off
+                                next_off += request_size
+                            else:
+                                # Tail chunks are in flight or retrying in another worker
+                                window_evt.clear()
+                                try:
+                                    await asyncio.wait_for(window_evt.wait(), timeout=0.5)
+                                except asyncio.TimeoutError:
+                                    pass
+                                continue
+
+                            p_state["in_flight"] += 1
+                            try:
+                                use_small = chunk_fails.get(claimed_off, 0) >= 1
+                                if use_small:
+                                    data = await _fetch_chunk_64k(call_fn, claimed_off)
+                                else:
+                                    req = get_file_req_cls(
+                                        location=loc_state["loc"],
+                                        offset=claimed_off,
+                                        limit=request_size,
+                                    )
+                                    resp = await call_fn(req)
+                                    if cdn_redir_cls and isinstance(resp, cdn_redir_cls):
+                                        p_state["fallback_seq"] = True
+                                        p_state["stop"] = True
+                                        window_evt.set()
+                                        return
+                                    data = getattr(resp, "bytes", b"") or b""
+
+                                if not data and claimed_off < total_size:
+                                    raise TimeoutError(f"Empty chunk returned at offset {claimed_off}")
+
+                                ready_chunks[claimed_off] = data
+                                while write_off in ready_chunks:
+                                    blk = ready_chunks.pop(write_off)
+                                    if blk:
+                                        fh_obj.write(blk)
+                                        write_off += len(blk)
+
+                                now = time.monotonic()
+                                if now - last_ui_ts >= 0.4 or write_off >= total_size:
+                                    elapsed = max(0.05, now - win_start_ts)
+                                    speed_bps = max(0.0, (write_off - win_start_bytes) / elapsed)
+                                    if elapsed >= 5.0:
+                                        win_start_ts = now
+                                        win_start_bytes = write_off
+                                    pct = (write_off * 100.0 / total_size) if total_size > 0 else 0.0
+                                    if hasattr(progress, "set_phase_progress"):
+                                        progress.set_phase_progress(
+                                            done_bytes=write_off,
+                                            total_bytes=total_size or getattr(progress, "bytes_total", 0),
+                                            pct=min(100.0, pct),
+                                            speed=speed_bps,
+                                            phase="download",
+                                        )
+                                    last_ui_ts = now
+                                if write_off >= total_size:
+                                    p_state["stop"] = True
+                                window_evt.set()
+                            except Exception as w_exc:
+                                err_str = str(w_exc)
+                                if "__CDN_REDIRECT__" in err_str:
+                                    p_state["fallback_seq"] = True
+                                    p_state["stop"] = True
+                                    window_evt.set()
+                                    return
+                                if isinstance(w_exc, tl_errors.FloodWaitError):
+                                    wait_s = max(1, int(getattr(w_exc, "seconds", 5) or 5)) + 1
+                                    now_t = time.monotonic()
+                                    p_state["pause_until"] = max(p_state["pause_until"], now_t + wait_s)
+                                    if now_t - p_state["last_flood_log"] > 5.0:
+                                        p_state["last_flood_log"] = now_t
+                                        progress.log(
+                                            f"[Telegram/Telethon] FloodWait {wait_s}s at {write_off / 1048576:.1f}/{total_size / 1048576:.1f} MB "
+                                            "— .part saved, resuming automatically..."
+                                        )
+                                    retry_q.appendleft(claimed_off)
+                                    window_evt.set()
+                                    continue
+                                if exported_file_ref_cls and isinstance(w_exc, exported_file_ref_cls):
+                                    try:
+                                        await _refresh_loc()
+                                        retry_q.appendleft(claimed_off)
+                                        window_evt.set()
+                                        continue
+                                    except Exception as ref_err:
+                                        p_state["fatal"] = ref_err
+                                        p_state["stop"] = True
+                                        window_evt.set()
+                                        return
+                                if migrate_err_cls and isinstance(w_exc, migrate_err_cls):
+                                    p_state["fallback_seq"] = True
+                                    p_state["stop"] = True
+                                    window_evt.set()
+                                    return
+
+                                err_low = err_str.lower()
+                                is_rpc_retryable = (
+                                    (server_err_types and isinstance(w_exc, server_err_types))
+                                    or isinstance(w_exc, (ConnectionError, TimeoutError, asyncio.TimeoutError, OSError))
+                                    or (isinstance(w_exc, ValueError) and "request was unsuccessful" in err_low)
+                                )
+                                if not is_rpc_retryable:
+                                    p_state["fatal"] = w_exc
+                                    p_state["stop"] = True
+                                    window_evt.set()
+                                    return
+
+                                fails = chunk_fails.get(claimed_off, 0) + 1
+                                chunk_fails[claimed_off] = fails
+                                detail = last_dc_issue or err_str
+                                if fails >= 3:
+                                    p_state["fatal"] = ProviderFailure(
+                                        "DOWNLOAD_FAILED",
+                                        f"Telegram DC{loc_state['dc']} không phản hồi dữ liệu tại offset "
+                                        f"{claimed_off}/{total_size} ({detail}).",
+                                    )
+                                    p_state["stop"] = True
+                                    window_evt.set()
+                                    return
+                                retry_q.append(claimed_off)
+                                backoff_s = min(16.0, float(2 ** (fails + 1)))
+                                p_state["pause_until"] = max(p_state["pause_until"], time.monotonic() + min(4.0, backoff_s))
+                                window_evt.set()
+                            finally:
+                                p_state["in_flight"] -= 1
+
+                    await asyncio.gather(*(_worker_loop(fn) for fn in worker_callers))
+                    while write_off in ready_chunks:
+                        blk = ready_chunks.pop(write_off)
+                        if blk:
+                            fh_obj.write(blk)
+                            write_off += len(blk)
+                    fh_obj.flush()
+                    os.fsync(fh_obj.fileno())
+
+                    if p_state["fatal"] is not None:
+                        raise p_state["fatal"]
+                    if p_state["fallback_seq"] or write_off < total_size:
+                        return write_off, False
+                    return write_off, True
+                finally:
+                    for ac in aux_clients:
+                        try:
+                            await ac.disconnect()
+                        except Exception:
+                            pass
+                    for asnd in aux_senders:
+                        try:
+                            await asnd.disconnect()
+                        except Exception:
+                            pass
 
             with open(part_path, mode) as fh:
                 if mode == "r+b":
                     fh.seek(offset)
                     fh.truncate(offset)
 
-                while total_size <= 0 or offset < total_size:
+                parallel_done = False
+                if num_workers >= 2 and total_size > 0 and offset < total_size:
+                    offset, parallel_done = await _run_parallel_ordered(fh, offset)
+                    win_start_ts = time.monotonic()
+                    win_start_bytes = offset
+
+                while (not parallel_done) and (total_size <= 0 or offset < total_size):
                     progress.check_cancelled()
+                    iter_bytes = 0
                     try:
                         async for chunk in client.iter_download(
                             msg.media,
                             offset=offset,
-                            request_size=request_size,
+                            request_size=cur_request_size,
                         ):
                             progress.check_cancelled()
                             if not chunk:
                                 continue
                             fh.write(chunk)
+                            iter_bytes += len(chunk)
                             offset += len(chunk)
+                            same_offset_fails = 0
+                            cur_request_size = request_size
                             now = time.monotonic()
                             if now - last_ui_ts >= 0.4 or (total_size > 0 and offset >= total_size):
                                 elapsed = max(0.05, now - win_start_ts)
@@ -5048,8 +5442,17 @@ class LinksProvider(BaseProvider):
                                 last_ui_ts = now
                             if total_size > 0 and offset >= total_size:
                                 break
-                        # Stream finished naturally
-                        break
+                        if total_size <= 0 or offset >= total_size:
+                            break
+                        if iter_bytes > 0:
+                            continue
+                        cycle += 1
+                        if cycle > max_cycles:
+                            raise ProviderFailure(
+                                "DOWNLOAD_FAILED",
+                                f"Telethon stream returned empty EOF at {offset}/{total_size} bytes",
+                            )
+                        await _sleep_cancellable(2.0)
                     except tl_errors.FloodWaitError as fw:
                         fh.flush()
                         os.fsync(fh.fileno())
@@ -5071,30 +5474,51 @@ class LinksProvider(BaseProvider):
                         fh.truncate(offset)
                         win_start_ts = time.monotonic()
                         win_start_bytes = offset
-                    except (
-                        tl_errors.TimeoutError,
-                        ConnectionError,
-                        TimeoutError,
-                        asyncio.TimeoutError,
-                        OSError,
-                    ) as net_exc:
+                    except Exception as net_exc:
+                        err_low = str(net_exc).lower()
+                        is_retryable_rpc = (
+                            (server_err_types and isinstance(net_exc, server_err_types))
+                            or isinstance(net_exc, (ConnectionError, TimeoutError, asyncio.TimeoutError, OSError))
+                            or (isinstance(net_exc, ValueError) and "request was unsuccessful" in err_low)
+                        )
+                        if not is_retryable_rpc:
+                            raise
                         fh.flush()
                         os.fsync(fh.fileno())
+                        offset = (fh.tell() // chunk_align) * chunk_align
+                        fh.seek(offset)
+                        fh.truncate(offset)
+
+                        if offset == last_fail_offset:
+                            same_offset_fails += 1
+                        else:
+                            last_fail_offset = offset
+                            same_offset_fails = 1
+
+                        detail = last_dc_issue or str(net_exc)
+                        if same_offset_fails >= 3:
+                            raise ProviderFailure(
+                                "DOWNLOAD_FAILED",
+                                f"Telegram DC{sess_info['dc_id']} không phản hồi dữ liệu tại offset "
+                                f"{offset}/{total_size} ({detail}).",
+                            ) from net_exc
+
                         cycle += 1
                         if cycle > max_cycles:
                             raise ProviderFailure(
                                 "DOWNLOAD_FAILED",
-                                f"Telethon interrupted after {max_cycles} retries at {offset}/{total_size} bytes: {net_exc}",
+                                f"Telethon interrupted after {max_cycles} retries at {offset}/{total_size} bytes: {detail}",
                             ) from net_exc
-                        backoff_s = min(30.0, float(2 ** min(cycle, 4)))
+
+                        if same_offset_fails == 2 and cur_request_size > 64 * 1024:
+                            cur_request_size = 64 * 1024
+
+                        backoff_s = min(30.0, float(2 ** min(cycle + 1, 4)))
                         progress.log(
-                            f"[Telegram/Telethon] Connection reset at {offset / 1048576:.1f} MB ({net_exc}); "
-                            f"retrying in {backoff_s:.0f}s..."
+                            f"[Telegram/Telethon] DC timeout/reset at {offset / 1048576:.1f} MB ({detail[:100]}); "
+                            f"retrying in {backoff_s:.0f}s (chunk={cur_request_size // 1024}KB)..."
                         )
                         await _sleep_cancellable(backoff_s)
-                        offset = (fh.tell() // chunk_align) * chunk_align
-                        fh.seek(offset)
-                        fh.truncate(offset)
                         win_start_ts = time.monotonic()
                         win_start_bytes = offset
 
@@ -5108,6 +5532,10 @@ class LinksProvider(BaseProvider):
             os.replace(part_path, dest_file)
             return [dest_file]
         finally:
+            try:
+                tl_logger.removeHandler(issue_handler)
+            except Exception:
+                pass
             try:
                 await client.disconnect()
             except Exception:
@@ -5132,25 +5560,11 @@ class LinksProvider(BaseProvider):
                 "Thiếu session Telegram (namespace: colab) trong file Packed JSON. Vui lòng đăng nhập Session Colab và Export lại.",
             )
 
-        tdl_bin: str | None = None
-        tdl_init_err = ""
-        try:
-            tdl_bin = await self._ensure_tdl_binary(progress)
-        except Exception as init_exc:
-            tdl_init_err = str(init_exc)
-
         opt = (progress.payload or {}).get("options", {}) if hasattr(progress, "payload") else {}
         try:
             expected_size = int((file_ref or {}).get("size") or (file_ref or {}).get("file_size") or 0)
         except (TypeError, ValueError):
             expected_size = 0
-
-        if not tdl_bin:
-            return await self._download_telegram_telethon(
-                url, dest_dir, name, progress,
-                credentials=creds, file_ref=file_ref,
-                fallback_reason=tdl_init_err or "tdl unavailable",
-            )
 
         source_items = ((progress.payload or {}).get("source") or {}).get("items") or [] if hasattr(progress, "payload") else []
         total_items = max(int(getattr(progress, "files_to_download", 0) or 0), len(source_items))
@@ -5162,14 +5576,61 @@ class LinksProvider(BaseProvider):
 
         if requested_threads == 1:
             base_threads, pool_size, profile_mode = 1, 4, "manual-1t"
+            tl_workers = 1
         elif total_items >= 2 and dl_conc >= 2:
             base_threads, pool_size, profile_mode = 1, 4, "auto-batch"
+            tl_workers = 2
         elif 0 < expected_size <= 25 * 1024 * 1024:
             base_threads, pool_size, profile_mode = 1, 4, "auto-small"
+            tl_workers = 1 if (0 < expected_size <= 2 * 1024 * 1024) else 3
         else:
             base_threads = 2 if requested_threads == 2 else 3
             pool_size = 8
             profile_mode = "auto-single"
+            tl_workers = 4
+
+        engine_pref = str(opt.get("telegram_engine") or "auto").strip().lower()
+        has_valid_gotd = False
+        try:
+            self._parse_tdl_gotd_session(kv_file[ns])
+            has_valid_gotd = True
+        except ProviderFailure:
+            has_valid_gotd = False
+
+        if engine_pref != "tdl" and has_valid_gotd:
+            try:
+                return await self._download_telegram_telethon(
+                    url,
+                    dest_dir,
+                    name,
+                    progress,
+                    credentials=creds,
+                    file_ref=file_ref,
+                    num_workers=tl_workers,
+                )
+            except ProviderFailure as tl_exc:
+                err_txt = str(tl_exc.message or "")
+                # Fail immediately on dead session auth or Telegram server-side -503 Timeout dead chunk
+                if tl_exc.code == "AUTH_REQUIRED" or "-503 Timeout" in err_txt or "không phản hồi dữ liệu" in err_txt:
+                    raise
+                if engine_pref == "telethon":
+                    raise
+                progress.log(f"[Telegram] Telethon engine error ({err_txt[:120]}); falling back to tdl CLI...")
+
+        tdl_bin: str | None = None
+        tdl_init_err = ""
+        try:
+            tdl_bin = await self._ensure_tdl_binary(progress)
+        except Exception as init_exc:
+            tdl_init_err = str(init_exc)
+
+        if not tdl_bin:
+            return await self._download_telegram_telethon(
+                url, dest_dir, name, progress,
+                credentials=creds, file_ref=file_ref,
+                fallback_reason=tdl_init_err or "tdl unavailable",
+                num_workers=tl_workers,
+            )
 
         dest_dir.mkdir(parents=True, exist_ok=True)
         tmp_root = Path(tempfile.mkdtemp(prefix="vb_tdl_"))
@@ -5208,6 +5669,8 @@ class LinksProvider(BaseProvider):
 
         last_error_msg = ""
         downloaded_files: list[Path] = []
+        max_done_bytes = -1
+        last_pct_seen = -1.0
         try:
             kv_path.write_text(json.dumps({ns: kv_file[ns]}), encoding="utf-8")
             try:
@@ -5223,7 +5686,7 @@ class LinksProvider(BaseProvider):
                 "--storage", f"type=file,path={kv_path.as_posix()}",
                 "-n", ns,
                 "--pool", str(pool_size),
-                "--reconnect-timeout", "30s",
+                "--reconnect-timeout", "2m",
                 "--debug",
                 "dl",
                 "-u", url,
@@ -5242,8 +5705,6 @@ class LinksProvider(BaseProvider):
 
             output_lines: list[str] = []
             buf = ""
-            max_done_bytes = -1
-            last_pct_seen = -1.0
             last_progress_at = time.monotonic()
             stalled = False
 
@@ -5287,9 +5748,9 @@ class LinksProvider(BaseProvider):
 
             while True:
                 progress.check_cancelled()
-                # Allow FloodWait pauses (commonly 30-90s near the end) to finish before declaring a stall
+                # Allow FloodWait / DC -503 recovery pauses near the end to finish before declaring a stall
                 if last_pct_seen >= 90.0:
-                    stall_limit = 120.0
+                    stall_limit = 150.0
                 elif max_done_bytes > 0:
                     stall_limit = 90.0
                 else:
@@ -5371,6 +5832,7 @@ class LinksProvider(BaseProvider):
             shutil.rmtree(dl_stage, ignore_errors=True)
 
         # Fallback to Telethon contiguous .part engine when tdl stalled, exited non-zero, or failed integrity validation
+        probe_hint = max_done_bytes if (last_pct_seen >= 90.0 and max_done_bytes >= 1024 * 1024) else 0
         return await self._download_telegram_telethon(
             url,
             dest_dir,
@@ -5379,6 +5841,8 @@ class LinksProvider(BaseProvider):
             credentials=creds,
             file_ref=file_ref,
             fallback_reason=last_error_msg or "tdl failed",
+            probe_hint_offset=probe_hint,
+            num_workers=tl_workers,
         )
 
     async def _dispatch_download(
