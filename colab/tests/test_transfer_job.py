@@ -6388,6 +6388,22 @@ def test_links_provider_telegram_download_writes_temp_kv_and_cleans_up(tmp_path,
     assert job.progress.download >= 50.0
     assert job.speed > 0
     assert "-n" in seen_cmd and seen_cmd[seen_cmd.index("-n") + 1] == "colab"
+    # Single large/unknown file auto-selects threads=3, pool=8
+    assert seen_cmd[seen_cmd.index("--threads") + 1] == "3"
+    assert seen_cmd[seen_cmd.index("--pool") + 1] == "8"
+
+    # Multi-item batch with parallel_download auto-selects threads=1, pool=4 even when UI default download_threads=32
+    seen_cmd.clear()
+    batch_payload = {
+        "source": {"provider": "links", "items": [file_ref, {**file_ref, "id": "https://t.me/c/3287969807/3"}]},
+        "options": {"parallel_download": True, "download_concurrency": 4, "download_threads": 32},
+    }
+    batch_job = JobState("tg-dl-batch", batch_payload)
+    batch_job.files_to_download = 2
+    out_batch = asyncio.run(provider.download_file(creds, dict(file_ref), tmp_path / "batch", batch_job))
+    assert out_batch.exists()
+    assert seen_cmd[seen_cmd.index("--threads") + 1] == "1"
+    assert seen_cmd[seen_cmd.index("--pool") + 1] == "4"
     assert seen_kv["exists_during_run"] is True
     assert seen_kv["content"]["colab"]["session"] == "eyJhdXRoX2tleSI6InNlY3JldCJ9"
     # Temp KV storage directory must be deleted immediately after download

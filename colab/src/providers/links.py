@@ -4614,11 +4614,29 @@ class LinksProvider(BaseProvider):
 
         tdl_bin = await self._ensure_tdl_binary(progress)
         opt = (progress.payload or {}).get("options", {}) if hasattr(progress, "payload") else {}
-        base_threads = max(1, min(4, int(opt.get("download_threads") or opt.get("threads_per_item") or 4)))
         try:
             expected_size = int((file_ref or {}).get("size") or (file_ref or {}).get("file_size") or 0)
         except (TypeError, ValueError):
             expected_size = 0
+
+        source_items = ((progress.payload or {}).get("source") or {}).get("items") or [] if hasattr(progress, "payload") else []
+        total_items = max(int(getattr(progress, "files_to_download", 0) or 0), len(source_items))
+        dl_conc = 1 if opt.get("parallel_download") is False else max(1, int(opt.get("download_concurrency") or 4))
+        try:
+            requested_threads = int(opt.get("telegram_threads") or opt.get("download_threads") or opt.get("threads_per_item") or 0)
+        except (TypeError, ValueError):
+            requested_threads = 0
+
+        if requested_threads == 1:
+            base_threads, pool_size, profile_mode = 1, 4, "manual-1t"
+        elif total_items >= 2 and dl_conc >= 2:
+            base_threads, pool_size, profile_mode = 1, 4, "auto-batch"
+        elif 0 < expected_size <= 25 * 1024 * 1024:
+            base_threads, pool_size, profile_mode = 1, 4, "auto-small"
+        else:
+            base_threads = 2 if requested_threads == 2 else 3
+            pool_size = 8
+            profile_mode = "auto-single"
 
         dest_dir.mkdir(parents=True, exist_ok=True)
         tmp_root = Path(tempfile.mkdtemp(prefix="vb_tdl_"))
@@ -4658,10 +4676,7 @@ class LinksProvider(BaseProvider):
                 pass
 
             thread_schedule = [base_threads]
-            for fallback_t in (2, 1):
-                if fallback_t < thread_schedule[-1]:
-                    thread_schedule.append(fallback_t)
-            if len(thread_schedule) == 1:
+            if base_threads > 1:
                 thread_schedule.append(1)
 
             downloaded_files: list[Path] = []
@@ -4676,7 +4691,7 @@ class LinksProvider(BaseProvider):
                     tdl_bin,
                     "--storage", f"type=file,path={kv_path.as_posix()}",
                     "-n", ns,
-                    "--pool", "12",
+                    "--pool", str(pool_size),
                     "--reconnect-timeout", "20s",
                     "dl",
                     "-u", url,
@@ -4686,7 +4701,7 @@ class LinksProvider(BaseProvider):
                     "--template", "{{ filenamify .FileName }}",
                     "--threads", str(cur_threads),
                 ]
-                progress.log(f"[Telegram] Downloading via tdl (ns={ns}, threads={cur_threads}): {url}")
+                progress.log(f"[Telegram] Downloading via tdl (ns={ns}, threads={cur_threads}, pool={pool_size}, {profile_mode}): {url}")
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
