@@ -4849,6 +4849,83 @@ class LinksProvider(BaseProvider):
                     f"Video integrity check failed for {file_path.name}: no valid media streams found",
                 )
 
+    async def _salvage_truncated_video(
+        self,
+        part_path: Path,
+        dest_file: Path,
+        total_size: int,
+        progress: JobState,
+        file_ref: dict[str, Any] | None = None,
+    ) -> Path | None:
+        """Attempt lossless ffmpeg remux when >= 95% of a video downloaded before a tail chunk error."""
+        if total_size <= 0 or not part_path.is_file():
+            return None
+        actual_size = part_path.stat().st_size
+        pct = (actual_size * 100.0) / total_size
+        if actual_size < int(total_size * 0.95):
+            return None
+
+        ext = dest_file.suffix.lower()
+        video_exts = (".mp4", ".mkv", ".mov", ".webm", ".avi", ".flv", ".ts", ".m4v")
+        if ext not in video_exts or not shutil.which("ffmpeg"):
+            return None
+
+        salvaged_tmp = part_path.with_name(f".salvage_{uuid.uuid4().hex[:8]}{ext}")
+        cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            "-err_detect", "ignore_err",
+            "-i", str(part_path),
+            "-map", "0:v?", "-map", "0:a?",
+            "-c", "copy",
+        ]
+        if ext in (".mp4", ".mov", ".m4v"):
+            cmd.extend(["-movflags", "+faststart"])
+        cmd.append(str(salvaged_tmp))
+
+        progress.log(
+            f"[Telegram/Salvage] Đã tải {pct:.1f}% ({actual_size / 1048576:.1f}/{total_size / 1048576:.1f} MB) "
+            f"trước lỗi cuối file — đang thử bỏ đoạn lỗi và cứu video bằng ffmpeg..."
+        )
+        try:
+            res = await asyncio.to_thread(
+                subprocess.run,
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            if res.returncode != 0 or not salvaged_tmp.is_file():
+                salvaged_tmp.unlink(missing_ok=True)
+                err_hint = (res.stderr or "").strip()[:140]
+                if err_hint:
+                    progress.log(f"[Telegram/Salvage] Không thể cứu video ({err_hint}).")
+                return None
+
+            salvaged_size = salvaged_tmp.stat().st_size
+            if salvaged_size < max(4096, int(actual_size * 0.50)):
+                salvaged_tmp.unlink(missing_ok=True)
+                progress.log("[Telegram/Salvage] File sau remux quá nhỏ; hủy để tránh upload video lỗi.")
+                return None
+
+            await self._verify_downloaded_media_integrity(
+                salvaged_tmp, expected_size=0, suffix_hint=ext
+            )
+            os.replace(salvaged_tmp, dest_file)
+            part_path.unlink(missing_ok=True)
+            if isinstance(file_ref, dict):
+                file_ref["_salvaged"] = True
+                file_ref["size"] = dest_file.stat().st_size
+            dropped_kb = max(1, (total_size - actual_size) // 1024)
+            progress.log(
+                f"[Telegram/Salvage] Đã bỏ {dropped_kb} KB cuối bị lỗi server và cứu toàn vẹn "
+                f"{dest_file.stat().st_size / 1048576:.1f} MB ({pct:.1f}%)!"
+            )
+            return dest_file
+        except Exception as exc:
+            salvaged_tmp.unlink(missing_ok=True)
+            progress.log(f"[Telegram/Salvage] Bỏ qua cứu video ({str(exc)[:120]}).")
+            return None
+
     async def _download_telegram_telethon(
         self,
         url: str,
@@ -5354,17 +5431,18 @@ class LinksProvider(BaseProvider):
                                 chunk_fails[claimed_off] = fails
                                 detail = last_dc_issue or err_str
                                 if fails >= 3:
-                                    p_state["fatal"] = ProviderFailure(
-                                        "DOWNLOAD_FAILED",
-                                        f"Telegram DC{loc_state['dc']} không phản hồi dữ liệu tại offset "
-                                        f"{claimed_off}/{total_size} ({detail}).",
-                                    )
+                                    # Downgrade from multi-worker to 1-connection sequential iter_download before failing
+                                    p_state["fallback_seq"] = True
                                     p_state["stop"] = True
+                                    progress.log(
+                                        f"[Telegram/Telethon] DC timeout at {claimed_off / 1048576:.1f} MB ({detail[:90]}); "
+                                        "switching to 1-connection sequential recovery..."
+                                    )
                                     window_evt.set()
                                     return
                                 retry_q.append(claimed_off)
                                 backoff_s = min(16.0, float(2 ** (fails + 1)))
-                                p_state["pause_until"] = max(p_state["pause_until"], time.monotonic() + min(4.0, backoff_s))
+                                p_state["pause_until"] = max(p_state["pause_until"], time.monotonic() + min(8.0, backoff_s))
                                 window_evt.set()
                             finally:
                                 p_state["in_flight"] -= 1
@@ -5395,135 +5473,150 @@ class LinksProvider(BaseProvider):
                         except Exception:
                             pass
 
-            with open(part_path, mode) as fh:
-                if mode == "r+b":
-                    fh.seek(offset)
-                    fh.truncate(offset)
+            salvage_exc: ProviderFailure | None = None
+            try:
+                with open(part_path, mode) as fh:
+                    if mode == "r+b":
+                        fh.seek(offset)
+                        fh.truncate(offset)
 
-                parallel_done = False
-                if num_workers >= 2 and total_size > 0 and offset < total_size:
-                    offset, parallel_done = await _run_parallel_ordered(fh, offset)
-                    win_start_ts = time.monotonic()
-                    win_start_bytes = offset
+                    parallel_done = False
+                    if num_workers >= 2 and total_size > 0 and offset < total_size:
+                        offset, parallel_done = await _run_parallel_ordered(fh, offset)
+                        win_start_ts = time.monotonic()
+                        win_start_bytes = offset
 
-                while (not parallel_done) and (total_size <= 0 or offset < total_size):
-                    progress.check_cancelled()
-                    iter_bytes = 0
-                    try:
-                        async for chunk in client.iter_download(
-                            msg.media,
-                            offset=offset,
-                            request_size=cur_request_size,
-                        ):
-                            progress.check_cancelled()
-                            if not chunk:
-                                continue
-                            fh.write(chunk)
-                            iter_bytes += len(chunk)
-                            offset += len(chunk)
-                            same_offset_fails = 0
-                            cur_request_size = request_size
-                            now = time.monotonic()
-                            if now - last_ui_ts >= 0.4 or (total_size > 0 and offset >= total_size):
-                                elapsed = max(0.05, now - win_start_ts)
-                                speed_bps = max(0.0, (offset - win_start_bytes) / elapsed)
-                                if elapsed >= 5.0:
-                                    win_start_ts = now
-                                    win_start_bytes = offset
-                                pct = (offset * 100.0 / total_size) if total_size > 0 else 0.0
-                                if hasattr(progress, "set_phase_progress"):
-                                    progress.set_phase_progress(
-                                        done_bytes=offset,
-                                        total_bytes=total_size or getattr(progress, "bytes_total", 0),
-                                        pct=min(100.0, pct),
-                                        speed=speed_bps,
-                                        phase="download",
-                                    )
-                                last_ui_ts = now
-                            if total_size > 0 and offset >= total_size:
+                    while (not parallel_done) and (total_size <= 0 or offset < total_size):
+                        progress.check_cancelled()
+                        iter_bytes = 0
+                        try:
+                            async for chunk in client.iter_download(
+                                msg.media,
+                                offset=offset,
+                                request_size=cur_request_size,
+                            ):
+                                progress.check_cancelled()
+                                if not chunk:
+                                    continue
+                                fh.write(chunk)
+                                iter_bytes += len(chunk)
+                                offset += len(chunk)
+                                same_offset_fails = 0
+                                cur_request_size = request_size
+                                now = time.monotonic()
+                                if now - last_ui_ts >= 0.4 or (total_size > 0 and offset >= total_size):
+                                    elapsed = max(0.05, now - win_start_ts)
+                                    speed_bps = max(0.0, (offset - win_start_bytes) / elapsed)
+                                    if elapsed >= 5.0:
+                                        win_start_ts = now
+                                        win_start_bytes = offset
+                                    pct = (offset * 100.0 / total_size) if total_size > 0 else 0.0
+                                    if hasattr(progress, "set_phase_progress"):
+                                        progress.set_phase_progress(
+                                            done_bytes=offset,
+                                            total_bytes=total_size or getattr(progress, "bytes_total", 0),
+                                            pct=min(100.0, pct),
+                                            speed=speed_bps,
+                                            phase="download",
+                                        )
+                                    last_ui_ts = now
+                                if total_size > 0 and offset >= total_size:
+                                    break
+                            if total_size <= 0 or offset >= total_size:
                                 break
-                        if total_size <= 0 or offset >= total_size:
-                            break
-                        if iter_bytes > 0:
-                            continue
-                        cycle += 1
-                        if cycle > max_cycles:
-                            raise ProviderFailure(
-                                "DOWNLOAD_FAILED",
-                                f"Telethon stream returned empty EOF at {offset}/{total_size} bytes",
+                            if iter_bytes > 0:
+                                continue
+                            cycle += 1
+                            if cycle > max_cycles:
+                                raise ProviderFailure(
+                                    "DOWNLOAD_FAILED",
+                                    f"Telethon stream returned empty EOF at {offset}/{total_size} bytes",
+                                )
+                            await _sleep_cancellable(2.0)
+                        except tl_errors.FloodWaitError as fw:
+                            fh.flush()
+                            os.fsync(fh.fileno())
+                            cycle += 1
+                            if cycle > max_cycles:
+                                raise ProviderFailure(
+                                    "DOWNLOAD_FAILED",
+                                    f"Telethon exceeded max FloodWait retries at {offset}/{total_size} bytes",
+                                ) from fw
+                            wait_s = max(1, int(getattr(fw, "seconds", 5) or 5)) + 1
+                            progress.log(
+                                f"[Telegram/Telethon] FloodWait {wait_s}s at {offset / 1048576:.1f}"
+                                + (f"/{total_size / 1048576:.1f} MB" if total_size > 0 else " MB")
+                                + " — .part saved, resuming automatically..."
                             )
-                        await _sleep_cancellable(2.0)
-                    except tl_errors.FloodWaitError as fw:
-                        fh.flush()
-                        os.fsync(fh.fileno())
-                        cycle += 1
-                        if cycle > max_cycles:
-                            raise ProviderFailure(
-                                "DOWNLOAD_FAILED",
-                                f"Telethon exceeded max FloodWait retries at {offset}/{total_size} bytes",
-                            ) from fw
-                        wait_s = max(1, int(getattr(fw, "seconds", 5) or 5)) + 1
-                        progress.log(
-                            f"[Telegram/Telethon] FloodWait {wait_s}s at {offset / 1048576:.1f}"
-                            + (f"/{total_size / 1048576:.1f} MB" if total_size > 0 else " MB")
-                            + " — .part saved, resuming automatically..."
-                        )
-                        await _sleep_cancellable(wait_s)
-                        offset = (fh.tell() // chunk_align) * chunk_align
-                        fh.seek(offset)
-                        fh.truncate(offset)
-                        win_start_ts = time.monotonic()
-                        win_start_bytes = offset
-                    except Exception as net_exc:
-                        err_low = str(net_exc).lower()
-                        is_retryable_rpc = (
-                            (server_err_types and isinstance(net_exc, server_err_types))
-                            or isinstance(net_exc, (ConnectionError, TimeoutError, asyncio.TimeoutError, OSError))
-                            or (isinstance(net_exc, ValueError) and "request was unsuccessful" in err_low)
-                        )
-                        if not is_retryable_rpc:
-                            raise
-                        fh.flush()
-                        os.fsync(fh.fileno())
-                        offset = (fh.tell() // chunk_align) * chunk_align
-                        fh.seek(offset)
-                        fh.truncate(offset)
+                            await _sleep_cancellable(wait_s)
+                            offset = (fh.tell() // chunk_align) * chunk_align
+                            fh.seek(offset)
+                            fh.truncate(offset)
+                            win_start_ts = time.monotonic()
+                            win_start_bytes = offset
+                        except Exception as net_exc:
+                            err_low = str(net_exc).lower()
+                            is_retryable_rpc = (
+                                (server_err_types and isinstance(net_exc, server_err_types))
+                                or isinstance(net_exc, (ConnectionError, TimeoutError, asyncio.TimeoutError, OSError))
+                                or (isinstance(net_exc, ValueError) and "request was unsuccessful" in err_low)
+                            )
+                            if not is_retryable_rpc:
+                                raise
+                            fh.flush()
+                            os.fsync(fh.fileno())
+                            offset = (fh.tell() // chunk_align) * chunk_align
+                            fh.seek(offset)
+                            fh.truncate(offset)
 
-                        if offset == last_fail_offset:
-                            same_offset_fails += 1
-                        else:
-                            last_fail_offset = offset
-                            same_offset_fails = 1
+                            if offset == last_fail_offset:
+                                same_offset_fails += 1
+                            else:
+                                last_fail_offset = offset
+                                same_offset_fails = 1
 
-                        detail = last_dc_issue or str(net_exc)
-                        if same_offset_fails >= 3:
-                            raise ProviderFailure(
-                                "DOWNLOAD_FAILED",
-                                f"Telegram DC{sess_info['dc_id']} không phản hồi dữ liệu tại offset "
-                                f"{offset}/{total_size} ({detail}).",
-                            ) from net_exc
+                            detail = last_dc_issue or str(net_exc)
+                            if same_offset_fails >= 3:
+                                if isinstance(file_ref, dict) and total_size > 0 and offset >= int(total_size * 0.90):
+                                    file_ref["_tg_dead_tail"] = True
+                                raise ProviderFailure(
+                                    "DOWNLOAD_FAILED",
+                                    f"Telegram DC{sess_info['dc_id']} không phản hồi dữ liệu tại offset "
+                                    f"{offset}/{total_size} ({detail}).",
+                                ) from net_exc
 
-                        cycle += 1
-                        if cycle > max_cycles:
-                            raise ProviderFailure(
-                                "DOWNLOAD_FAILED",
-                                f"Telethon interrupted after {max_cycles} retries at {offset}/{total_size} bytes: {detail}",
-                            ) from net_exc
+                            cycle += 1
+                            if cycle > max_cycles:
+                                raise ProviderFailure(
+                                    "DOWNLOAD_FAILED",
+                                    f"Telethon interrupted after {max_cycles} retries at {offset}/{total_size} bytes: {detail}",
+                                ) from net_exc
 
-                        if same_offset_fails == 2 and cur_request_size > 64 * 1024:
-                            cur_request_size = 64 * 1024
+                            if same_offset_fails == 2 and cur_request_size > 64 * 1024:
+                                cur_request_size = 64 * 1024
 
-                        backoff_s = min(30.0, float(2 ** min(cycle + 1, 4)))
-                        progress.log(
-                            f"[Telegram/Telethon] DC timeout/reset at {offset / 1048576:.1f} MB ({detail[:100]}); "
-                            f"retrying in {backoff_s:.0f}s (chunk={cur_request_size // 1024}KB)..."
-                        )
-                        await _sleep_cancellable(backoff_s)
-                        win_start_ts = time.monotonic()
-                        win_start_bytes = offset
+                            backoff_s = min(30.0, float(2 ** min(cycle + 1, 4)))
+                            progress.log(
+                                f"[Telegram/Telethon] DC timeout/reset at {offset / 1048576:.1f} MB ({detail[:100]}); "
+                                f"retrying in {backoff_s:.0f}s (chunk={cur_request_size // 1024}KB)..."
+                            )
+                            await _sleep_cancellable(backoff_s)
+                            win_start_ts = time.monotonic()
+                            win_start_bytes = offset
 
-                fh.flush()
-                os.fsync(fh.fileno())
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            except ProviderFailure as dl_exc:
+                salvage_exc = dl_exc
+
+            if salvage_exc is not None:
+                if salvage_exc.code != "AUTH_REQUIRED":
+                    salvaged = await self._salvage_truncated_video(
+                        part_path, dest_file, total_size or expected_ref_size, progress, file_ref=file_ref
+                    )
+                    if salvaged is not None:
+                        return [salvaged]
+                raise salvage_exc
 
             verify_size = total_size or expected_ref_size
             await self._verify_downloaded_media_integrity(
@@ -5579,7 +5672,7 @@ class LinksProvider(BaseProvider):
             tl_workers = 1
         elif total_items >= 2 and dl_conc >= 2:
             base_threads, pool_size, profile_mode = 1, 4, "auto-batch"
-            tl_workers = 2
+            tl_workers = 1 if (0 < expected_size <= 20 * 1024 * 1024) else 2
         elif 0 < expected_size <= 25 * 1024 * 1024:
             base_threads, pool_size, profile_mode = 1, 4, "auto-small"
             tl_workers = 1 if (0 < expected_size <= 2 * 1024 * 1024) else 3
@@ -5610,8 +5703,11 @@ class LinksProvider(BaseProvider):
                 )
             except ProviderFailure as tl_exc:
                 err_txt = str(tl_exc.message or "")
-                # Fail immediately on dead session auth or Telegram server-side -503 Timeout dead chunk
-                if tl_exc.code == "AUTH_REQUIRED" or "-503 Timeout" in err_txt or "không phản hồi dữ liệu" in err_txt:
+                is_dead_tail_err = ("tại cuối file" in err_txt) or (
+                    isinstance(file_ref, dict) and bool(file_ref.get("_tg_dead_tail"))
+                )
+                # Fail immediately only on dead session auth or confirmed >=90% end-of-file DC5 dead chunk
+                if tl_exc.code == "AUTH_REQUIRED" or is_dead_tail_err:
                     raise
                 if engine_pref == "telethon":
                     raise
@@ -6322,7 +6418,7 @@ class LinksProvider(BaseProvider):
 
         result = downloaded[0]
         self._validate_downloaded_files([result])
-        if expected_size and result.stat().st_size < expected_size:
+        if expected_size and not (isinstance(file_ref, dict) and file_ref.get("_salvaged")) and result.stat().st_size < expected_size:
             raise ProviderFailure("DOWNLOAD_INCOMPLETE", f"Downloaded {result.stat().st_size} bytes, expected {expected_size}")
         if is_placeholder_link_name(file_ref.get("name"), url):
             file_ref["name"] = result.name

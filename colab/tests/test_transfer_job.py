@@ -6824,6 +6824,9 @@ def test_telegram_telethon_primary_multi_connection_ordered_writer(monkeypatch, 
             await asyncio.sleep(delay_map.get(off, 0.01))
             return types.SimpleNamespace(bytes=full_payload[off:off + req.limit])
 
+        async def iter_download(self, media, offset=0, limit=None, request_size=524288):
+            yield full_payload[offset:]
+
     fake_telethon = types.ModuleType("telethon")
     fake_telethon.TelegramClient = FakeClient
     fake_errors = types.ModuleType("telethon.errors")
@@ -6877,19 +6880,93 @@ def test_telegram_telethon_primary_multi_connection_ordered_writer(monkeypatch, 
     assert client_count["n"] == 4
     assert any("workers=4" in line for line in job.logs)
 
-    # Batch parallel mode scales down Telethon workers to 2 connections/item
+    # Batch parallel mode: unknown/large (>20MB) item scales down to 2 workers; <=20MB item uses 1 worker
     client_count["n"] = 0
     seen_req_offsets.clear()
-    file_ref_sized = {**file_ref, "size": total_len}
     batch_job = JobState("tg-multi-batch", {
-        "source": {"provider": "links", "items": [file_ref_sized, {**file_ref_sized, "id": "https://t.me/c/3287969807/3"}]},
+        "source": {"provider": "links", "items": [file_ref, {**file_ref, "id": "https://t.me/c/3175144270/3"}]},
         "options": {"parallel_download": True, "download_concurrency": 4},
     })
     batch_job.files_to_download = 2
-    out_b = asyncio.run(provider.download_file(creds, dict(file_ref_sized), tmp_path / "batch", batch_job))
+    out_b = asyncio.run(provider.download_file(creds, dict(file_ref), tmp_path / "batch_unknown", batch_job))
     assert out_b.read_bytes() == full_payload
     assert client_count["n"] == 2
     assert any("workers=2" in line for line in batch_job.logs)
+
+    client_count["n"] = 0
+    file_ref_small_batch = {**file_ref, "size": total_len}
+    batch_small = JobState("tg-multi-batch-small", {
+        "source": {"provider": "links", "items": [file_ref_small_batch, {**file_ref_small_batch, "id": "https://t.me/c/3175144270/4"}]},
+        "options": {"parallel_download": True, "download_concurrency": 4},
+    })
+    batch_small.files_to_download = 2
+    out_bs = asyncio.run(provider.download_file(creds, dict(file_ref_small_batch), tmp_path / "batch_small", batch_small))
+    assert out_bs.read_bytes() == full_payload
+    assert client_count["n"] == 1
+    assert any("workers=1" in line for line in batch_small.logs)
+
+
+def test_telegram_tail_salvage_remuxes_95pct_video_or_rejects_broken_moov(monkeypatch, tmp_path):
+    import json
+    import subprocess
+    from src.providers.links import LinksProvider
+    from src.jobs.progress import JobState
+
+    provider = LinksProvider()
+    monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}" if cmd in ("ffmpeg", "ffprobe") else None)
+
+    total_size = 100_000
+    part_path = tmp_path / ".tg_part_abc.part"
+    dest_file = tmp_path / "salvaged.mp4"
+
+    # 1) < 95% downloaded -> refuse salvage
+    part_path.write_bytes(b"V" * 90_000)
+    job_low = JobState("salvage-low", {})
+    assert asyncio.run(provider._salvage_truncated_video(part_path, dest_file, total_size, job_low)) is None
+
+    # 2) >= 95% downloaded + ffmpeg remux fails (missing moov atom) -> refuse salvage cleanly
+    part_path.write_bytes(b"V" * 98_000)
+    mode = {"ffmpeg_ok": False}
+
+    def fake_run(cmd, **kwargs):
+        exe = str(cmd[0])
+        if exe.endswith("ffmpeg"):
+            if mode["ffmpeg_ok"]:
+                Path(cmd[-1]).write_bytes(b"VALID_MP4_" * 9_500)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, 1, "", "moov atom not found")
+        if exe.endswith("ffprobe"):
+            return subprocess.CompletedProcess(
+                cmd, 0, json.dumps({"streams": [{"codec_type": "video"}], "format": {"duration": "12.5"}}), ""
+            )
+        raise AssertionError(f"Unexpected cmd: {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    job_fail = JobState("salvage-no-moov", {})
+    assert asyncio.run(provider._salvage_truncated_video(part_path, dest_file, total_size, job_fail)) is None
+    assert not dest_file.exists()
+    assert any("Không thể cứu video" in line for line in job_fail.logs)
+
+    # 3) >= 95% downloaded + ffmpeg remux succeeds & ffprobe validates -> returns clean file & avoids DOWNLOAD_INCOMPLETE
+    mode["ffmpeg_ok"] = True
+    file_ref = {"id": "https://t.me/c/3287969807/2", "name": "salvaged.mp4", "type": "telegram", "size": total_size}
+    job_ok = JobState("salvage-ok", {})
+    salvaged = asyncio.run(provider._salvage_truncated_video(part_path, dest_file, total_size, job_ok, file_ref=file_ref))
+    assert salvaged == dest_file
+    assert dest_file.exists() and not part_path.exists()
+    assert file_ref.get("_salvaged") is True
+    assert file_ref["size"] == dest_file.stat().st_size
+    assert any("cứu toàn vẹn" in line for line in job_ok.logs)
+
+    # Verify download_file wrapper does not throw DOWNLOAD_INCOMPLETE on a salvaged file
+    async def fake_dispatch(*args, **kwargs):
+        return [dest_file]
+
+    monkeypatch.setattr(provider, "_ensure_deps", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(provider, "_dispatch_download", fake_dispatch)
+    final = asyncio.run(provider.download_file({}, file_ref, tmp_path, job_ok))
+    assert final == dest_file
+
 
 
 
