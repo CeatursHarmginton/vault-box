@@ -2608,6 +2608,7 @@ class LinksProvider(BaseProvider):
                 continue
             # A node key may contain multiple slash-separated entries: "owner:b64/owner2:b64"
             dec_k_a32: list[int] = []
+            attrs: dict[str, Any] = {}
             for part in k_full.split("/"):
                 k_b64 = part.split(":", 1)[1] if ":" in part else part
                 if not k_b64:
@@ -2617,13 +2618,21 @@ class LinksProvider(BaseProvider):
                     if len(enc_k) % 16 != 0:
                         continue
                     dec_k_bytes = self._mega_aes_ecb_decrypt(enc_k, master_key)
-                    dec_k_a32 = self._mega_bytes_to_a32(dec_k_bytes)
-                    break
+                    cand_k_a32 = self._mega_bytes_to_a32(dec_k_bytes)
+                    cand_attrs = self._mega_decrypt_attr(str(n.get("a") or ""), cand_k_a32)
+                    if cand_attrs and cand_attrs.get("n"):
+                        dec_k_a32 = cand_k_a32
+                        attrs = cand_attrs
+                        break
+                    if not dec_k_a32:
+                        dec_k_a32 = cand_k_a32
+                        attrs = cand_attrs
                 except Exception:
                     continue
             if not dec_k_a32:
                 continue
-            attrs = self._mega_decrypt_attr(str(n.get("a") or ""), dec_k_a32)
+            if not attrs:
+                attrs = self._mega_decrypt_attr(str(n.get("a") or ""), dec_k_a32)
             node_name = safe_name(str(attrs.get("n") or h))
             nodes_by_id[h] = {
                 "h": h,
@@ -6084,6 +6093,20 @@ class LinksProvider(BaseProvider):
 
             subfolders = [c for c in items if (c.get("type") == "folder" or c.get("is_folder") or c.get("isdir"))]
             file_children = [c for c in items if not (c.get("type") == "folder" or c.get("is_folder") or c.get("isdir"))]
+
+            from ..utils.media_converter import is_file_filter_enabled, should_download_file_item
+            if file_children and is_file_filter_enabled(options):
+                kept_children: list[dict[str, Any]] = []
+                for child in file_children:
+                    if should_download_file_item(child, options):
+                        kept_children.append(child)
+                    else:
+                        progress.files_skipped += 1
+                        progress.log(f"[File-Filter] Skipped file excluded by filter: {child.get('name') or child.get('_relative_path') or 'file'}")
+                file_children = kept_children
+                if not file_children and not subfolders:
+                    progress.log(f"[File-Filter] No matching files to download in link folder '{folder_ref.get('name') or url[:60]}'")
+                    return []
 
             checker = getattr(progress, "_target_checker", None)
             if checker is not None and file_children and (options.get("auto_skip") or options.get("autoSkip")):

@@ -15,6 +15,7 @@ class JobCancelled(RuntimeError):
 class JobProgress:
     download: float = 0
     extract: float = 0
+    convert: float = 0
     optimize: float = 0
     upload: float = 0
 
@@ -56,6 +57,7 @@ class JobState:
     confirm_event: threading.Event = field(default_factory=threading.Event, compare=False, hash=False)
     confirm_action: str | None = None
     optimized_files: list[dict[str, Any]] = field(default_factory=list)
+    converted_files: list[dict[str, Any]] = field(default_factory=list)
     completed_items: list[dict[str, Any]] = field(default_factory=list)
     failed_items: list[dict[str, Any]] = field(default_factory=list)
     failed_files: list[dict[str, Any]] = field(default_factory=list)
@@ -181,7 +183,7 @@ class JobState:
 
     def set(self, *, status: str | None = None, step: str | None = None, current_file: str | None = None) -> None:
         changed = False
-        if status and getattr(self, "_waiting_for_account", False) and status in {"running", "downloading", "uploading", "extracting", "pending"}:
+        if status and getattr(self, "_waiting_for_account", False) and status in {"running", "downloading", "uploading", "extracting", "converting", "pending"}:
             status = None
         if status and status != self.status:
             self.status = status
@@ -308,6 +310,8 @@ class JobState:
             ("fresh_url", "freshUrl"),
             ("archive_password", "archivePassword"),
             ("archive_passwords", "archivePasswords"),
+            ("auto_convert", "autoConvert"),
+            ("file_filter", "fileFilter"),
         )
         normalized = dict(new_options)
         for k1, k2 in alias_pairs:
@@ -353,10 +357,13 @@ class JobState:
         return cur
 
     def view(self) -> dict[str, Any]:
+        from ..utils.media_converter import is_auto_convert_enabled
         options = dict(self.payload.get("options") or {}) if isinstance(self.payload, dict) else {}
         phases = ["download"]
         if options.get("extract"):
             phases.append("extract")
+        if is_auto_convert_enabled(options):
+            phases.append("convert")
         if options.get("optimize_image"):
             phases.append("optimize")
         phases.append("upload")
@@ -397,6 +404,7 @@ class JobState:
             "filesFailed": self.files_failed,
             "filesToUpload": self.files_to_upload,
             "optimizedFiles": list(self.optimized_files),
+            "convertedFiles": list(self.converted_files),
             "completedItems": list(self.completed_items),
             "failedItems": list(self.failed_items),
             "failedFiles": list(self.failed_files[-50:]),
@@ -445,6 +453,7 @@ class JobState:
                 "files_to_upload": self.files_to_upload,
                 "files_skipped": self.files_skipped,
                 "files_failed": self.files_failed,
+                "converted_files": self.converted_files,
                 "completed_items": self.completed_items,
                 "failed_items": self.failed_items,
                 "item_timings": self.item_timings,
@@ -468,7 +477,7 @@ class JobState:
             job = cls(job_id=job_id, payload=payload)
             saved_status = data.get("status", "interrupted")
             saved_step = data.get("step", "interrupted")
-            if saved_status in {"running", "downloading", "uploading", "extracting", "pending"}:
+            if saved_status in {"running", "downloading", "uploading", "extracting", "converting", "pending"}:
                 job.status = "interrupted"
                 job.step = "interrupted"
                 job.error = {"code": "INTERRUPTED", "message": "Local server was stopped or restarted while transfer was in progress. Click 'Resume Transfer' to continue.", "details": {}}
@@ -491,6 +500,7 @@ class JobState:
             job.files_failed = data.get("files_failed", 0)
             job.downloaded_files = set(data.get("downloaded_files") or [])
             job.uploaded_files = set(data.get("uploaded_files") or [])
+            job.converted_files = data.get("converted_files") or []
             job.completed_items = data.get("completed_items") or []
             job.failed_items = data.get("failed_items") or []
             job.item_timings = data.get("item_timings") or {}

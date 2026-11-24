@@ -2439,6 +2439,23 @@ async def _run_resumable_backup_pipeline_core(
 
     final_size = final_output_path.stat().st_size
     live_opts_final = (job.payload.get("options") if isinstance(getattr(job, "payload", None), dict) else None) or options
+    if isinstance(live_opts_final, dict):
+        from ..utils.media_converter import convert_video_file, is_auto_convert_enabled, resolve_conversion_target
+        if is_auto_convert_enabled(live_opts_final):
+            conv_fmt = resolve_conversion_target(final_output_path, live_opts_final)
+            if conv_fmt:
+                conv_out = dirs["output"] / f"{final_output_path.stem}.{conv_fmt}"
+                job.set(status="running", step="converting", current_file=final_output_path.name)
+                job.log(f"[Auto-Convert] Converting assembled video: {final_output_path.name} -> {conv_out.name}...")
+                ok_conv, msg_conv = await asyncio.to_thread(
+                    convert_video_file, final_output_path, conv_out, conv_fmt, job.check_cancelled
+                )
+                if not ok_conv or not conv_out.is_file():
+                    raise ProviderFailure("CONVERT_FAILED", f"Video conversion/validation failed for {final_output_path.name}: {msg_conv}")
+                final_output_path = conv_out
+                final_video_name = conv_out.name
+                final_size = final_output_path.stat().st_size
+                job.log(f"[Auto-Convert] Validated converted video: {final_video_name} ({final_size} bytes)")
     if isinstance(live_opts_final, dict) and (live_opts_final.get("set_video_thumbnail") or live_opts_final.get("trim_intro")):
         try:
             from ..utils.video_thumbnail import process_video_thumbnails

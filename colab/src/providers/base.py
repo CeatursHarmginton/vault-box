@@ -169,7 +169,12 @@ class BaseProvider(ABC):
         listing = await self.list_files(credentials, str(folder_ref.get("id") or folder_ref.get("path") or "/"))
         items = listing.get("items") or listing.get("files") or []
         progress.log(f"{self.name} list folder {folder_ref.get('name') or folder_ref.get('path') or folder_ref.get('id')}: {len(items)} item(s)")
-        eligible = [item for item in items if not (item.get("type") == "folder" or item.get("is_folder") or item.get("isdir")) and not _skip_optimize_item(item, progress)]
+        eligible = [
+            item for item in items
+            if not (item.get("type") == "folder" or item.get("is_folder") or item.get("isdir"))
+            and not _skip_filtered_item(item, progress)
+            and not _skip_optimize_item(item, progress)
+        ]
         progress.files_to_download += len(eligible)
         options = (progress.payload or {}).get("options", {}) if hasattr(progress, "payload") else {}
         conc = int(options.get("download_concurrency") or FOLDER_DOWNLOAD_CONCURRENCY)
@@ -187,6 +192,10 @@ class BaseProvider(ABC):
                 sub = local_dir / _safe_name(item.get("name") or item.get("server_filename") or "folder")
                 sub.mkdir(parents=True, exist_ok=True)
                 return await self.download_folder(credentials, item, sub, progress, sem)
+            if _skip_filtered_item(item, progress):
+                progress.files_skipped += 1
+                progress.log(f"[File-Filter] Skipped file excluded by filter: {item.get('name') or item.get('server_filename') or item.get('id') or 'file'}")
+                return []
             if _skip_optimize_item(item, progress):
                 progress.files_skipped += 1
                 progress.log(f"[SKIP] File ignored by image optimizer: {item.get('name') or item.get('server_filename') or item.get('id') or 'file'}")
@@ -519,6 +528,12 @@ def safe_name(name: str, is_dir: bool = False) -> str:
     return f'{stem}{ext}'
 
 _safe_name = safe_name
+
+def _skip_filtered_item(item: dict[str, Any], progress: JobState) -> bool:
+    from ..utils.media_converter import should_download_file_item
+    options = (progress.payload or {}).get("options") or {} if hasattr(progress, "payload") and isinstance(progress.payload, dict) else {}
+    return not should_download_file_item(item, options)
+
 
 def _skip_optimize_item(item: dict[str, Any], progress: JobState) -> bool:
     if not (progress.payload.get("options") or {}).get("optimize_image"):

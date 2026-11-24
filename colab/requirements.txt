@@ -13,3 +13,4 @@ gdown>=5.0
 cryptography>=41.0
 telethon>=1.36
 cryptg>=0.4
+Pillow>=10.0

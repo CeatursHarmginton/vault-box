@@ -13,6 +13,13 @@ from ..providers import PROVIDERS
 from ..providers.base import ProviderFailure, close_shared_clients, dict_lock, download_with_retry, is_skippable_download_failure, safe_name
 from ..security import redact
 from ..utils.image_optimizer import VIDEO_EXTENSIONS
+from ..utils.media_converter import (
+    convert_directory,
+    is_auto_convert_enabled,
+    is_file_filter_enabled,
+    resolve_conversion_target,
+    should_download_file_item,
+)
 from ..utils.temp_storage import cleanup_job, job_dirs
 from .progress import JobCancelled, JobState
 
@@ -47,6 +54,78 @@ def _should_process_video_thumbnails(options: dict[str, Any], payload: dict[str,
 def _is_auto_skip_enabled(options: dict[str, Any] | None) -> bool:
     opts = options or {}
     return bool(opts.get("auto_skip") or opts.get("autoSkip"))
+
+
+def _filter_file_items_for_download(
+    job: JobState,
+    source: dict[str, Any],
+    file_items: list[dict[str, Any]],
+    options: dict[str, Any] | None,
+    *,
+    mark_completed: bool = True,
+) -> list[dict[str, Any]]:
+    if not file_items or not is_file_filter_enabled(options):
+        return file_items
+    kept: list[dict[str, Any]] = []
+    skipped_items: list[dict[str, Any]] = []
+    for it in file_items:
+        if should_download_file_item(it, options):
+            kept.append(it)
+        else:
+            it_label = str(it.get("_relative_path") or _item_name(it))
+            job.files_skipped += 1
+            job.log(f"[File-Filter] Skipped file excluded by filter: {it_label}")
+            if mark_completed and not it.get("_parent_folder"):
+                skipped_items.append(it)
+    if skipped_items:
+        _finish_items(job, source, skipped_items)
+    return kept
+
+
+async def _run_auto_convert_stage(
+    job: JobState,
+    input_root: Path,
+    output_parent_dir: Path,
+    outputs: list[Path],
+    options: dict[str, Any],
+    source: dict[str, Any],
+    fallback_items: list[dict[str, Any]] | None = None,
+) -> tuple[Path, list[Path]]:
+    live_opts = _live_options(job, options)
+    if not is_auto_convert_enabled(live_opts):
+        return input_root, outputs
+
+    job.set(status="running", step="converting")
+    conv_dest = output_parent_dir / "converted"
+    conv_dest.mkdir(parents=True, exist_ok=True)
+    summary = await asyncio.to_thread(
+        convert_directory,
+        input_root,
+        conv_dest,
+        live_opts,
+        job,
+        cancel_check=job.check_cancelled,
+    )
+    job.converted_files.extend(summary.get("converted") or [])
+    failed_list = summary.get("failed") or []
+    if failed_list:
+        source_refs = getattr(job, "_source_refs", None) or {}
+        for fail_entry in failed_list:
+            job.files_failed += 1
+            job.files_skipped += 1
+            src_p_str = str(fail_entry.get("source_path") or "")
+            ref_item = source_refs.get(src_p_str)
+            if ref_item is None and fallback_items and len(fallback_items) == 1:
+                ref_item = fallback_items[0]
+            if isinstance(ref_item, dict):
+                _mark_item_skipped(
+                    job,
+                    source,
+                    ref_item,
+                    f"Conversion/validation failed: {fail_entry.get('error') or 'invalid output'}",
+                )
+    valid_outputs = summary.get("outputs") or []
+    return conv_dest, valid_outputs
 
 
 def _norm_check_name(name: str) -> str:
@@ -279,6 +358,14 @@ class _TargetFileChecker:
             except Exception:
                 pass
 
+        if is_auto_convert_enabled(opts):
+            conv_target = resolve_conversion_target(item, opts) or resolve_conversion_target(file_name, opts)
+            if conv_target:
+                stem = PurePosixPath(file_name).stem or file_name
+                conv_name = f"{stem}.{conv_target}"
+                cand_names.add(_norm_check_name(conv_name))
+                cand_names.add(_norm_check_name(safe_name(conv_name)))
+
         cand_names.discard("")
         if not cand_names:
             return False
@@ -310,7 +397,7 @@ class _TargetFileChecker:
             candidate_dir_paths.append([])
 
         for d_path in candidate_dir_paths:
-            if self._normalize_full_rel_key(d_path, file_name) in self._uploaded_rel_keys:
+            if any(self._normalize_full_rel_key(d_path, cn) in self._uploaded_rel_keys for cn in (file_name, *cand_names)):
                 return True
             if await self._exists_in_dir_path(root_id, d_path, cand_names):
                 return True
@@ -470,6 +557,7 @@ async def run_transfer(job: JobState) -> None:
         job.files_uploaded = 0
         job.files_skipped = 0
         job.files_to_upload = 0
+        job.converted_files = []
         job._upload_log_done = 0
         if _is_auto_skip_enabled(options):
             _get_target_checker(job, dst, target, options)
@@ -510,7 +598,11 @@ async def run_transfer(job: JobState) -> None:
                     await item_src.resolve_item_metadata(
                         resolve_creds,
                         item,
-                        resolve_file_names=_is_auto_skip_enabled(options),
+                        resolve_file_names=(
+                            _is_auto_skip_enabled(options)
+                            or is_file_filter_enabled(options)
+                            or is_auto_convert_enabled(options)
+                        ),
                     )
                 except Exception as meta_exc:
                     job.log(f"[Metadata] Lưu ý khi truy vấn tên từ link ({item_url[:60]}): {meta_exc}")
@@ -534,6 +626,14 @@ async def run_transfer(job: JobState) -> None:
 
         # Count individual files in the source list beforehand to prevent incorrect [index/index] counts
         file_items = [item for item in (source.get("items") or []) if not (item.get("type") == "folder" or item.get("is_folder"))]
+        if is_file_filter_enabled(options) and file_items:
+            file_items = _filter_file_items_for_download(job, source, file_items, options, mark_completed=True)
+            if not file_items and not has_folder_batch:
+                job.log(f"[File-Filter] All {job.files_skipped} source file(s) skipped by download filter. Completed!")
+                _mark_remaining_items_completed(job, source)
+                _log_skip_summary(job)
+                job.set(status="completed", step="completed")
+                return
         if options.get("optimize_image"):
             skipped_videos = [item for item in file_items if _is_video_item(item)]
             for item in skipped_videos:
@@ -613,6 +713,12 @@ async def run_transfer(job: JobState) -> None:
                 item_name = _item_name(item)
                 item_size = _item_size(item)
                 item_k = _queue_item_key(source, item)
+
+                if not should_download_file_item(item, live_opts):
+                    job.files_skipped += 1
+                    job.log(f"[File-Filter] Skipped file excluded by filter: {item_name}")
+                    _finish_items(job, source, [item])
+                    return []
 
                 if _is_auto_skip_enabled(live_opts):
                     checker = _get_target_checker(job, dst, target, live_opts)
@@ -740,6 +846,12 @@ async def run_transfer(job: JobState) -> None:
             _log_skip_summary(job)
             job.set(status="completed", step="completed")
             return
+        if not downloaded and is_file_filter_enabled(options) and job.files_skipped and not job.failed_items:
+            job.log(f"[File-Filter] Không có file nào cần tải (đã lọc bỏ {job.files_skipped} file). Hoàn tất!")
+            _mark_remaining_items_completed(job, source)
+            _log_skip_summary(job)
+            job.set(status="completed", step="completed")
+            return
         if not downloaded:
             if job.failed_items:
                 raise ProviderFailure("DOWNLOAD_FAILED", f"All {len(job.failed_items)} item(s) skipped after retries; nothing downloaded", {"failedItems": job.failed_items[:5]})
@@ -763,6 +875,15 @@ async def run_transfer(job: JobState) -> None:
             outputs = await extract_archives(dirs["input"], extract_root, job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
             out_root = extract_root
             job.log(f"Extract stage output files: {len(outputs)}")
+
+        if is_auto_convert_enabled(_live_options(job, options)):
+            out_root, outputs = await _run_auto_convert_stage(
+                job, out_root, dirs["output"], outputs, options, source, fallback_items=items,
+            )
+            if not outputs:
+                if job.failed_items:
+                    raise ProviderFailure("CONVERT_FAILED", f"All {len(job.failed_items)} item(s) failed conversion/validation", {"failedItems": job.failed_items[:5]})
+                raise ProviderFailure("CONVERT_FAILED", "No valid files produced after conversion")
 
         if options.get("optimize_image"):
             job.set(step="optimizing")
@@ -1043,6 +1164,11 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         job.log("No image files found for optimization.")
 
 async def _run_plain_file_batches(job: JobState, dirs: dict[str, Path], source: dict[str, Any], target: dict[str, Any], options: dict[str, Any], src: Any, dst: Any, file_items: list[dict[str, Any]]) -> None:
+    if is_file_filter_enabled(options) and file_items:
+        file_items = _filter_file_items_for_download(job, source, file_items, options, mark_completed=True)
+        if not file_items:
+            job.log("[File-Filter] Toàn bộ file riêng lẻ bị loại bỏ bởi bộ lọc tải xuống. Bỏ qua tải!")
+            return
     if _is_auto_skip_enabled(options) and file_items:
         checker = _get_target_checker(job, dst, target, options)
         missing_files: list[dict[str, Any]] = []
@@ -1083,6 +1209,12 @@ async def _run_plain_file_batches(job: JobState, dirs: dict[str, Path], source: 
             item_name = _item_name(item)
             item_size = _item_size(item)
             item_k = _queue_item_key(source, item)
+
+            if not should_download_file_item(item, live_opts):
+                job.files_skipped += 1
+                job.log(f"[File-Filter] Skipped file excluded by filter: {item_name}")
+                _finish_items(job, source, [item])
+                return []
 
             if _is_auto_skip_enabled(live_opts):
                 checker = _get_target_checker(job, dst, target, live_opts)
@@ -1182,11 +1314,22 @@ async def _run_plain_file_batches(job: JobState, dirs: dict[str, Path], source: 
             continue
         _validate_downloads(downloaded, batch_input)
         upload_root = batch_input
+        outputs = downloaded
         if options.get("extract"):
             job.log("Extract enabled: scanning downloaded files for archives...")
             upload_root = batch_output / "extracted"
             outputs = await extract_archives(batch_input, upload_root, job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
             job.log(f"Extract stage output files: {len(outputs)}")
+
+        if is_auto_convert_enabled(_live_options(job, options)):
+            upload_root, outputs = await _run_auto_convert_stage(
+                job, upload_root, batch_output, outputs, options, source, fallback_items=batch_items,
+            )
+            if not outputs:
+                shutil.rmtree(batch_input, ignore_errors=True)
+                shutil.rmtree(batch_output, ignore_errors=True)
+                continue
+
         job.set(status="running", step="uploading")
         await _upload_outputs_with_retry(job, target, options, dst, upload_root, {"type": "folder"})
         shutil.rmtree(batch_input, ignore_errors=True)
@@ -1406,6 +1549,23 @@ async def _run_smart_folder_batches(
             except Exception:
                 folder_files = []
 
+        if folder_files and is_file_filter_enabled(options):
+            kept_folder_files: list[dict[str, Any]] = []
+            for it in folder_files:
+                if should_download_file_item(it, options):
+                    kept_folder_files.append(it)
+                else:
+                    it_rel = it.get("_relative_path") or f"{f_name}/{_item_name(it)}"
+                    job.files_skipped += 1
+                    job.log(f"[File-Filter] Skipped file in folder '{f_name}' excluded by filter: {it_rel}")
+            folder_files = kept_folder_files
+            if not folder_files:
+                job.log(f"[Smart Folder {idx}/{total_groups}] [File-Filter] Toàn bộ file trong thư mục '{f_name}' bị loại bỏ bởi bộ lọc tải xuống. Bỏ qua thư mục!")
+                _finish_items(job, source, [f_item])
+                shutil.rmtree(batch_input, ignore_errors=True)
+                shutil.rmtree(batch_output, ignore_errors=True)
+                continue
+
         if folder_files and _is_auto_skip_enabled(options):
             checker = _get_target_checker(job, dst, target, options)
             missing_folder_files: list[dict[str, Any]] = []
@@ -1451,6 +1611,10 @@ async def _run_smart_folder_batches(
                         it_rel = it.get("_relative_path") or f"{f_name}/{it_name}"
                         it_size = _item_size(it)
                         it_k = _queue_item_key(source, it)
+                        if not should_download_file_item(it, live_opts):
+                            job.files_skipped += 1
+                            job.log(f"[File-Filter] Skipped file excluded by filter: {it_rel}")
+                            return []
                         if _is_auto_skip_enabled(live_opts):
                             checker = _get_target_checker(job, dst, target, live_opts)
                             if await checker.item_exists(it, sub_options, folder_name=f_name):
@@ -1489,6 +1653,17 @@ async def _run_smart_folder_batches(
                     extract_root = batch_output / "extracted"
                     outputs = await extract_archives(batch_input, extract_root, job, _archive_passwords(live_opts), bool(live_opts.get("deleteArchiveAfterExtract")))
                     upload_root = extract_root
+
+                if is_auto_convert_enabled(live_opts):
+                    upload_root, outputs = await _run_auto_convert_stage(
+                        job, upload_root, batch_output, outputs, sub_options, source, fallback_items=[f_item],
+                    )
+                    if not outputs:
+                        shutil.rmtree(batch_input, ignore_errors=True)
+                        shutil.rmtree(batch_output, ignore_errors=True)
+                        batch_input.mkdir(parents=True, exist_ok=True)
+                        batch_output.mkdir(parents=True, exist_ok=True)
+                        continue
 
                 if _should_process_video_thumbnails(live_opts, job.payload):
                     try:
@@ -1551,6 +1726,16 @@ async def _run_smart_folder_batches(
                 upload_root = extract_root
                 job.log(f"Extract stage output files: {len(outputs)}")
 
+            if is_auto_convert_enabled(live_opts):
+                upload_root, outputs = await _run_auto_convert_stage(
+                    job, upload_root, batch_output, outputs, sub_options, source, fallback_items=[f_item],
+                )
+                if not outputs:
+                    shutil.rmtree(batch_input, ignore_errors=True)
+                    shutil.rmtree(batch_output, ignore_errors=True)
+                    _finish_items(job, source, [f_item])
+                    continue
+
             if _should_process_video_thumbnails(live_opts, job.payload):
                 try:
                     from ..utils.video_thumbnail import process_video_thumbnails
@@ -1610,6 +1795,13 @@ async def _run_file_pipeline_batches(
 
     if not file_items:
         return
+
+    if is_file_filter_enabled(options) and file_items:
+        file_items = _filter_file_items_for_download(job, source, file_items, options, mark_completed=True)
+        if not file_items:
+            job.log(f"[Pipeline] [File-Filter] Toàn bộ file đã bị loại bỏ bởi bộ lọc tải xuống. Hoàn tất!")
+            _mark_remaining_items_completed(job, source)
+            return
 
     if _is_auto_skip_enabled(options) and file_items:
         job.log(f"[Auto-Skip] Đang kiểm tra đối chiếu {len(file_items)} file với thư mục đích...")
@@ -1679,6 +1871,13 @@ async def _run_file_pipeline_batches(
         async with dl_sem:
             job.check_cancelled()
             live_opts = _live_options(job, options)
+            if not should_download_file_item(item, live_opts):
+                job.files_skipped += 1
+                job.log(f"[File-Filter] Skipped file excluded by filter: {rel_path}")
+                if not item.get("_parent_folder"):
+                    _finish_items(job, source, [item])
+                shutil.rmtree(pipe_in, ignore_errors=True)
+                return
             if _is_auto_skip_enabled(live_opts):
                 checker = _get_target_checker(job, dst, target, live_opts)
                 parent_folder = item.get("_parent_folder") or {}
@@ -1720,10 +1919,22 @@ async def _run_file_pipeline_batches(
                 raise
 
         upload_root = pipe_in
+        outputs = [p for p in upload_root.rglob("*") if p.is_file()]
         if options.get("extract") and is_archive_name(path.name):
             pipe_out.mkdir(parents=True, exist_ok=True)
             upload_root = pipe_out / "extracted"
-            await extract_archives(pipe_in, upload_root, job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
+            outputs = await extract_archives(pipe_in, upload_root, job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
+
+        if is_auto_convert_enabled(_live_options(job, options)):
+            pipe_out.mkdir(parents=True, exist_ok=True)
+            upload_root, outputs = await _run_auto_convert_stage(
+                job, upload_root, pipe_out, outputs, options, source, fallback_items=[item],
+            )
+            if not outputs:
+                if options.get("cleanupAfterFinish", True):
+                    shutil.rmtree(pipe_in, ignore_errors=True)
+                    shutil.rmtree(pipe_out, ignore_errors=True)
+                return
 
         if _should_process_video_thumbnails(options, job.payload):
             try:
