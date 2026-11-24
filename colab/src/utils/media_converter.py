@@ -451,13 +451,16 @@ def parse_auto_convert_config(options: dict[str, Any] | None) -> dict[str, Categ
 
     if isinstance(raw, dict):
         master_enabled = raw.get("enabled")
+        is_master_on = master_enabled is True or str(master_enabled).strip().lower() in ("true", "1")
+        if not is_master_on:
+            return {
+                "image": CategoryConvertRule("image", enabled=False, input_mode="all", input_formats=[], output_formats=["jpg"], target_format="jpg"),
+                "video": CategoryConvertRule("video", enabled=False, input_mode="except", input_formats=["gif"], output_formats=["mp4"], target_format="mp4"),
+            }
         img_raw = raw.get("image") or raw.get("images") or {}
         vid_raw = raw.get("video") or raw.get("videos") or {}
         img_rule = _parse_single_category_rule("image", img_raw, SUPPORTED_IMAGE_OUTPUT_FORMATS, "jpg")
         vid_rule = _parse_single_category_rule("video", vid_raw, SUPPORTED_VIDEO_OUTPUT_FORMATS, "mp4")
-        if master_enabled is False:
-            img_rule.enabled = False
-            vid_rule.enabled = False
         return {"image": img_rule, "video": vid_rule}
 
     return {

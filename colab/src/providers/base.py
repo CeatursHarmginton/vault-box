@@ -110,7 +110,9 @@ def is_retryable_download_failure(exc: BaseException) -> bool:
 def is_skippable_download_failure(exc: BaseException) -> bool:
     return isinstance(exc, ProviderFailure) and exc.code in SKIPPABLE_DOWNLOAD_CODES
 
-def retry_delay_for(exc: ProviderFailure, delay: float = DOWNLOAD_RETRY_DELAY) -> float:
+def retry_delay_for(exc: ProviderFailure, delay: float = DOWNLOAD_RETRY_DELAY, attempt: int = 0) -> float:
+    if exc.code == "PROVIDER_RATE_LIMITED":
+        return max(delay, 12.0 * (attempt + 1))
     return delay if exc.code in {"PROVIDER_NEEDS_VERIFY", "PROVIDER_RATE_LIMITED"} else 0.0
 
 async def sleep_cancellable(seconds: float, progress: JobState) -> None:
@@ -137,7 +139,9 @@ async def download_with_retry(
     The last failure propagates so the caller can skip the item.
     """
     last: ProviderFailure | None = None
-    for attempt in range(max(1, retries + 1)):
+    max_retries = retries
+    attempt = 0
+    while attempt <= max_retries:
         progress.check_cancelled()
         try:
             return await factory()
@@ -145,12 +149,15 @@ async def download_with_retry(
             if not is_retryable_download_failure(exc):
                 raise
             last = exc
-            if attempt >= retries:
+            if exc.code == "PROVIDER_RATE_LIMITED" and max_retries < 5:
+                max_retries = 5
+            if attempt >= max_retries:
                 break
-            wait = retry_delay_for(exc, delay)
+            wait = retry_delay_for(exc, delay, attempt)
             suffix = f"in {int(wait)}s" if wait else "now"
-            progress.log(f"[RETRY {attempt + 1}/{retries}] Download failed ({exc.message}); retrying {label} {suffix}")
+            progress.log(f"[RETRY {attempt + 1}/{max_retries}] Download failed ({exc.message}); retrying {label} {suffix}")
             await sleep_cancellable(wait, progress)
+            attempt += 1
     raise last or ProviderFailure("DOWNLOAD_FAILED", f"Download failed: {label}")
 
 class BaseProvider(ABC):

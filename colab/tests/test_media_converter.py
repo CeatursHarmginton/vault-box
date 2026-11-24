@@ -255,6 +255,38 @@ class MediaConverterAndFilterTests(TestCase):
         self.assertTrue(should_png)
         self.assertEqual(target_png, "jpg")
 
+    def test_auto_convert_disabled_when_master_toggle_is_false_or_missing(self) -> None:
+        # Case 1: master enabled is explicitly False, even if sub-rules say enabled: True
+        opts_false = {
+            "auto_convert": {
+                "enabled": False,
+                "video": {"enabled": True, "target_format": "mp4"},
+                "image": {"enabled": True, "target_format": "jpg"},
+            }
+        }
+        self.assertFalse(is_auto_convert_enabled(opts_false))
+        cfg_false = parse_auto_convert_config(opts_false)
+        self.assertFalse(cfg_false["video"].enabled)
+        self.assertFalse(cfg_false["image"].enabled)
+        _, should_conv, _, reason = resolve_conversion_decision("video.m4v", opts_false)
+        self.assertFalse(should_conv)
+        self.assertEqual(reason, "disabled")
+
+        # Case 2: master enabled is None or missing, sub-rules say enabled: True
+        opts_missing = {
+            "auto_convert": {
+                "video": {"enabled": True, "target_format": "mp4"},
+            }
+        }
+        self.assertFalse(is_auto_convert_enabled(opts_missing))
+        _, should_conv2, _, reason2 = resolve_conversion_decision("video.m4v", opts_missing)
+        self.assertFalse(should_conv2)
+        self.assertEqual(reason2, "disabled")
+
+        # Case 3: Empty options
+        self.assertFalse(is_auto_convert_enabled({}))
+        self.assertFalse(is_auto_convert_enabled(None))
+
     def test_validate_converted_image_and_corruption_detection(self) -> None:
         valid_img_path = self.src_dir / "valid.png"
         img = Image.new("RGB", (100, 100), color="red")

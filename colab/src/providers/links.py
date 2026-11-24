@@ -2726,7 +2726,7 @@ class LinksProvider(BaseProvider):
 
     def _mark_mega_direct_quota_exceeded(self, progress: JobState | None = None) -> None:
         now = time.time()
-        type(self)._mega_direct_cooldown_until = now + 600.0
+        type(self)._mega_direct_cooldown_until = now + 10800.0  # 3 hours cooldown
         type(self)._mega_direct_was_throttled = True
         if progress and (now - type(self)._mega_direct_notice_ts) >= 30.0:
             type(self)._mega_direct_notice_ts = now
@@ -2815,8 +2815,12 @@ class LinksProvider(BaseProvider):
                                 saw_rl = True
                                 if not use_tor:
                                     self._mark_mega_direct_quota_exceeded(progress)
+                                    rotate_cli = True
+                                    saw_rl = False
+                                    await asyncio.sleep(0.5)
                                 else:
                                     rotate_cli = True
+                                    await asyncio.sleep(1.0 + random.uniform(0.4, 1.2))
                             else:
                                 resp.raise_for_status()
                                 saw_rl = False
@@ -2910,7 +2914,7 @@ class LinksProvider(BaseProvider):
                         saw_rate_limit = False
                         last_exc: Exception | None = None
 
-                        for attempt in range(24):
+                        for attempt in range(36):
                             progress.check_cancelled()
                             if fatal_errors:
                                 return
@@ -2972,8 +2976,13 @@ class LinksProvider(BaseProvider):
                                             saw_rate_limit = True
                                             if not use_tor:
                                                 self._mark_mega_direct_quota_exceeded(progress)
+                                                rotate_circuit = True
+                                                saw_rate_limit = False
+                                                await asyncio.sleep(0.5)
                                             else:
                                                 rotate_circuit = True
+                                                pool = self._get_mega_circuit_pool()
+                                                pool.get("idle", []).clear()
                                         elif resp.status_code in (403, 404, 410):
                                             consecutive_403 += 1
                                             if not use_tor:
@@ -3060,6 +3069,8 @@ class LinksProvider(BaseProvider):
                                 await self._discard_mega_circuit(w_cli)
                                 w_px = None
                                 w_cli = None
+                                if saw_rate_limit:
+                                    await asyncio.sleep(1.2 + random.uniform(0.4, 1.4))
 
                             if need_refresh and refresh_url is not None:
                                 async with refresh_lock:
@@ -3080,7 +3091,7 @@ class LinksProvider(BaseProvider):
                                         w_cli = None
                                 break
 
-                            if not rotate_circuit and not saw_rate_limit and write_pos <= c_end:
+                            if not rotate_circuit and write_pos <= c_end:
                                 if use_tor:
                                     await self._discard_mega_circuit(w_cli)
                                     w_px = None
