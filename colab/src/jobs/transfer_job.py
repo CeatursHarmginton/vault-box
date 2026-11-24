@@ -635,7 +635,11 @@ async def run_transfer(job: JobState) -> None:
                 job.set(status="completed", step="completed")
                 return
         if options.get("optimize_image"):
-            skipped_videos = [item for item in file_items if _is_video_item(item)]
+            auto_convert_on = is_auto_convert_enabled(_live_options(job, options))
+            skipped_videos = [
+                item for item in file_items
+                if _is_video_item(item) and not (auto_convert_on and resolve_conversion_decision(item, options)[1])
+            ]
             for item in skipped_videos:
                 job.files_skipped += 1
                 _record_optimized_skip(job, item, "Skipped")
@@ -645,7 +649,11 @@ async def run_transfer(job: JobState) -> None:
                 job.files_skipped += 1
                 _record_optimized_skip(job, item, "Skipped")
                 job.log(f"[SKIP] Archive ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
-            file_items = [item for item in file_items if not _is_video_item(item) and not (not options.get("extract") and _is_archive_item(item))]
+            file_items = [
+                item for item in file_items
+                if not (_is_video_item(item) and not (auto_convert_on and resolve_conversion_decision(item, options)[1]))
+                and not (not options.get("extract") and _is_archive_item(item))
+            ]
         job.files_to_download = len(file_items)
 
         strategy = str(options.get("transfer_strategy") or options.get("transferStrategy") or "").lower()
@@ -876,6 +884,12 @@ async def run_transfer(job: JobState) -> None:
             out_root = extract_root
             job.log(f"Extract stage output files: {len(outputs)}")
 
+        if is_file_filter_enabled(options) and out_root.exists():
+            for p in list(out_root.rglob("*")):
+                if p.is_file() and not should_download_file_item(p.name, options):
+                    p.unlink(missing_ok=True)
+            outputs = [p for p in out_root.rglob("*") if p.is_file()]
+
         if is_auto_convert_enabled(_live_options(job, options)):
             out_root, outputs = await _run_auto_convert_stage(
                 job, out_root, dirs["output"], outputs, options, source, fallback_items=items,
@@ -899,9 +913,10 @@ async def run_transfer(job: JobState) -> None:
             out_root = opt_dest
             outputs = [p for p in out_root.rglob("*") if p.is_file()]
             
-            # Only ask for confirmation if there are actual optimized image results
+            # Only ask for confirmation if there are actual optimized image results or converted files
+            has_converted = bool(getattr(job, "converted_files", None))
             actual_compressed = [f for f in (job.optimized_files or []) if f.get("status") != "Skipped"]
-            if actual_compressed:
+            if actual_compressed or has_converted:
                 is_opt_page = bool(options.get("is_optimize_page") or payload.get("is_optimize_page") or payload.get("mode") == "optimize" or payload.get("job_type") == "optimize")
                 conf_mode = options.get("confirm_action") or options.get("confirmation_mode")
                 if conf_mode == "replace":
@@ -912,7 +927,7 @@ async def run_transfer(job: JobState) -> None:
                     options["_auto_confirm_upload_new"] = True
                     job.log("Confirmation strategy: auto upload as new (fallback to replace if failed).")
                 else:
-                    action = _wait_for_confirmation(job, len(actual_compressed))
+                    action = _wait_for_confirmation(job, len(actual_compressed) or len(getattr(job, "converted_files", [])))
 
                 if action == "replace":
                     options["replace"] = True
@@ -922,7 +937,7 @@ async def run_transfer(job: JobState) -> None:
                     if has_folder_source:
                         options["upload_prefix"] = f"results/{_selected_folder_name(source)} (optimized)"
             else:
-                job.log("No image files found for optimization, skipping confirmation.")
+                job.log("No files were compressed or converted, skipping confirmation.")
                 
             job.set(status="running", step="uploading")
         if _should_process_video_thumbnails(options, payload):
@@ -1030,18 +1045,21 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         item_name_str = _item_name(item)
         item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
         if item_type != "folder" and _is_video_item(item):
-            job.files_skipped += 1
-            _record_optimized_skip(job, item, "Skipped")
-            job.log(f"[SKIP] Video ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
-            job.finish_item(item_k, status="skipped", name=item_name_str)
-            timing = job.item_timings.get(item_k) or {}
-            job.completed_items.append({
-                **item_ref,
-                "startTime": timing.get("startTime"),
-                "endTime": timing.get("endTime"),
-                "duration": timing.get("duration"),
-            })
-            continue
+            auto_convert_on = is_auto_convert_enabled(_live_options(job, options))
+            should_convert = auto_convert_on and resolve_conversion_decision(item, options)[1]
+            if not should_convert:
+                job.files_skipped += 1
+                _record_optimized_skip(job, item, "Skipped")
+                job.log(f"[SKIP] Video ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
+                job.finish_item(item_k, status="skipped", name=item_name_str)
+                timing = job.item_timings.get(item_k) or {}
+                job.completed_items.append({
+                    **item_ref,
+                    "startTime": timing.get("startTime"),
+                    "endTime": timing.get("endTime"),
+                    "duration": timing.get("duration"),
+                })
+                continue
         if item_type != "folder" and not options.get("extract") and _is_archive_item(item):
             job.files_skipped += 1
             _record_optimized_skip(job, item, "Skipped")
@@ -1056,7 +1074,27 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
             })
             continue
 
+        if item_type != "folder" and is_file_filter_enabled(options) and not should_download_file_item(item, options):
+            job.files_skipped += 1
+            _record_optimized_skip(job, item, "Skipped")
+            job.log(f"[File-Filter] Skipped file excluded by filter: {item.get('name') or item.get('id') or 'file'}")
+            job.finish_item(item_k, status="skipped", name=item_name_str)
+            timing = job.item_timings.get(item_k) or {}
+            job.completed_items.append({
+                **item_ref,
+                "startTime": timing.get("startTime"),
+                "endTime": timing.get("endTime"),
+                "duration": timing.get("duration"),
+            })
+            continue
+
         candidates.append(item)
+
+    if not candidates:
+        job.log("All source items were excluded by filter or optimizer criteria. Completed!")
+        _log_skip_summary(job)
+        job.set(status="completed", step="completed")
+        return
 
     groupable = not any((_item_type(item) == "folder") for item in candidates) and len({_item_scope(source, item) for item in candidates}) <= 1
     groups = _download_batches(candidates, dirs["input"], options, job) if groupable else [[item] for item in candidates]
@@ -1112,6 +1150,19 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
             optimize_input = batch_extract
             job.log(f"Extract stage output files: {len(outputs)}")
 
+        if is_file_filter_enabled(options) and optimize_input.exists():
+            for p in list(optimize_input.rglob("*")):
+                if p.is_file() and not should_download_file_item(p.name, options):
+                    p.unlink(missing_ok=True)
+
+        if is_auto_convert_enabled(_live_options(job, options)):
+            conv_outputs = [p for p in optimize_input.rglob("*") if p.is_file()]
+            conv_root, conv_outputs = await _run_auto_convert_stage(
+                job, optimize_input, dirs["output"] / f"batch-{index}", conv_outputs, options, source, fallback_items=batch_items,
+            )
+            if conv_outputs:
+                optimize_input = conv_root
+
         job.set(step="optimizing")
         job.log(f"Starting image optimization: {_batch_name(batch_items)}")
         batch_results = await asyncio.to_thread(
@@ -1120,15 +1171,16 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         )
         job.optimized_files.extend(batch_results)
         batch_files = [p for p in batch_output.rglob("*") if p.is_file()]
+        has_converted_batch = bool(getattr(job, "converted_files", None))
         if not batch_results and not batch_files:
-            job.log(f"No image files found for optimization: {_batch_name(batch_items)}")
+            job.log(f"No files found for optimization or conversion: {_batch_name(batch_items)}")
             shutil.rmtree(batch_input, ignore_errors=True)
             shutil.rmtree(batch_output.parent, ignore_errors=True)
             if not item_failed:
                 _finish_items(job, source, batch_items)
             continue
 
-        if batch_results and action is None:
+        if (batch_results or has_converted_batch or batch_files) and action is None:
             is_opt_page = bool(options.get("is_optimize_page") or (job.payload or {}).get("is_optimize_page") or (job.payload or {}).get("mode") == "optimize" or (job.payload or {}).get("job_type") == "optimize")
             conf_mode = options.get("confirm_action") or options.get("confirmation_mode")
             if conf_mode == "replace":
@@ -1139,7 +1191,7 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
                 options["_auto_confirm_upload_new"] = True
                 job.log("Confirmation strategy: auto upload as new (fallback to replace if failed).")
             else:
-                action = _wait_for_confirmation(job, len(batch_results))
+                action = _wait_for_confirmation(job, len(batch_results) or len(getattr(job, "converted_files", [])) or len(batch_files))
         action = action or ("replace" if options.get("replace") else "upload_new")
         options["replace"] = action == "replace"
         options.pop("upload_prefix", None)
@@ -1160,8 +1212,8 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         if not item_failed:
             _finish_items(job, source, [item for item in batch_items if not _item_is_failed(job, source, item)])
 
-    if not job.optimized_files and job.files_skipped:
-        job.log("No image files found for optimization.")
+    if not job.optimized_files and not getattr(job, "converted_files", None) and job.files_skipped:
+        job.log("No files found for optimization or conversion.")
 
 async def _run_plain_file_batches(job: JobState, dirs: dict[str, Path], source: dict[str, Any], target: dict[str, Any], options: dict[str, Any], src: Any, dst: Any, file_items: list[dict[str, Any]]) -> None:
     if is_file_filter_enabled(options) and file_items:
