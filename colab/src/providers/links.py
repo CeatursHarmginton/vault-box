@@ -436,7 +436,7 @@ class LinksProvider(BaseProvider):
         if "idle" not in pool:
             pool["idle"] = []  # LIFO stack of verified fast (proxy_url, httpx.AsyncClient)
             pool["rr"] = 0
-            pool["sem"] = asyncio.Semaphore(36)
+            pool["sem"] = asyncio.Semaphore(64)
         return pool
 
     def _acquire_mega_circuit(self, daemons: list[str]) -> tuple[str, httpx.AsyncClient]:
@@ -2939,7 +2939,7 @@ class LinksProvider(BaseProvider):
                                     "mega_dl_direct",
                                     follow_redirects=True,
                                     timeout=httpx.Timeout(connect=20.0, read=45.0, write=30.0, pool=30.0),
-                                    limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
+                                    limits=httpx.Limits(max_connections=160, max_keepalive_connections=80),
                                 )
 
                             curr_url = url_state["dl_url"]
@@ -3203,7 +3203,7 @@ class LinksProvider(BaseProvider):
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"MEGA folder is empty or could not be decrypted: {url}")
         progress.log(f"[MEGA] Resolved {len(nodes)} file(s) inside MEGA folder. Starting download...")
         options = (progress.payload or {}).get("options", {}) if hasattr(progress, "payload") else {}
-        conc = max(1, min(8, int(options.get("download_concurrency") or 4)))
+        conc = max(1, min(24, int(options.get("download_concurrency") or 4)))
         sem = asyncio.Semaphore(conc)
         results: list[Path] = []
 

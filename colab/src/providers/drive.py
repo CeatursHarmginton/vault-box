@@ -122,7 +122,12 @@ class DriveProvider(BaseProvider):
 
     def _client(self) -> httpx.AsyncClient:
         """One keep-alive client per job loop; Drive auth travels in headers, not in the client."""
-        return shared_client("drive", timeout=None, follow_redirects=True)
+        return shared_client(
+            "drive",
+            timeout=httpx.Timeout(connect=20.0, read=180.0, write=180.0, pool=60.0),
+            limits=httpx.Limits(max_connections=128, max_keepalive_connections=64),
+            follow_redirects=True,
+        )
 
     def _cred_bucket(self, owner: Any) -> dict[str, Any]:
         key = "default"
@@ -298,13 +303,28 @@ class DriveProvider(BaseProvider):
         raise AttributeError(f"{client} has no {method.lower()} or request method")
 
     async def _request(self, c: dict[str, Any], method: str, url: str, **kw: Any) -> httpx.Response:
-        headers = self._headers(c, kw.pop("headers", None))
-        resp = await self._send_request(self._client(), method, url, headers=headers, **kw)
-        if resp.status_code == 401:
-            raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive token expired or revoked")
-        if resp.status_code >= 400:
-            raise ProviderFailure("UPLOAD_FAILED" if method != "GET" else "DOWNLOAD_FAILED", resp.text[:500], {"status": resp.status_code})
-        return resp
+        base_headers = kw.pop("headers", None)
+        last_exc: Exception | None = None
+        for attempt in range(4):
+            headers = self._headers(c, base_headers)
+            try:
+                resp = await self._send_request(self._client(), method, url, headers=headers, **kw)
+            except (httpx.HTTPError, OSError) as exc:
+                last_exc = exc
+                if attempt < 3:
+                    await asyncio.sleep(min(2 ** attempt, 6) + (0.2 * attempt))
+                    continue
+                raise ProviderFailure("UPLOAD_FAILED" if method != "GET" else "DOWNLOAD_FAILED", f"Drive network error: {exc}") from exc
+            if resp.status_code == 401:
+                raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "Drive token expired or revoked")
+            if resp.status_code in (429, 500, 502, 503, 504) or (resp.status_code == 403 and _is_rate_limit_or_transient_403(resp.text[:500])):
+                if attempt < 3:
+                    await asyncio.sleep(min(2 ** attempt, 6) + (0.25 * attempt))
+                    continue
+            if resp.status_code >= 400:
+                raise ProviderFailure("UPLOAD_FAILED" if method != "GET" else "DOWNLOAD_FAILED", resp.text[:500], {"status": resp.status_code})
+            return resp
+        raise ProviderFailure("UPLOAD_FAILED" if method != "GET" else "DOWNLOAD_FAILED", f"Drive request failed: {last_exc or 'rate limited'}")
 
     def _update_cookies_from_response(self, credentials: dict[str, Any], resp: httpx.Response) -> None:
         if not resp:

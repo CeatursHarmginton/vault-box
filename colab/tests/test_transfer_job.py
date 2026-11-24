@@ -6968,6 +6968,99 @@ def test_telegram_tail_salvage_remuxes_95pct_video_or_rejects_broken_moov(monkey
     assert final == dest_file
 
 
+def test_relay_progress_delta_emits_only_changed_heavy_fields():
+    from src import relay_client
+
+    job = JobState(
+        "relay-delta-1",
+        {
+            "source": {"items": [{"id": f"f{i}", "name": f"file_{i}.mp4"} for i in range(100)]},
+            "options": {"download_concurrency": 8, "download_threads": 32},
+        },
+    )
+    job.status = "running"
+    job.step = "downloading"
+    for i in range(10):
+        job.log(f"line-{i}")
+    job.downloaded_files.add("file_0.mp4")
+    job.file_sizes["file_0.mp4"] = 1000
+    job.start_item("mega::f0", name="file_0.mp4")
+
+    delta = relay_client._JobProgressDelta()
+    snap = job.view()
+    delta.seed(snap)
+
+    # Pure byte/speed progress update should omit heavy unchanged collections
+    job.add_bytes(4096, 100000, "download", "file_1.mp4")
+    p1 = delta.build_progress_payload(job.view())
+    assert p1["bytesDone"] == 4096
+    assert "items" not in p1
+    assert "options" not in p1
+    assert "logs" not in p1
+    assert "downloadedFiles" not in p1
+    assert "fileSizes" not in p1
+    assert "itemTimings" not in p1
+
+    # New log lines, file size, and downloaded file should emit only deltas (+ overlap tail)
+    job.log("line-10")
+    job.log("line-11")
+    job.downloaded_files.add("file_1.mp4")
+    job.file_sizes["file_1.mp4"] = 2000
+    p2 = delta.build_progress_payload(job.view())
+    assert p2["downloadedFiles"] == ["file_1.mp4"]
+    assert p2["fileSizes"] == {"file_1.mp4": 2000}
+    assert p2["logs"] == ["line-5", "line-6", "line-7", "line-8", "line-9", "line-10", "line-11"]
+    assert "items" not in p2
+
+
+def test_relay_monitor_throttles_high_frequency_logs_and_bytes(monkeypatch):
+    from src import relay_client
+
+    sent_msgs = []
+
+    class CaptureSocket:
+        async def send(self, raw):
+            sent_msgs.append(json.loads(raw))
+
+    class Manager:
+        def __init__(self, job):
+            self.jobs = {job.job_id: job}
+
+        def get(self, job_id):
+            return self.jobs.get(job_id)
+
+    job = JobState("relay-throttle-1", {"source": {"items": [{"id": "1", "name": "a.mp4"}]}})
+    job.status = "running"
+    job.step = "downloading"
+    init_view = job.view()
+
+    monkeypatch.setattr(relay_client, "PROGRESS_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(relay_client, "PROGRESS_MIN_SEND_INTERVAL", 0.15)
+
+    async def scenario():
+        task = asyncio.create_task(relay_client._monitor(CaptureSocket(), Manager(job), job.job_id, initial_view=init_view))
+        # Burst 10 byte + log mutations rapidly within < 0.08s
+        for i in range(10):
+            job.add_bytes(1024, 100000, "download", "a.mp4")
+            job.log(f"burst-{i}")
+            await asyncio.sleep(0.005)
+        count_during_burst = len(sent_msgs)
+        await asyncio.sleep(0.18)
+        count_after_window = len(sent_msgs)
+        job.status = "completed"
+        job.step = "completed"
+        await task
+        return count_during_burst, count_after_window
+
+    during_burst, after_window = asyncio.run(scenario())
+    assert during_burst <= 1
+    assert after_window >= 1
+    assert sent_msgs[-1]["type"] == "done"
+    assert sent_msgs[-1]["job"]["status"] == "completed"
+
+
+
+
 
 
 

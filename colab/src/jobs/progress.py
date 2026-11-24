@@ -353,33 +353,40 @@ class JobState:
         return cur
 
     def view(self) -> dict[str, Any]:
-        options = self.payload.get("options") or {}
+        options = dict(self.payload.get("options") or {}) if isinstance(self.payload, dict) else {}
         phases = ["download"]
         if options.get("extract"):
             phases.append("extract")
         if options.get("optimize_image"):
             phases.append("optimize")
         phases.append("upload")
+        active_files = {
+            k: (dict(v) if isinstance(v, dict) else v)
+            for k, v in list(self.active_files.items())
+        }
+        phase_done_vals = list(self._phase_done_by_name.values())
+        phase_total_vals = list(self._phase_total_by_name.values())
+        src_items = ((self.payload.get("source") or {}).get("items") or []) if isinstance(self.payload, dict) else []
         return {
             "jobId": self.job_id,
             "status": self.status,
             "step": self.step,
-            "progress": self.progress.__dict__,
+            "progress": dict(self.progress.__dict__),
             "phases": phases,
             "options": options,
             "currentFile": self.current_file,
             "lastActiveFile": self.last_active_file or self.current_file,
-            "activeFiles": self.active_files,
-            "fileSizes": self.file_sizes,
+            "activeFiles": active_files,
+            "fileSizes": dict(self.file_sizes),
             "downloadedFiles": list(self.downloaded_files),
             "uploadedFiles": list(self.uploaded_files),
             "bytesDone": self._phase_done or self.bytes_done,
             "bytesTotal": self._phase_total or self.bytes_total,
-            "bytesOverallDone": sum(self._phase_done_by_name.values()) or self.bytes_done,
-            "bytesOverallTotal": sum(self._phase_total_by_name.values()) or self.bytes_total,
+            "bytesOverallDone": sum(phase_done_vals) or self.bytes_done,
+            "bytesOverallTotal": sum(phase_total_vals) or self.bytes_total,
             "bytesCumulative": self.bytes_done,
             "speed": self.speed,
-            "logs": self.logs[-500:],
+            "logs": list(self.logs[-500:]),
             "error": self.error,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
@@ -389,17 +396,20 @@ class JobState:
             "filesSkipped": self.files_skipped,
             "filesFailed": self.files_failed,
             "filesToUpload": self.files_to_upload,
-            "optimizedFiles": self.optimized_files,
-            "completedItems": self.completed_items,
-            "failedItems": self.failed_items,
-            "failedFiles": self.failed_files[-50:],
-            "itemTimings": self.item_timings,
+            "optimizedFiles": list(self.optimized_files),
+            "completedItems": list(self.completed_items),
+            "failedItems": list(self.failed_items),
+            "failedFiles": list(self.failed_files[-50:]),
+            "itemTimings": {
+                k: (dict(v) if isinstance(v, dict) else v)
+                for k, v in list(self.item_timings.items())
+            },
             "confirmAction": self.confirm_action,
             # Source item list, so the app can rebuild the per-item queue view after a
             # restart or when it reconnects to a job it did not start itself.
-            "items": [item for item in ((self.payload.get("source") or {}).get("items") or []) if isinstance(item, dict)],
-            "targetProvider": (self.payload.get("target") or {}).get("provider"),
-            "targetAccountId": (self.payload.get("target") or {}).get("accountId") or (self.payload.get("target") or {}).get("account_id"),
+            "items": [dict(item) for item in list(src_items) if isinstance(item, dict)],
+            "targetProvider": (self.payload.get("target") or {}).get("provider") if isinstance(self.payload, dict) else None,
+            "targetAccountId": ((self.payload.get("target") or {}).get("accountId") or (self.payload.get("target") or {}).get("account_id")) if isinstance(self.payload, dict) else None,
         }
 
     def save_state(self) -> None:
