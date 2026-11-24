@@ -341,6 +341,10 @@ class CategoryConvertRule:
         if ext in accepted_outputs:
             return False, None, f"already_accepted:{ext}"
 
+        # Always exclude gif from video conversion (user requirement: all types to mp4 except gif)
+        if self.category == "video" and ext == "gif":
+            return False, None, "excluded:gif"
+
         if self.input_mode == "include":
             inc_set = {normalize_format_ext(f, category=self.category) for f in self.input_formats if f}
             if ext not in inc_set:
@@ -367,6 +371,15 @@ def _parse_single_category_rule(
     default_output: str,
 ) -> CategoryConvertRule:
     if not isinstance(raw_rule, dict):
+        if category == "video":
+            return CategoryConvertRule(
+                category=category,
+                enabled=False,
+                input_mode="except",
+                input_formats=["gif"],
+                output_formats=[default_output],
+                target_format=default_output,
+            )
         return CategoryConvertRule(
             category=category,
             enabled=False,
@@ -377,16 +390,20 @@ def _parse_single_category_rule(
         )
 
     enabled = bool(raw_rule.get("enabled", False))
-    input_mode = str(raw_rule.get("input_mode") or raw_rule.get("inputMode") or "all").strip().lower()
+    default_mode = "except" if category == "video" else "all"
+    input_mode = str(raw_rule.get("input_mode") or raw_rule.get("inputMode") or default_mode).strip().lower()
     if input_mode == "exclude":
         input_mode = "except"
     if input_mode not in ("all", "include", "except"):
-        input_mode = "all"
+        input_mode = default_mode
 
+    raw_input_fmts = raw_rule.get("input_formats") if "input_formats" in raw_rule else raw_rule.get("inputFormats")
     input_formats = normalize_format_list(
-        raw_rule.get("input_formats") if "input_formats" in raw_rule else raw_rule.get("inputFormats"),
+        raw_input_fmts,
         category=category,
     )
+    if category == "video" and input_mode == "except" and raw_input_fmts is None and not input_formats:
+        input_formats = ["gif"]
 
     raw_outputs = (
         raw_rule.get("output_formats")
@@ -444,8 +461,8 @@ def parse_auto_convert_config(options: dict[str, Any] | None) -> dict[str, Categ
         return {"image": img_rule, "video": vid_rule}
 
     return {
-        "image": CategoryConvertRule("image", enabled=False, output_formats=["jpg"], target_format="jpg"),
-        "video": CategoryConvertRule("video", enabled=False, output_formats=["mp4"], target_format="mp4"),
+        "image": CategoryConvertRule("image", enabled=False, input_mode="all", input_formats=[], output_formats=["jpg"], target_format="jpg"),
+        "video": CategoryConvertRule("video", enabled=False, input_mode="except", input_formats=["gif"], output_formats=["mp4"], target_format="mp4"),
     }
 
 

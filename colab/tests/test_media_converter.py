@@ -206,6 +206,55 @@ class MediaConverterAndFilterTests(TestCase):
         self.assertFalse(should_mov)
         self.assertEqual(reason_mov, "excluded:mov")
 
+    def test_auto_convert_defaults_video_to_mp4_except_gif_and_image_to_jpg(self) -> None:
+        # Default options when video and image conversion are enabled without custom filters
+        opts = {
+            "auto_convert": {
+                "enabled": True,
+                "video": {
+                    "enabled": True,
+                },
+                "image": {
+                    "enabled": True,
+                },
+            }
+        }
+        cfg = parse_auto_convert_config(opts)
+        # Check Video default rule: mode except, input_formats ['gif'], output_formats ['mp4'], target 'mp4'
+        self.assertEqual(cfg["video"].input_mode, "except")
+        self.assertIn("gif", cfg["video"].input_formats)
+        self.assertEqual(cfg["video"].output_formats, ["mp4"])
+        self.assertEqual(cfg["video"].target_format, "mp4")
+
+        # Check Image default rule: mode all, output_formats ['jpg'], target 'jpg'
+        self.assertEqual(cfg["image"].input_mode, "all")
+        self.assertEqual(cfg["image"].output_formats, ["jpg"])
+        self.assertEqual(cfg["image"].target_format, "jpg")
+
+        # Test video file (MKV) converts to MP4
+        cat_mkv, should_mkv, target_mkv, _ = resolve_conversion_decision("sample.mkv", opts)
+        self.assertEqual(cat_mkv, "video")
+        self.assertTrue(should_mkv)
+        self.assertEqual(target_mkv, "mp4")
+
+        # Test video file already MP4 is skipped
+        cat_mp4, should_mp4, target_mp4, reason_mp4 = resolve_conversion_decision("sample.mp4", opts)
+        self.assertEqual(cat_mp4, "video")
+        self.assertFalse(should_mp4)
+        self.assertEqual(reason_mp4, "already_accepted:mp4")
+
+        # Test GIF file is NOT converted by video conversion (even if only video conversion enabled)
+        vid_only_opts = {"auto_convert": {"enabled": True, "video": {"enabled": True}}}
+        cat_gif, should_gif, target_gif, _ = resolve_conversion_decision("anim.gif", vid_only_opts)
+        self.assertFalse(should_gif)
+        self.assertIsNone(target_gif)
+
+        # Test Image file (PNG) converts to JPG
+        cat_png, should_png, target_png, _ = resolve_conversion_decision("photo.png", opts)
+        self.assertEqual(cat_png, "image")
+        self.assertTrue(should_png)
+        self.assertEqual(target_png, "jpg")
+
     def test_validate_converted_image_and_corruption_detection(self) -> None:
         valid_img_path = self.src_dir / "valid.png"
         img = Image.new("RGB", (100, 100), color="red")
