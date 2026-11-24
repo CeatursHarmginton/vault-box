@@ -1024,6 +1024,7 @@ async def run_transfer(job: JobState) -> None:
             # Drop provider credential refs and loop-bound semaphores after run.
             job._dynamic_semaphores = []
             payload.get("source", {}).pop("credentials", None)
+            payload.get("source", {}).pop("relayConfig", None)
             payload.get("target", {}).pop("credentials", None)
             job.save_state()
 
@@ -1515,7 +1516,8 @@ async def _resolve_smart_folder_units(
             continue
 
         try:
-            listing = item.pop("_prefetched_listing", None) if isinstance(item.get("_prefetched_listing"), dict) else None
+            prefetched = item.get("_prefetched_listing") if isinstance(item.get("_prefetched_listing"), dict) else None
+            listing = item.pop("_prefetched_listing", None) if prefetched is not None else None
             if listing is None:
                 listing = await item_src.list_files(item_creds, folder_id)
             resolved_title = str(listing.get("name") or "").strip()
@@ -1538,16 +1540,18 @@ async def _resolve_smart_folder_units(
             for sf in subfolders:
                 sf_copy = dict(sf)
                 sf_copy["_parent_prefix"] = f_name
-                sf_copy["credentials"] = item_creds
-                sf_copy["provider"] = item_prov
+                sf_copy.setdefault("credentials", item_creds)
+                sf_copy.setdefault("provider", item_prov)
                 resolved_folders.append(sf_copy)
             for cf in child_files:
                 cf_copy = dict(cf)
                 cf_copy["_parent_prefix"] = f_name
-                cf_copy["credentials"] = item_creds
-                cf_copy["provider"] = item_prov
+                cf_copy.setdefault("credentials", item_creds)
+                cf_copy.setdefault("provider", item_prov)
                 resolved_files.append(cf_copy)
         else:
+            if prefetched is not None:
+                item["_prefetched_listing"] = listing
             resolved_folders.append(item)
 
     return resolved_folders, resolved_files
@@ -1676,9 +1680,12 @@ async def _run_smart_folder_batches(
                         target_dir = batch_input / PurePosixPath(it_rel).parent
                         target_dir.mkdir(parents=True, exist_ok=True)
                         job.start_file(it_name, phase="download", size=it_size, key=it_k)
+                        it_prov = str(it.get("provider") or (it.get("meta") or {}).get("provider") or f_prov).lower()
+                        it_src = PROVIDERS.get(it_prov, f_src)
+                        it_creds = it.get("credentials") if isinstance(it.get("credentials"), dict) else f_creds
                         try:
                             p = await download_with_retry(
-                                lambda: f_src.download_file(f_creds, it, target_dir, job),
+                                lambda: it_src.download_file(it_creds, it, target_dir, job),
                                 progress=job, label=it_name,
                             )
                             act_sz = p.stat().st_size if (p and p.exists()) else it_size

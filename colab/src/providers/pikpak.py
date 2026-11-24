@@ -22,6 +22,7 @@ from ..jobs.progress import JobState
 API = "https://api-drive.mypikpak.com"
 USER = "https://user.mypikpak.com"
 CLIENT_ID = "YNxT9w7GMdWvEOKa"
+CLIENT_SECRET = "dbw2OtmVEeuUvIptb1Coyg"
 CLIENT_VERSION = "1.47.1"
 PACKAGE = "com.pikcloud.pikpak"
 WEB_CLIENT_ID = "YUMx5nI8ZU8Ap8pm"
@@ -114,9 +115,35 @@ class PikPakSession:
         h.update(extra or {})
         return h
 
+    async def refresh(self) -> bool:
+        if not self.refresh_token:
+            return False
+        body: dict[str, Any] = {
+            "client_id": WEB_CLIENT_ID if str(self.device_id).startswith("wdi") else CLIENT_ID,
+            "refresh_token": self.refresh_token,
+            "grant_type": "refresh_token",
+        }
+        if not str(self.device_id).startswith("wdi"):
+            body["client_secret"] = CLIENT_SECRET
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            resp = await client.post(f"{USER}/v1/auth/token", json=body, headers={"Content-Type": "application/json", "Accept": "application/json"})
+        if resp.status_code >= 400:
+            return False
+        data = resp.json() if resp.text else {}
+        if not data.get("access_token"):
+            return False
+        self.access_token = str(data["access_token"])
+        self.refresh_token = str(data.get("refresh_token") or self.refresh_token)
+        if data.get("sub") or data.get("user_id"):
+            self.user_id = str(data.get("sub") or data.get("user_id"))
+        return True
+
     async def req(self, method: str, url: str, **kw: Any) -> dict[str, Any]:
+        extra_headers = kw.pop("headers", None)
         async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
-            resp = await client.request(method, url, headers=self.headers(kw.pop("headers", None)), **kw)
+            resp = await client.request(method, url, headers=self.headers(extra_headers), **kw)
+            if resp.status_code == 401 and self.refresh_token and await self.refresh():
+                resp = await client.request(method, url, headers=self.headers(extra_headers), **kw)
         if resp.status_code == 401:
             raise ProviderFailure("INVALID_PROVIDER_CREDENTIALS", "PikPak token expired or revoked")
         try:
@@ -193,22 +220,249 @@ class PikPakProvider(BaseProvider):
             page_token = next_token
         return {"items": items}
 
+    @staticmethod
+    def _extract_download_urls(info: dict[str, Any]) -> list[str]:
+        urls: list[str] = []
+        for media in info.get("medias") or []:
+            if not isinstance(media, dict) or media.get("is_visible") is False:
+                continue
+            link_url = str(((media.get("link") or {}).get("url") or "")).strip()
+            if link_url.startswith(("http://", "https://")) and link_url not in urls:
+                urls.append(link_url)
+        web_url = str(info.get("web_content_link") or "").strip()
+        if web_url.startswith(("http://", "https://")) and web_url not in urls:
+            urls.append(web_url)
+        return urls
+
+    async def _download_urls(self, urls: list[str], dest: Path, progress: JobState, file_ref: dict[str, Any]) -> Path:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            from .links import LinksProvider
+            from ..jobs.progress import JobCancelled
+
+            links_prov = LinksProvider()
+            await links_prov._ensure_deps()
+            paths = await links_prov._dispatch_download(
+                "direct",
+                False,
+                urls[0],
+                urls,
+                dest.parent,
+                dest.name,
+                progress,
+                file_ref={**file_ref, "name": dest.name, "urls": urls},
+            )
+            valid = [p for p in (paths or []) if p and p.is_file() and p.stat().st_size > 0]
+            if valid:
+                return valid[0]
+        except Exception as exc:
+            if exc.__class__.__name__ == "JobCancelled":
+                raise
+        return await stream_download(str(urls[0]), dest, progress)
+
+    async def _share_req(self, s: PikPakSession, method: str, path: str, **kw: Any) -> dict[str, Any]:
+        url = f"{API}{path}"
+        last: Exception | None = None
+        for action in ("", f"{method.upper()}:{url}", f"{method.upper()}:{path}"):
+            try:
+                if action:
+                    s.captcha = await s.captcha_init(action)
+                return await s.req(method, url, **kw)
+            except ProviderFailure as exc:
+                last = exc
+                if exc.code == "INVALID_PROVIDER_CREDENTIALS":
+                    raise
+            finally:
+                s.captcha = ""
+        raise last or ProviderFailure("DOWNLOAD_FAILED", f"PikPak {path} failed")
+
+    async def _create_share(self, s: PikPakSession, file_id: str) -> tuple[str, str]:
+        data = await self._share_req(
+            s,
+            "POST",
+            "/drive/v1/share",
+            json={
+                "file_ids": [file_id],
+                "share_to": "publiclink",
+                "pass_code_option": "NOT_REQUIRED",
+                "expiration_days": 1,
+            },
+        )
+        share_id = str(data.get("share_id") or data.get("id") or "")
+        if not share_id:
+            raise ProviderFailure("DOWNLOAD_FAILED", "PikPak share did not return share_id")
+        return share_id, str(data.get("pass_code") or "")
+
+    async def _acquire_relay_session(
+        self,
+        relay_cfg: dict[str, Any],
+        file_id: str,
+        file_size: int,
+        share_id: str,
+        pass_code: str,
+        attempt_idx: int = 0,
+    ) -> tuple[PikPakSession, str]:
+        mode = str(relay_cfg.get("mode") or "").lower()
+        if mode == "vaultbox_server":
+            api_base = str(relay_cfg.get("api_base_url") or "").strip().rstrip("/")
+            creds = relay_cfg.get("credentials") if isinstance(relay_cfg.get("credentials"), dict) else {}
+            token = str(creds.get("access_token") or relay_cfg.get("license_key") or "").strip()
+            device_id = str(creds.get("device_id") or "").strip()
+            if not api_base or not token:
+                raise ProviderFailure("DOWNLOAD_FAILED", "Relay server credentials missing")
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "X-VaultBox-Client": "desktop",
+                "X-VaultBox-Device-ID": device_id,
+                "User-Agent": "VaultBox/desktop",
+            }
+            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0), follow_redirects=True) as client:
+                resp = await client.post(
+                    f"{api_base}/api/pikpak-relay/download",
+                    headers=headers,
+                    json={
+                        "file_id": file_id,
+                        "source_account_id": str(relay_cfg.get("source_account_id") or ""),
+                        "source_account_hash": str(relay_cfg.get("source_account_hash") or ""),
+                        "action": "download",
+                        "file_size": int(file_size or 0),
+                        "allow_mutation": True,
+                        "source_share": {"share_id": share_id, "pass_code": pass_code},
+                    },
+                )
+            data = resp.json() if resp.content else {}
+            if resp.status_code >= 400 or not data.get("ok"):
+                raise ProviderFailure("DOWNLOAD_FAILED", str(data.get("message") or data.get("reason") or data.get("error") or f"HTTP {resp.status_code}"))
+            client_relay = data.get("client_relay") if isinstance(data.get("client_relay"), dict) else {}
+            session_dict = client_relay.get("session") if isinstance(client_relay.get("session"), dict) else {}
+            if not session_dict:
+                raise ProviderFailure("DOWNLOAD_FAILED", "Relay server did not return client_relay session")
+            return PikPakSession(session_dict), str(client_relay.get("label") or "VaultBox Server Relay")
+
+        accounts = [a for a in (relay_cfg.get("accounts") or []) if isinstance(a, dict) and isinstance(a.get("credentials"), dict)]
+        if not accounts:
+            raise ProviderFailure("DOWNLOAD_FAILED", "No local PikPak relay accounts available")
+        chosen = accounts[attempt_idx % len(accounts)]
+        return PikPakSession(chosen["credentials"]), str(chosen.get("label") or chosen.get("account_id") or "Local Relay")
+
+    async def _restore_to_relay(
+        self,
+        relay_s: PikPakSession,
+        share_id: str,
+        pass_code: str,
+        file_id: str,
+        progress: JobState,
+        *,
+        timeout: float = 90.0,
+    ) -> str:
+        params: dict[str, Any] = {"share_id": share_id, "limit": "100", "thumbnail_size": "SIZE_LARGE", "order": "3"}
+        if pass_code:
+            params["pass_code"] = pass_code
+        share_info = await self._share_req(relay_s, "GET", "/drive/v1/share", params=params)
+        pass_code_token = str(share_info.get("pass_code_token") or "")
+        restore = await self._share_req(
+            relay_s,
+            "POST",
+            "/drive/v1/share/restore",
+            json={
+                "share_id": share_id,
+                "pass_code_token": pass_code_token,
+                "file_ids": [file_id],
+                "params": {"trace_file_ids": file_id},
+            },
+        )
+        task_id = str(restore.get("restore_task_id") or restore.get("task_id") or "")
+        if not task_id:
+            raise ProviderFailure("DOWNLOAD_FAILED", "PikPak restore did not return task_id")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            progress.check_cancelled()
+            try:
+                task = await relay_s.req("GET", f"{API}/drive/v1/tasks/{task_id}")
+            except ProviderFailure:
+                relay_s.captcha = await relay_s.captcha_init(f"GET:/drive/v1/tasks/{task_id}")
+                try:
+                    task = await relay_s.req("GET", f"{API}/drive/v1/tasks/{task_id}")
+                finally:
+                    relay_s.captcha = ""
+            phase = str(task.get("phase") or "")
+            if phase == "PHASE_TYPE_COMPLETE":
+                try:
+                    mapping = json.loads((task.get("params") or {}).get("trace_file_ids") or "{}")
+                except Exception:
+                    mapping = {}
+                relay_fid = str(mapping.get(file_id) or next((v for v in mapping.values() if v), "") or "")
+                if not relay_fid:
+                    raise ProviderFailure("DOWNLOAD_FAILED", "PikPak restore returned no relay file id")
+                return relay_fid
+            if phase == "PHASE_TYPE_ERROR":
+                raise ProviderFailure("DOWNLOAD_FAILED", "PikPak restore task failed", {"task": task})
+            await asyncio.sleep(1.5)
+        raise ProviderFailure("DOWNLOAD_FAILED", "PikPak restore task timed out")
+
+    async def _download_via_relay(
+        self,
+        credentials: dict[str, Any],
+        file_ref: dict[str, Any],
+        local_path: Path,
+        progress: JobState,
+        relay_cfg: dict[str, Any],
+    ) -> Path:
+        fid = str(file_ref.get("id") or "")
+        file_size = int(file_ref.get("size") or 0)
+        src_session = PikPakSession(credentials)
+        share_id, pass_code = await self._create_share(src_session, fid)
+        relay_session, relay_label = await self._acquire_relay_session(relay_cfg, fid, file_size, share_id, pass_code)
+        relay_fid = ""
+        try:
+            relay_fid = await self._restore_to_relay(relay_session, share_id, pass_code, fid, progress)
+            relay_session.captcha = await relay_session.captcha_init(f"GET:/drive/v1/files/{relay_fid}")
+            try:
+                info = await relay_session.req("GET", f"{API}/drive/v1/files/{relay_fid}")
+            finally:
+                relay_session.captcha = ""
+            urls = self._extract_download_urls(info)
+            if not urls:
+                raise ProviderFailure("DOWNLOAD_FAILED", "PikPak relay did not return download url")
+            dest = (local_path / safe_name(file_ref.get("name") or info.get("name") or fid)) if (local_path.is_dir() or not local_path.suffix) else local_path
+            progress.set(step="downloading", current_file=dest.name)
+            progress.log(f"[PikPak-Relay] Downloading via {relay_label}: {dest.name}")
+            return await self._download_urls(urls, dest, progress, file_ref)
+        finally:
+            if relay_fid and relay_cfg.get("cleanup_after_download", True):
+                try:
+                    await self._batch(relay_session, "batchDelete", [relay_fid])
+                except Exception:
+                    pass
+
     async def download_file(self, credentials: dict[str, Any], file_ref: dict[str, Any], local_path: Path, progress: JobState) -> Path:
-        s = PikPakSession(credentials)
         fid = str(file_ref.get("id") or "")
         if not fid:
             raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "PikPak file id missing")
+        payload_source = (progress.payload.get("source") or {}) if isinstance(getattr(progress, "payload", None), dict) else {}
+        relay_cfg = file_ref.get("relayConfig") or payload_source.get("relayConfig") or {}
+        already_relayed = bool((file_ref.get("relay") or {}).get("used"))
+        if isinstance(relay_cfg, dict) and relay_cfg.get("enabled") and not already_relayed:
+            try:
+                return await self._download_via_relay(credentials, file_ref, local_path, progress, relay_cfg)
+            except Exception as exc:
+                if exc.__class__.__name__ == "JobCancelled":
+                    raise
+                progress.log(f"[PikPak-Relay] Fallback to direct source for {file_ref.get('name') or fid}: {exc}")
+
+        s = PikPakSession(credentials)
         s.captcha = await s.captcha_init(f"GET:/drive/v1/files/{fid}")
         try:
             info = await s.req("GET", f"{API}/drive/v1/files/{fid}")
         finally:
             s.captcha = ""
-        url = info.get("web_content_link") or ((info.get("medias") or [{}])[0].get("link") or {}).get("url")
-        if not url:
+        urls = self._extract_download_urls(info)
+        if not urls:
             raise ProviderFailure("DOWNLOAD_FAILED", "PikPak did not return download url")
         dest = (local_path / safe_name(file_ref.get("name") or info.get("name") or fid)) if (local_path.is_dir() or not local_path.suffix) else local_path
         progress.set(step="downloading", current_file=dest.name)
-        return await stream_download(str(url), dest, progress)
+        return await self._download_urls(urls, dest, progress, file_ref)
 
     async def _create_folder(self, s: PikPakSession, parent_id: str, name: str) -> str:
         payload = {"kind": "drive#folder", "name": name, "parent_id": parent_id or ""}

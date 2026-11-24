@@ -173,7 +173,9 @@ class BaseProvider(ABC):
     async def download_file(self, credentials: dict[str, Any], file_ref: dict[str, Any], local_path: Path, progress: JobState) -> Path: ...
 
     async def download_folder(self, credentials: dict[str, Any], folder_ref: dict[str, Any], local_dir: Path, progress: JobState, _sem: asyncio.Semaphore | None = None) -> list[Path]:
-        listing = await self.list_files(credentials, str(folder_ref.get("id") or folder_ref.get("path") or "/"))
+        listing = folder_ref.pop("_prefetched_listing", None) if isinstance(folder_ref.get("_prefetched_listing"), dict) else None
+        if listing is None:
+            listing = await self.list_files(credentials, str(folder_ref.get("id") or folder_ref.get("path") or "/"))
         items = listing.get("items") or listing.get("files") or []
         progress.log(f"{self.name} list folder {folder_ref.get('name') or folder_ref.get('path') or folder_ref.get('id')}: {len(items)} item(s)")
         eligible = [
@@ -207,22 +209,32 @@ class BaseProvider(ABC):
                 progress.files_skipped += 1
                 progress.log(f"[SKIP] File ignored by image optimizer: {item.get('name') or item.get('server_filename') or item.get('id') or 'file'}")
                 return []
+            rel_sub = str(item.get("_relative_path") or "").replace("\\", "/").strip("/")
+            rel_parts = [p for p in rel_sub.split("/") if p and p not in (".", "..")]
+            rel_parent_parts = [_safe_name(p) for p in rel_parts[:-1]]
+            target_dir = local_dir.joinpath(*rel_parent_parts) if rel_parent_parts else local_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
             checker = getattr(progress, "_target_checker", None)
             if checker is not None and (live_options.get("auto_skip") or live_options.get("autoSkip")):
                 f_name = _safe_name(folder_ref.get("name") or folder_ref.get("path") or folder_ref.get("id") or "folder")
                 item_name_cand = _safe_name(item.get("name") or item.get("server_filename") or item.get("id") or "file")
-                check_item = {**item, "_relative_path": f"{f_name}/{item_name_cand}"}
+                rel_for_check = f"{f_name}/{'/'.join(rel_parts)}" if rel_parts else f"{f_name}/{item_name_cand}"
+                check_item = {**item, "_relative_path": rel_for_check}
                 if await checker.item_exists(check_item, live_options, folder_name=f_name):
                     progress.files_skipped += 1
-                    progress.log(f"[Auto-Skip] File đã tồn tại ở đích, bỏ qua tải: {f_name}/{item_name_cand}")
+                    progress.log(f"[Auto-Skip] File đã tồn tại ở đích, bỏ qua tải: {rel_for_check}")
                     return []
             async with sem:
-                dest = local_dir / _safe_name(item.get("name") or item.get("server_filename") or item.get("id") or "file")
+                from . import PROVIDERS
+                item_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or self.name).lower()
+                item_src = PROVIDERS.get(item_prov, self)
+                item_creds = item.get("credentials") if isinstance(item.get("credentials"), dict) else credentials
+                dest = target_dir / _safe_name(item.get("name") or item.get("server_filename") or item.get("id") or "file")
                 file_sz = int(item.get("size") or 0)
                 progress.start_file(dest.name, phase="download", size=file_sz)
                 try:
                     path = await download_with_retry(
-                        lambda: self.download_file(credentials, item, dest, progress),
+                        lambda: item_src.download_file(item_creds, item, dest, progress),
                         progress=progress, label=dest.name,
                     )
                     actual_sz = path.stat().st_size if (path and path.exists()) else file_sz

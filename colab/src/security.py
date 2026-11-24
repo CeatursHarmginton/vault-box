@@ -11,7 +11,7 @@ from .config import NO_AUTH, SERVER_TOKEN
 SECRET_KEYS = (
     "token", "cookie", "authorization", "access", "refresh",
     "ndus", "bdstoken", "jstoken", "auth_key", "app_hash",
-    "session", "kv_file", "salt", "telegram_auth",
+    "session", "kv_file", "salt", "telegram_auth", "license_key",
 )
 
 def require_token(authorization: str | None = Header(default=None)) -> None:

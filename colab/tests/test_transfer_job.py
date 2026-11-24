@@ -7059,6 +7059,203 @@ def test_relay_monitor_throttles_high_frequency_logs_and_bytes(monkeypatch):
     assert sent_msgs[-1]["job"]["status"] == "completed"
 
 
+def test_pikpak_rolling_relay_downloads_and_cleans_up(tmp_path, monkeypatch):
+    from src.providers.pikpak import PikPakProvider
+
+    prov = PikPakProvider()
+    actions = []
+
+    async def fake_create_share(self, s, file_id):
+        actions.append(("share", s.access_token, file_id))
+        return "share_1", ""
+
+    async def fake_acquire(self, relay_cfg, file_id, file_size, share_id, pass_code, attempt_idx=0):
+        from src.providers.pikpak import PikPakSession
+        actions.append(("acquire", relay_cfg["mode"], file_id, share_id))
+        return PikPakSession({"access_token": "RELAY_TOK", "device_id": "dev_relay"}), "Relay-1"
+
+    async def fake_restore(self, relay_s, share_id, pass_code, file_id, progress, timeout=90.0):
+        actions.append(("restore", relay_s.access_token, share_id, file_id))
+        return "relay_fid_1"
+
+    async def fake_captcha_init(self, action):
+        return "cap_tok"
+
+    async def fake_req(self, method, url, **kw):
+        actions.append(("req", method, url, self.access_token))
+        if "/drive/v1/files/relay_fid_1" in url:
+            return {"name": "clip.mp4", "web_content_link": "https://cdn.relay/clip.mp4", "medias": []}
+        return {}
+
+    async def fake_batch(self, s, op, ids, body=None):
+        actions.append(("batch", op, ids, s.access_token))
+        return {}
+
+    async def fake_download_urls(self, urls, dest, progress, file_ref):
+        actions.append(("download", urls, dest.name))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"video-data")
+        return dest
+
+    from src.providers.pikpak import PikPakSession
+    monkeypatch.setattr(PikPakProvider, "_create_share", fake_create_share)
+    monkeypatch.setattr(PikPakProvider, "_acquire_relay_session", fake_acquire)
+    monkeypatch.setattr(PikPakProvider, "_restore_to_relay", fake_restore)
+    monkeypatch.setattr(PikPakProvider, "_batch", fake_batch)
+    monkeypatch.setattr(PikPakProvider, "_download_urls", fake_download_urls)
+    monkeypatch.setattr(PikPakSession, "captcha_init", fake_captcha_init)
+    monkeypatch.setattr(PikPakSession, "req", fake_req)
+
+    job = JobState("pp-relay-1", {
+        "source": {
+            "provider": "pikpak",
+            "relayConfig": {"enabled": True, "mode": "vaultbox_server", "cleanup_after_download": True},
+        }
+    })
+    out = asyncio.run(prov.download_file({"access_token": "SRC_TOK"}, {"id": "src_fid_1", "name": "clip.mp4", "size": 10}, tmp_path, job))
+
+    assert out.is_file()
+    assert out.read_bytes() == b"video-data"
+    assert ("share", "SRC_TOK", "src_fid_1") in actions
+    assert ("acquire", "vaultbox_server", "src_fid_1", "share_1") in actions
+    assert ("restore", "RELAY_TOK", "share_1", "src_fid_1") in actions
+    assert ("download", ["https://cdn.relay/clip.mp4"], "clip.mp4") in actions
+    assert ("batch", "batchDelete", ["relay_fid_1"], "RELAY_TOK") in actions
+
+
+def test_pikpak_rolling_relay_falls_back_to_direct_on_error(tmp_path, monkeypatch):
+    from src.providers.pikpak import PikPakProvider, PikPakSession
+
+    prov = PikPakProvider()
+
+    async def broken_relay(*args, **kwargs):
+        raise RuntimeError("relay_unavailable")
+
+    async def fake_captcha_init(self, action):
+        return "cap_tok"
+
+    async def fake_req(self, method, url, **kw):
+        return {"name": "clip.mp4", "web_content_link": "https://cdn.src/clip.mp4", "medias": []}
+
+    async def fake_download_urls(self, urls, dest, progress, file_ref):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"direct-data")
+        return dest
+
+    monkeypatch.setattr(PikPakProvider, "_download_via_relay", broken_relay)
+    monkeypatch.setattr(PikPakProvider, "_download_urls", fake_download_urls)
+    monkeypatch.setattr(PikPakSession, "captcha_init", fake_captcha_init)
+    monkeypatch.setattr(PikPakSession, "req", fake_req)
+
+    job = JobState("pp-relay-fallback", {
+        "source": {
+            "provider": "pikpak",
+            "relayConfig": {"enabled": True, "mode": "vaultbox_server"},
+        }
+    })
+    out = asyncio.run(prov.download_file({"access_token": "SRC_TOK"}, {"id": "src_fid_1", "name": "clip.mp4"}, tmp_path, job))
+
+    assert out.read_bytes() == b"direct-data"
+    assert any("Fallback to direct source" in line for line in job.logs)
+
+
+def test_smart_folder_preserves_prefetched_listing_with_links_children(tmp_path, monkeypatch):
+    dst = UploadRecorder()
+    old = dict(PROVIDERS)
+    downloaded_urls = []
+
+    class FakeLinks:
+        async def download_file(self, credentials, file_ref, local_path: Path, progress: JobState):
+            downloaded_urls.append(file_ref.get("id"))
+            local_path.mkdir(parents=True, exist_ok=True)
+            out = local_path / file_ref["name"]
+            out.write_bytes(b"ok")
+            return out
+
+    class FakePikPak:
+        async def list_files(self, credentials, path_or_id):
+            raise AssertionError("list_files should not be called when _prefetched_listing is provided")
+
+    PROVIDERS.update({"pikpak": FakePikPak(), "links": FakeLinks(), "fake-dst": dst})
+    try:
+        job = JobState("smart-prefetch", {
+            "source": {
+                "provider": "pikpak",
+                "items": [{
+                    "id": "folder_1",
+                    "name": "FortuneCutie",
+                    "type": "folder",
+                    "_prefetched_listing": {
+                        "items": [
+                            {"id": "https://cdn.example/1.mp4", "path": "https://cdn.example/1.mp4", "name": "a.mp4", "type": "file", "provider": "links", "credentials": {}, "_relative_path": "a.mp4"},
+                            {"id": "https://cdn.example/2.mp4", "path": "https://cdn.example/2.mp4", "name": "b.mp4", "type": "file", "provider": "links", "credentials": {}, "_relative_path": "Sub/b.mp4"},
+                        ]
+                    },
+                }],
+            },
+            "target": {"provider": "fake-dst", "folder": {"id": "/", "path": "/"}},
+            "options": {"transfer_strategy": "smart_folder", "cleanupAfterFinish": False},
+        })
+        asyncio.run(run_transfer(job))
+    finally:
+        PROVIDERS.clear()
+        PROVIDERS.update(old)
+        __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("smart-prefetch")
+
+    assert job.status == "completed", job.error
+    assert downloaded_urls == ["https://cdn.example/1.mp4", "https://cdn.example/2.mp4"]
+    assert sorted(ref["relative_path"] for ref in dst.target_refs) == ["FortuneCutie/Sub/b.mp4", "FortuneCutie/a.mp4"]
+
+
+def test_file_by_file_uses_prefetched_listing_with_links_children(tmp_path, monkeypatch):
+    dst = UploadRecorder()
+    old = dict(PROVIDERS)
+    downloaded_urls = []
+
+    class FakeLinks:
+        async def download_file(self, credentials, file_ref, local_path: Path, progress: JobState):
+            downloaded_urls.append(file_ref.get("id"))
+            local_path.mkdir(parents=True, exist_ok=True)
+            out = local_path / file_ref["name"]
+            out.write_bytes(b"ok")
+            return out
+
+    class FakePikPak:
+        async def list_files(self, credentials, path_or_id):
+            raise AssertionError("list_files should not be called when _prefetched_listing is provided")
+
+    PROVIDERS.update({"pikpak": FakePikPak(), "links": FakeLinks(), "fake-dst": dst})
+    try:
+        job = JobState("pipeline-prefetch", {
+            "source": {
+                "provider": "pikpak",
+                "items": [{
+                    "id": "folder_1",
+                    "name": "FortuneCutie",
+                    "type": "folder",
+                    "_prefetched_listing": {
+                        "items": [
+                            {"id": "https://cdn.example/1.mp4", "path": "https://cdn.example/1.mp4", "name": "a.mp4", "type": "file", "provider": "links", "credentials": {}, "_relative_path": "a.mp4"},
+                            {"id": "https://cdn.example/2.mp4", "path": "https://cdn.example/2.mp4", "name": "b.mp4", "type": "file", "provider": "links", "credentials": {}, "_relative_path": "Sub/b.mp4"},
+                        ]
+                    },
+                }],
+            },
+            "target": {"provider": "fake-dst", "folder": {"id": "/", "path": "/"}},
+            "options": {"transfer_strategy": "file_by_file", "cleanupAfterFinish": False},
+        })
+        asyncio.run(run_transfer(job))
+    finally:
+        PROVIDERS.clear()
+        PROVIDERS.update(old)
+        __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("pipeline-prefetch")
+
+    assert job.status == "completed", job.error
+    assert sorted(downloaded_urls) == ["https://cdn.example/1.mp4", "https://cdn.example/2.mp4"]
+    assert sorted(ref["relative_path"] for ref in dst.target_refs) == ["FortuneCutie/Sub/b.mp4", "FortuneCutie/a.mp4"]
+
+
+
 
 
 
