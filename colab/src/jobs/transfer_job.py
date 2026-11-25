@@ -593,6 +593,7 @@ async def run_transfer(job: JobState) -> None:
                 item["name"] = cur_name
             if item_prov == "links" and item_url and hasattr(item_src, "resolve_item_metadata"):
                 old_name = str(item.get("name") or "").strip()
+                old_is_folder = bool(item.get("type") == "folder" or item.get("is_folder"))
                 resolve_creds = item.get("credentials") or source.get("credentials") or fallback_drive_creds
                 try:
                     await item_src.resolve_item_metadata(
@@ -607,10 +608,13 @@ async def run_transfer(job: JobState) -> None:
                 except Exception as meta_exc:
                     job.log(f"[Metadata] Lưu ý khi truy vấn tên từ link ({item_url[:60]}): {meta_exc}")
                 new_name = str(item.get("name") or "").strip()
-                if new_name and new_name != old_name:
+                new_is_folder = bool(item.get("type") == "folder" or item.get("is_folder"))
+                if (new_name and new_name != old_name) or (new_is_folder != old_is_folder):
                     meta_changed = True
-                    if item.get("type") == "folder" or item.get("is_folder"):
+                    if new_is_folder and new_name and new_name != old_name:
                         job.log(f"[Folder] Đã nhận diện tên thư mục gốc: '{new_name}' (thay cho {old_name or 'ID'})")
+                    elif new_is_folder and not old_is_folder:
+                        job.log(f"[Folder] Đã nhận diện liên kết thư mục: '{new_name or item_url[:60]}'")
         if meta_changed:
             job.save_state()
         has_folder_batch = any((item.get("type") == "folder" or item.get("is_folder")) for item in items)

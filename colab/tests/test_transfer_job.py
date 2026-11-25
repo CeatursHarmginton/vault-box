@@ -7255,6 +7255,333 @@ def test_file_by_file_uses_prefetched_listing_with_links_children(tmp_path, monk
     assert sorted(ref["relative_path"] for ref in dst.target_refs) == ["FortuneCutie/Sub/b.mp4", "FortuneCutie/a.mp4"]
 
 
+def test_yandex_disk_classification_url_parsing_and_placeholders():
+    from src.providers.links import LinksProvider, is_placeholder_link_name
+
+    provider = LinksProvider()
+    assert provider._classify_link("https://disk.yandex.ru/d/AbCdEf123") == "yandex_disk"
+    assert provider._classify_link("https://disk.yandex.com/i/XyZ987") == "yandex_disk"
+    assert provider._classify_link("https://yadi.sk/d/ShortKey42") == "yandex_disk"
+    assert provider._classify_link("https://disk.360.yandex.com/d/WorkKey99/Sub/ep01.mkv") == "yandex_disk"
+    assert provider._classify_link("https://disk.yandex.ru/public?hash=abc%2Bdef%3D") == "yandex_disk"
+    assert provider._classify_link("https://downloader.disk.yandex.ru/disk/abc/123/hash?filename=Archive.zip") == "direct"
+    assert provider._classify_link("https://yandex.ru/video/preview/1234567890") == "ytdlp"
+    assert provider._classify_link("https://dzen.ru/video/watch/65a1b2c3d4e5") == "ytdlp"
+
+    p_sub = provider._parse_yandex_disk_url("https://disk.360.yandex.com/d/RootKey/Season%201/Ep%20%231.mkv")
+    assert p_sub["kind"] == "d"
+    assert p_sub["public_key"] == "https://disk.yandex.com/d/RootKey"
+    assert p_sub["fallback_public_key"] == "https://disk.yandex.ru/d/RootKey"
+    assert p_sub["path"] == "/Season 1/Ep #1.mkv"
+
+    rebuilt = provider._build_yandex_subitem_url(p_sub["public_key"], p_sub["path"])
+    roundtrip = provider._parse_yandex_disk_url(rebuilt)
+    assert roundtrip["public_key"] == p_sub["public_key"]
+    assert roundtrip["path"] == p_sub["path"]
+
+    p_hash = provider._parse_yandex_disk_url("https://disk.yandex.ru/public?hash=abc%2Bdef%3D%3D")
+    assert p_hash["kind"] == "hash"
+    assert p_hash["public_key"] == "abc+def=="
+    rebuilt_hash = provider._build_yandex_subitem_url(p_hash["public_key"], "/Docs/report 1.pdf")
+    rt_hash = provider._parse_yandex_disk_url(rebuilt_hash)
+    assert rt_hash["public_key"] == "abc+def=="
+    assert rt_hash["path"] == "/Docs/report 1.pdf"
+
+    p_priv = provider._parse_yandex_disk_url("https://disk.yandex.ru/client/disk/MyPrivateFolder")
+    assert p_priv["kind"] == "private"
+
+    assert is_placeholder_link_name("Yandex_AbCdEf123", "https://disk.yandex.ru/d/AbCdEf123") is True
+    assert is_placeholder_link_name("AbCdEf123", "https://disk.yandex.ru/d/AbCdEf123") is True
+    assert is_placeholder_link_name("Episode01.mkv", "https://disk.yandex.ru/d/AbCdEf123/Episode01.mkv") is False
+
+
+def test_yandex_disk_single_file_and_expired_cached_url_refresh(tmp_path, monkeypatch):
+    from src.providers.links import LinksProvider
+
+    provider = LinksProvider()
+    monkeypatch.setattr(LinksProvider, "_ensure_deps", classmethod(lambda cls: asyncio.sleep(0)))
+    api_calls = []
+    aria2_calls = []
+
+    async def fake_yandex_api_get(self, endpoint, params, *, fallback_public_key="", progress=None, proxy=None):
+        api_calls.append((endpoint, dict(params)))
+        if endpoint.endswith("/public/resources"):
+            return {
+                "type": "file",
+                "name": "Real_Archive_2026.7z",
+                "size": 12,
+                "mime_type": "application/x-7z-compressed",
+            }, proxy
+        if endpoint.endswith("/public/resources/download"):
+            return {
+                "href": "https://downloader.disk.yandex.ru/disk/fresh/token?filename=Real_Archive_2026.7z",
+                "method": "GET",
+            }, proxy
+        raise AssertionError(f"Unexpected endpoint {endpoint}")
+
+    async def fake_aria2(self, url, dest_dir, name, progress, headers=None, proxy=None, cookies=None):
+        aria2_calls.append((url, name, proxy))
+        if "stale" in str(url):
+            raise ProviderFailure("DOWNLOAD_FAILED", "HTTP 410 Gone")
+        out = dest_dir / (name or "file.bin")
+        out.write_bytes(b"7z-data-test")
+        return [out]
+
+    monkeypatch.setattr(LinksProvider, "_yandex_api_get", fake_yandex_api_get)
+    monkeypatch.setattr(LinksProvider, "_download_aria2", fake_aria2)
+
+    # 1. Single /i/ file link with placeholder name resolves real name + href
+    item = {"id": "https://yadi.sk/i/FileKey77", "name": "Yandex_FileKey77", "type": "file"}
+    out = asyncio.run(provider.download_file({}, item, tmp_path, JobState("yd-single", {})))
+    assert out.name == "Real_Archive_2026.7z"
+    assert item["name"] == "Real_Archive_2026.7z"
+    assert item["size"] == 12
+    assert aria2_calls[-1][0].startswith("https://downloader.disk.yandex.ru/disk/fresh/")
+
+    # 2. Cached direct URL rejected -> automatically mints fresh href via /download
+    cached_item = {
+        "id": "https://disk.yandex.ru/d/RootKey/Sub/Real_Archive_2026.7z",
+        "name": "Real_Archive_2026.7z",
+        "raw_name": "Real_Archive_2026.7z",
+        "type": "file",
+        "size": 12,
+        "meta": {
+            "provider": "links",
+            "cloud_host": "Yandex Disk",
+            "type": "file",
+            "yandex_public_key": "https://disk.yandex.ru/d/RootKey",
+            "yandex_path": "/Sub/Real_Archive_2026.7z",
+            "yandex_direct_url": "https://downloader.disk.yandex.ru/disk/stale/token",
+            "yandex_direct_ts": __import__("time").time(),
+        },
+    }
+    sub_tmp = tmp_path / "cached_retry"
+    sub_tmp.mkdir()
+    out2 = asyncio.run(provider.download_file({}, cached_item, sub_tmp, JobState("yd-cached", {})))
+    assert out2.name == "Real_Archive_2026.7z"
+    assert any("stale" in c[0] for c in aria2_calls)
+    assert aria2_calls[-1][0].startswith("https://downloader.disk.yandex.ru/disk/fresh/")
+
+
+def test_yandex_disk_folder_paginated_end_to_end_transfer_with_nested_subfolders(tmp_path, monkeypatch):
+    from src.providers.links import LinksProvider
+
+    links_prov = LinksProvider()
+    monkeypatch.setattr(LinksProvider, "_ensure_deps", classmethod(lambda cls: asyncio.sleep(0)))
+
+    api_queries = []
+
+    async def fake_yandex_api_get(self, endpoint, params, *, fallback_public_key="", progress=None, proxy=None):
+        api_queries.append((endpoint, dict(params)))
+        sub_p = params.get("path") or ""
+        offset = int(params.get("offset") or 0)
+        if endpoint.endswith("/public/resources"):
+            if not sub_p:
+                if offset == 0:
+                    return {
+                        "type": "dir",
+                        "name": "Yandex Master Course",
+                        "path": "/",
+                        "_embedded": {
+                            "total": 3,
+                            "limit": 2,
+                            "offset": 0,
+                            "items": [
+                                {
+                                    "name": "intro.mp4",
+                                    "type": "file",
+                                    "size": 5,
+                                    "path": "/intro.mp4",
+                                    "file": "https://downloader.disk.yandex.ru/disk/f1?filename=intro.mp4",
+                                },
+                                {
+                                    "name": "Module 1",
+                                    "type": "dir",
+                                    "path": "/Module 1",
+                                },
+                            ],
+                        },
+                    }, proxy
+                else:
+                    return {
+                        "type": "dir",
+                        "name": "Yandex Master Course",
+                        "path": "/",
+                        "_embedded": {
+                            "total": 3,
+                            "limit": 2,
+                            "offset": 2,
+                            "items": [
+                                {
+                                    "name": "readme.pdf",
+                                    "type": "file",
+                                    "size": 4,
+                                    "path": "/readme.pdf",
+                                    "file": "https://downloader.disk.yandex.ru/disk/f2?filename=readme.pdf",
+                                },
+                            ],
+                        },
+                    }, proxy
+            elif sub_p == "/Module 1":
+                return {
+                    "type": "dir",
+                    "name": "Module 1",
+                    "path": "/Module 1",
+                    "_embedded": {
+                        "total": 1,
+                        "limit": 1000,
+                        "offset": 0,
+                        "items": [
+                            {
+                                "name": "lesson_01.mkv",
+                                "type": "file",
+                                "size": 6,
+                                "path": "/Module 1/lesson_01.mkv",
+                                "file": "https://downloader.disk.yandex.ru/disk/f3?filename=lesson_01.mkv",
+                            },
+                        ],
+                    },
+                }, proxy
+        raise AssertionError(f"Unexpected query: {endpoint} {params}")
+
+    async def fake_aria2(self, url, dest_dir, name, progress, headers=None, proxy=None, cookies=None):
+        payloads = {
+            "intro.mp4": b"12345",
+            "readme.pdf": b"1234",
+            "lesson_01.mkv": b"123456",
+        }
+        out = dest_dir / name
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(payloads[name])
+        return [out]
+
+    monkeypatch.setattr(LinksProvider, "_yandex_api_get", fake_yandex_api_get)
+    monkeypatch.setattr(LinksProvider, "_download_aria2", fake_aria2)
+
+    dst = UploadRecorder()
+    old = dict(PROVIDERS)
+    PROVIDERS.update({"links": links_prov, "fake-dst": dst})
+    try:
+        job = JobState("yd-folder-e2e", {
+            "source": {
+                "provider": "links",
+                "items": [{
+                    "id": "https://disk.yandex.ru/d/CourseHash99",
+                    "path": "https://disk.yandex.ru/d/CourseHash99",
+                    "name": "Yandex_CourseHash99",
+                    "type": "file",
+                    "is_folder": False,
+                    "provider": "links",
+                    "meta": {"provider": "links", "cloud_host": "Yandex Disk", "type": "file"},
+                }],
+            },
+            "target": {"provider": "fake-dst", "folder": {"id": "/", "path": "/"}},
+            "options": {"transfer_strategy": "file_by_file", "cleanupAfterFinish": False},
+        })
+        asyncio.run(run_transfer(job))
+    finally:
+        PROVIDERS.clear()
+        PROVIDERS.update(old)
+        __import__("src.utils.temp_storage", fromlist=["cleanup_job"]).cleanup_job("yd-folder-e2e")
+
+    assert job.status == "completed", job.error
+    src_item = job.payload["source"]["items"][0]
+    assert src_item["type"] == "folder"
+    assert src_item["is_folder"] is True
+    assert src_item["name"] == "Yandex Master Course"
+    assert sorted(ref["relative_path"] for ref in dst.target_refs) == [
+        "Yandex Master Course/Module 1/lesson_01.mkv",
+        "Yandex Master Course/intro.mp4",
+        "Yandex Master Course/readme.pdf",
+    ]
+    # Root listing was prefetched once (page 0 + page 1) and reused without re-fetching root!
+    root_zero_calls = [q for _, q in api_queries if not q.get("path") and int(q.get("offset") or 0) == 0]
+    assert len(root_zero_calls) == 1
+
+
+def test_yandex_disk_429_activates_tor_proxy_and_view_only_falls_back_to_ytdlp(tmp_path, monkeypatch):
+    from src.providers.links import LinksProvider
+
+    provider = LinksProvider()
+    async def _fake_tor(cls, progress=None):
+        return "socks5://127.0.0.1:9050"
+
+    async def _fast_sleep(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(LinksProvider, "_ensure_deps", classmethod(lambda cls: _fast_sleep()))
+    monkeypatch.setattr(LinksProvider, "_ensure_tor_proxy", classmethod(_fake_tor))
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    seen_proxies = []
+
+    class FakeResp:
+        def __init__(self, status_code, body):
+            self.status_code = status_code
+            self._body = body
+            self.text = __import__("json").dumps(body)
+
+        def json(self):
+            return self._body
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.proxy = kwargs.get("proxy")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, endpoint, params=None):
+            seen_proxies.append(self.proxy)
+            pk = (params or {}).get("public_key", "")
+            if "ViewOnlyKey" in pk:
+                return FakeResp(403, {"error": "DiskResourceDownloadDisabledError", "description": "Download disabled"})
+            if self.proxy is None:
+                return FakeResp(429, {"error": "TooManyRequestsError", "description": "Rate limit"})
+            if endpoint.endswith("/public/resources"):
+                return FakeResp(200, {"type": "file", "name": "proxied_video.mp4", "size": 4, "file": "https://downloader.disk.yandex.ru/disk/px"})
+            return FakeResp(200, {"href": "https://downloader.disk.yandex.ru/disk/px"})
+
+    import src.providers.links as links_mod
+    monkeypatch.setattr(links_mod.httpx, "AsyncClient", FakeAsyncClient)
+
+    aria2_px = []
+
+    async def fake_aria2(self, url, dest_dir, name, progress, headers=None, proxy=None, cookies=None):
+        aria2_px.append(proxy)
+        out = dest_dir / name
+        out.write_bytes(b"data")
+        return [out]
+
+    ytdlp_calls = []
+
+    async def fake_ytdlp(self, url, dest_dir, name, progress, **kwargs):
+        ytdlp_calls.append(url)
+        out = dest_dir / (name or "streamed.mp4")
+        out.write_bytes(b"vid!")
+        return [out]
+
+    monkeypatch.setattr(LinksProvider, "_download_aria2", fake_aria2)
+    monkeypatch.setattr(LinksProvider, "_download_ytdlp", fake_ytdlp)
+
+    # 1. HTTP 429 on direct -> switches to isolated Tor SOCKS5 circuit and passes same circuit to downloader
+    out_px = asyncio.run(provider.download_file({}, {"id": "https://disk.yandex.ru/i/RateLimitedKey", "name": "Yandex_RateLimitedKey"}, tmp_path, JobState("yd-429", {})))
+    assert out_px.name == "proxied_video.mp4"
+    assert any(px and "vb_" in px for px in seen_proxies)
+    assert aria2_px and "vb_" in str(aria2_px[-1])
+
+    # 2. View-only link (DiskResourceDownloadDisabledError) -> falls back to yt-dlp stream extraction
+    vo_dir = tmp_path / "vo"
+    vo_dir.mkdir()
+    out_vo = asyncio.run(provider.download_file({}, {"id": "https://disk.yandex.ru/i/ViewOnlyKey", "name": "Yandex_ViewOnlyKey"}, vo_dir, JobState("yd-vo", {})))
+    assert out_vo.name == "streamed.mp4"
+    assert ytdlp_calls == ["https://disk.yandex.ru/i/ViewOnlyKey"]
+
+
+
 
 
 

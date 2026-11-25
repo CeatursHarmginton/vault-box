@@ -17,7 +17,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlencode, urlparse, urljoin, urlunparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse, urljoin, urlunparse
 
 TOR_PROXY = "socks5://127.0.0.1:9050"
 PROXY_SETUP_LOCK: asyncio.Lock | None = None
@@ -56,6 +56,9 @@ _PLACEHOLDER_LINK_NAME_RE = re.compile(
     r"Pixeldrain_[A-Za-z0-9_-]+|"
     r"Gofile_[A-Za-z0-9_-]+|"
     r"Dropbox_Folder_[A-Za-z0-9_-]+|"
+    r"Yandex_Folder_[A-Za-z0-9_-]+|"
+    r"Yandex_[A-Za-z0-9_-]+|"
+    r"Yandex_Public|Yandex_Disk|Yandex_Download|"
     r"tg_[A-Za-z0-9_]+_\d+|"
     r"Telegram_Media|"
     r"cloud_folder|folder|"
@@ -80,8 +83,12 @@ def is_placeholder_link_name(name: str | None, url: str = "") -> bool:
     if url:
         clean_tail = str(url).split("#", 1)[0].split("?", 1)[0].rstrip("/").split("/")[-1].strip()
         if clean_tail and stem in (clean_tail, safe_name(clean_tail)):
-            # For cloud share links where URL tail is an opaque ID (Drive/MEGA/Gofile/Pixeldrain/MediaFire), treat as placeholder
-            if any(h in url.lower() for h in ("drive.google.com", "docs.google.com", "drive.usercontent.google.com", "mega.nz", "mega.co.nz", "gofile.io", "pixeldrain.com", "mediafire.com")):
+            # For cloud share links where URL tail is an opaque ID (Drive/MEGA/Gofile/Pixeldrain/MediaFire/Yandex), treat as placeholder
+            url_low = url.lower()
+            if any(h in url_low for h in ("drive.google.com", "docs.google.com", "drive.usercontent.google.com", "mega.nz", "mega.co.nz", "gofile.io", "pixeldrain.com", "mediafire.com")):
+                return True
+            url_no_q = str(url).split("#", 1)[0].split("?", 1)[0].rstrip("/")
+            if re.search(r"(?:disk\.(?:360\.)?yandex\.[a-z.]+|yadi\.sk)/(?:d|i)/[^/]+$", url_no_q, re.IGNORECASE):
                 return True
     return False
 
@@ -683,6 +690,11 @@ class LinksProvider(BaseProvider):
         if any(h in url_lower for h in ("1drv.ms", "onedrive.live.com", "sharepoint.com")):
             return "onedrive"
 
+        if re.search(r"(?:^|\.)downloader\.disk\.yandex\.[a-z.]+$", parsed.netloc):
+            return "direct"
+        if self._is_yandex_disk_host(parsed.netloc):
+            return "yandex_disk"
+
         if "sorafolder.com" in url_lower:
             return "sorafolder"
 
@@ -705,11 +717,15 @@ class LinksProvider(BaseProvider):
         ytdlp_domains = [
             "youtube", "youtu.be", "tiktok", "bilibili", "vimeo", 
             "dailymotion", "twitch", 
-            "1fichier.com", "pornhub.com"
+            "1fichier.com", "pornhub.com",
+            "dzen.ru", "zen.yandex.", "vh.yandex.",
         ]
         
         if url_lower.endswith(".m3u8") or url_lower.endswith(".mpd") or ".m3u8?" in url_lower or ".mpd?" in url_lower or "/hls/" in url_lower:
             return "stream"
+
+        if re.search(r"(?:^|\.)(?:yandex\.[a-z.]+|ya\.ru)$", parsed.netloc) and "/video/" in parsed.path:
+            return "ytdlp"
             
         for domain in ytdlp_domains:
             if domain in url_lower:
@@ -2250,10 +2266,57 @@ class LinksProvider(BaseProvider):
         if not url:
             return item
         cur_name = str(item.get("name") or "").strip()
-        if not is_placeholder_link_name(cur_name, url):
+        ltype = self._classify_link(url)
+        is_placeholder = is_placeholder_link_name(cur_name, url)
+
+        if ltype == "yandex_disk":
+            yd_parsed = self._parse_yandex_disk_url(url)
+            need_type_probe = yd_parsed.get("kind") in ("d", "hash") and not isinstance(item.get("_prefetched_listing"), dict)
+            if need_type_probe or is_placeholder:
+                try:
+                    folder_title, children, raw_meta = await self._list_yandex_folder_items(url)
+                    if raw_meta and raw_meta.get("type") == "dir":
+                        item["type"] = "folder"
+                        item["is_folder"] = True
+                        if isinstance(item.get("meta"), dict):
+                            item["meta"]["type"] = "folder"
+                            item["meta"]["cloud_host"] = "Yandex Disk"
+                        if folder_title and is_placeholder:
+                            item["name"] = safe_name(folder_title, is_dir=True)
+                        elif cur_name.lower().endswith(".mp4") and is_placeholder:
+                            item["name"] = safe_name(cur_name[:-4], is_dir=True)
+                        item["_prefetched_listing"] = {"name": folder_title, "items": children}
+                    elif raw_meta and raw_meta.get("type") == "file":
+                        item["type"] = "file"
+                        item["is_folder"] = False
+                        real_fname = str(raw_meta.get("name") or "").strip()
+                        real_size = int(raw_meta.get("size") or 0)
+                        if real_fname and is_placeholder:
+                            item["name"] = safe_name(real_fname)
+                        if real_size and not item.get("size"):
+                            item["size"] = real_size
+                        if not isinstance(item.get("meta"), dict):
+                            item["meta"] = {}
+                        meta_d = item["meta"]
+                        meta_d["provider"] = "links"
+                        meta_d["cloud_host"] = "Yandex Disk"
+                        meta_d["type"] = "file"
+                        if real_size:
+                            meta_d["size"] = real_size
+                        if raw_meta.get("mime_type"):
+                            meta_d["mimeType"] = str(raw_meta["mime_type"])
+                        if raw_meta.get("file"):
+                            meta_d["yandex_direct_url"] = str(raw_meta["file"])
+                            meta_d["yandex_direct_ts"] = time.time()
+                        meta_d["yandex_public_key"] = yd_parsed.get("public_key", "")
+                        meta_d["yandex_path"] = yd_parsed.get("path", "")
+                except Exception:
+                    pass
             return item
 
-        ltype = self._classify_link(url)
+        if not is_placeholder:
+            return item
+
         if ltype == "gdrive_folder":
             fid, rk = self._extract_gdrive_id_and_resourcekey(url)
             title = await self._resolve_gdrive_folder_title(fid, rk)
@@ -3689,6 +3752,533 @@ class LinksProvider(BaseProvider):
             name = safe_name(parsed_name) if parsed_name else None
         progress.log("Resolved MediaFire direct download URL")
         return await self._download_aria2(direct, dest_dir, name, progress)
+
+    # -------------------------------------------------------------------------
+    # Yandex Disk Cloud Support (Public Files /i/, Folders & Files /d/, Subpaths, Hash Links)
+    # -------------------------------------------------------------------------
+
+    _YANDEX_PUBLIC_RESOURCES_API = "https://cloud-api.yandex.net/v1/disk/public/resources"
+    _YANDEX_PUBLIC_DOWNLOAD_API = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
+
+    @staticmethod
+    def _is_yandex_disk_host(netloc: str) -> bool:
+        host = str(netloc or "").lower().split(":", 1)[0]
+        if host in ("yadi.sk", "www.yadi.sk"):
+            return True
+        return bool(re.search(r"(?:^|\.)disk\.(?:360\.)?yandex\.[a-z.]+$", host))
+
+    @staticmethod
+    def _parse_yandex_disk_url(url: str) -> dict[str, str]:
+        raw = str(url or "").strip()
+        if not raw:
+            return {"kind": "", "public_key": "", "fallback_public_key": "", "path": "", "short_id": ""}
+        parsed = urlparse(raw)
+        netloc = parsed.netloc.lower().split(":", 1)[0]
+        scheme = parsed.scheme or "https"
+        api_host = re.sub(r"^(?:www\.)?disk\.360\.yandex\.", "disk.yandex.", netloc)
+        if api_host == "www.yadi.sk":
+            api_host = "yadi.sk"
+        parts = [p for p in parsed.path.split("/") if p]
+        qs = parse_qs(parsed.query)
+
+        if parts and parts[0].lower() == "client":
+            return {"kind": "private", "public_key": "", "fallback_public_key": "", "path": "", "short_id": ""}
+
+        if len(parts) >= 2 and parts[0].lower() in ("d", "i"):
+            kind = parts[0].lower()
+            key = parts[1]
+            public_key = f"{scheme}://{api_host}/{kind}/{key}"
+            fallback_pk = f"https://disk.yandex.ru/{kind}/{key}"
+            sub_path = ""
+            if kind == "d" and len(parts) > 2:
+                decoded_segs = [unquote(seg) for seg in parts[2:] if seg]
+                if decoded_segs:
+                    sub_path = "/" + "/".join(decoded_segs)
+            elif qs.get("vb_path") or qs.get("path"):
+                q_sub = str((qs.get("vb_path") or qs.get("path") or [""])[0]).strip()
+                if q_sub and q_sub != "/":
+                    sub_path = "/" + q_sub.lstrip("/")
+            return {
+                "kind": kind,
+                "public_key": public_key,
+                "fallback_public_key": fallback_pk if fallback_pk != public_key else "",
+                "path": sub_path,
+                "short_id": key,
+            }
+
+        if qs.get("hash"):
+            raw_hash = str(qs["hash"][0]).strip()
+            q_sub = str((qs.get("vb_path") or qs.get("path") or [""])[0]).strip()
+            sub_path = ("/" + q_sub.lstrip("/")) if (q_sub and q_sub != "/") else ""
+            short_id = hashlib.sha1(raw_hash.encode("utf-8", errors="ignore")).hexdigest()[:10]
+            return {
+                "kind": "hash",
+                "public_key": raw_hash,
+                "fallback_public_key": "",
+                "path": sub_path,
+                "short_id": short_id,
+            }
+
+        return {
+            "kind": "unknown",
+            "public_key": raw,
+            "fallback_public_key": "",
+            "path": "",
+            "short_id": parts[-1] if parts else "yandex",
+        }
+
+    @staticmethod
+    def _build_yandex_subitem_url(public_key: str, sub_path: str) -> str:
+        clean_sub = ("/" + sub_path.strip("/")) if (sub_path and sub_path.strip("/")) else ""
+        if public_key.startswith(("http://", "https://")) and "/d/" in public_key:
+            if not clean_sub:
+                return public_key
+            encoded = "/".join(quote(seg, safe="") for seg in clean_sub.strip("/").split("/") if seg)
+            return f"{public_key.rstrip('/')}/{encoded}"
+        if clean_sub:
+            return f"https://disk.yandex.ru/public?{urlencode({'hash': public_key, 'path': clean_sub})}"
+        return f"https://disk.yandex.ru/public?{urlencode({'hash': public_key})}"
+
+    @staticmethod
+    def _normalize_yandex_child_path(child: dict[str, Any], parent_subpath: str = "", root_api_path: str = "") -> str:
+        raw_p = str(child.get("path") or "").strip()
+        cname = str(child.get("name") or "").strip("/")
+        parent_clean = str(parent_subpath or "").rstrip("/")
+        if raw_p.startswith("disk:"):
+            root_clean = str(root_api_path or "").rstrip("/")
+            if root_clean.startswith("disk:") and raw_p.startswith(root_clean + "/"):
+                rel_tail = raw_p[len(root_clean):]
+                return f"{parent_clean}{rel_tail}" if parent_clean else rel_tail
+            return f"{parent_clean}/{cname}" if cname else (parent_clean or "/")
+        if raw_p.startswith("/"):
+            return raw_p
+        if raw_p:
+            return f"{parent_clean}/{raw_p.lstrip('/')}"
+        return f"{parent_clean}/{cname}" if cname else (parent_clean or "/")
+
+    async def _yandex_api_get(
+        self,
+        endpoint: str,
+        params: dict[str, Any],
+        *,
+        fallback_public_key: str = "",
+        progress: JobState | None = None,
+        proxy: str | None = None,
+    ) -> tuple[dict[str, Any], str | None]:
+        async def _req_once(q_params: dict[str, Any], active_px: str | None) -> tuple[int, dict[str, Any], str]:
+            client_kw: dict[str, Any] = {
+                "timeout": 25.0,
+                "follow_redirects": True,
+                "headers": {
+                    "User-Agent": _GDRIVE_BROWSER_UA,
+                    "Accept": "application/json",
+                },
+            }
+            if active_px:
+                if "socks" in str(active_px).lower():
+                    from ..utils.http import ensure_socks_support
+                    ensure_socks_support()
+                client_kw["proxy"] = active_px
+            async with httpx.AsyncClient(**client_kw) as client:
+                resp = await client.get(endpoint, params=q_params)
+                body_dict: dict[str, Any] = {}
+                try:
+                    parsed_json = resp.json()
+                    if isinstance(parsed_json, dict):
+                        body_dict = parsed_json
+                except Exception:
+                    pass
+                return resp.status_code, body_dict, resp.text
+
+        code, data, raw_txt = 0, {}, ""
+        for attempt in range(2):
+            try:
+                code, data, raw_txt = await _req_once(params, proxy)
+                if code == 200 and data:
+                    return data, proxy
+                if code not in (429, 500, 502, 503, 504):
+                    break
+            except Exception as exc:
+                if attempt == 1 and proxy is not None:
+                    raise ProviderFailure("DOWNLOAD_FAILED", f"Yandex Disk API request failed: {exc}") from exc
+                raw_txt = str(exc)
+            if attempt == 0:
+                await asyncio.sleep(1.2)
+
+        err_code = str(data.get("error") or "").strip()
+        desc = str(data.get("description") or data.get("message") or raw_txt[:200] or f"HTTP {code}").strip()
+
+        if code == 404 or err_code == "DiskNotFoundError":
+            if fallback_public_key and fallback_public_key != params.get("public_key"):
+                alt_params = {**params, "public_key": fallback_public_key}
+                try:
+                    f_code, f_data, f_txt = await _req_once(alt_params, proxy)
+                    if f_code == 200 and f_data:
+                        params["public_key"] = fallback_public_key
+                        return f_data, proxy
+                    code, data, raw_txt = f_code, f_data, f_txt
+                    err_code = str(data.get("error") or err_code).strip()
+                    desc = str(data.get("description") or data.get("message") or desc).strip()
+                except Exception:
+                    pass
+            if code == 404 or err_code == "DiskNotFoundError":
+                raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"Yandex Disk resource not found or link expired: {desc}")
+
+        if err_code == "DiskResourceDownloadDisabledError":
+            raise ProviderFailure("YANDEX_DOWNLOAD_DISABLED", f"Yandex Disk owner disabled downloading for this link: {desc}")
+
+        is_rate_or_ip_block = (
+            code in (0, 401, 403, 429, 451, 500, 502, 503, 504)
+            or any(k in err_code.lower() for k in ("limit", "many", "quota", "throttle"))
+        )
+        if is_rate_or_ip_block and proxy is None:
+            base_px = await self._ensure_tor_proxy(progress)
+            if base_px:
+                if progress:
+                    progress.log(f"[Yandex] Direct API returned {err_code or code}; retrying via isolated Tor circuit...")
+                for _ in range(2):
+                    cand_px = self._isolated_proxy(base_px, uuid.uuid4().hex[:8])
+                    if not cand_px:
+                        continue
+                    try:
+                        p_code, p_data, p_txt = await _req_once(params, cand_px)
+                        if p_code == 200 and p_data:
+                            return p_data, cand_px
+                        p_err = str(p_data.get("error") or "").strip()
+                        p_desc = str(p_data.get("description") or p_data.get("message") or p_txt[:200]).strip()
+                        if p_code == 404 or p_err == "DiskNotFoundError":
+                            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"Yandex Disk resource not found or link expired: {p_desc}")
+                        if p_err == "DiskResourceDownloadDisabledError":
+                            raise ProviderFailure("YANDEX_DOWNLOAD_DISABLED", f"Yandex Disk owner disabled downloading for this link: {p_desc}")
+                        code, data, err_code, desc = p_code, p_data, p_err or err_code, p_desc or desc
+                    except ProviderFailure:
+                        raise
+                    except Exception:
+                        continue
+
+        if code == 429 or any(k in err_code.lower() for k in ("limit", "many", "quota", "throttle")):
+            raise ProviderFailure("PROVIDER_RATE_LIMITED", f"Yandex Disk download/API limit exceeded ({err_code or code}): {desc}")
+
+        raise ProviderFailure("DOWNLOAD_FAILED", f"Yandex Disk API error ({err_code or f'HTTP {code}'}): {desc}")
+
+    async def _resolve_yandex_download_url(
+        self,
+        public_key: str,
+        sub_path: str = "",
+        *,
+        fallback_public_key: str = "",
+        progress: JobState | None = None,
+        proxy: str | None = None,
+    ) -> tuple[str, str | None]:
+        q: dict[str, Any] = {"public_key": public_key}
+        if sub_path:
+            q["path"] = sub_path
+        data, active_px = await self._yandex_api_get(
+            self._YANDEX_PUBLIC_DOWNLOAD_API,
+            q,
+            fallback_public_key=fallback_public_key,
+            progress=progress,
+            proxy=proxy,
+        )
+        href = str(data.get("href") or "").strip()
+        if not href:
+            raise ProviderFailure("DOWNLOAD_FAILED", "Yandex Disk did not return a direct download URL")
+        return href, active_px
+
+    async def _list_yandex_folder_items(
+        self,
+        url: str,
+        *,
+        progress: JobState | None = None,
+        proxy: str | None = None,
+        prefetched_root: dict[str, Any] | None = None,
+    ) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
+        parsed = self._parse_yandex_disk_url(url)
+        if parsed["kind"] == "private":
+            raise ProviderFailure(
+                "SOURCE_FILE_NOT_FOUND",
+                f"Yandex Disk private account URL cannot be accessed directly ({url}). Click Share in Yandex Disk and paste the public disk.yandex.*/d/... or /i/... link.",
+            )
+        if not parsed["public_key"]:
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"Invalid Yandex Disk URL: {url}")
+
+        page_limit = 1000
+        q_params: dict[str, Any] = {
+            "public_key": parsed["public_key"],
+            "limit": page_limit,
+            "offset": 0,
+        }
+        if parsed["path"]:
+            q_params["path"] = parsed["path"]
+
+        active_px = proxy
+        if prefetched_root is not None:
+            data = prefetched_root
+        else:
+            data, active_px = await self._yandex_api_get(
+                self._YANDEX_PUBLIC_RESOURCES_API,
+                q_params,
+                fallback_public_key=parsed["fallback_public_key"],
+                progress=progress,
+                proxy=active_px,
+            )
+
+        eff_public_key = str(q_params.get("public_key") or parsed["public_key"])
+        res_type = str(data.get("type") or "").lower()
+        res_title = str(data.get("name") or "").strip()
+        if res_type == "file":
+            return res_title, [], data
+
+        embedded = data.get("_embedded") if isinstance(data.get("_embedded"), dict) else {}
+        raw_items: list[dict[str, Any]] = list(embedded.get("items") or [])
+        total_count = int(embedded.get("total") or 0)
+        eff_limit = max(1, int(embedded.get("limit") or page_limit))
+        offset = len(raw_items)
+
+        while raw_items and ((total_count > 0 and len(raw_items) < total_count) or (total_count == 0 and len(raw_items) >= eff_limit)):
+            page_q: dict[str, Any] = {
+                "public_key": eff_public_key,
+                "limit": page_limit,
+                "offset": offset,
+            }
+            if parsed["path"]:
+                page_q["path"] = parsed["path"]
+            page_data, active_px = await self._yandex_api_get(
+                self._YANDEX_PUBLIC_RESOURCES_API,
+                page_q,
+                progress=progress,
+                proxy=active_px,
+            )
+            page_emb = page_data.get("_embedded") if isinstance(page_data.get("_embedded"), dict) else {}
+            batch = list(page_emb.get("items") or [])
+            if not batch:
+                break
+            raw_items.extend(batch)
+            offset += len(batch)
+            if total_count == 0 and len(batch) < eff_limit:
+                break
+
+        root_api_path = str(data.get("path") or "")
+        now_ts = time.time()
+        items: list[dict[str, Any]] = []
+        for child in raw_items:
+            if not isinstance(child, dict):
+                continue
+            c_type = str(child.get("type") or "file").lower()
+            raw_cname = str(child.get("name") or "").strip()
+            if not raw_cname:
+                continue
+            child_api_path = self._normalize_yandex_child_path(child, parent_subpath=parsed["path"], root_api_path=root_api_path)
+            sub_url = self._build_yandex_subitem_url(eff_public_key, child_api_path)
+            if c_type == "dir":
+                d_name = safe_name(raw_cname, is_dir=True)
+                items.append({
+                    "id": sub_url,
+                    "path": sub_url,
+                    "url": sub_url,
+                    "name": d_name,
+                    "raw_name": raw_cname,
+                    "type": "folder",
+                    "is_folder": True,
+                    "size": 0,
+                    "provider": "links",
+                    "meta": {
+                        "provider": "links",
+                        "cloud_host": "Yandex Disk",
+                        "type": "folder",
+                        "yandex_public_key": eff_public_key,
+                        "yandex_path": child_api_path,
+                    },
+                })
+            else:
+                f_name = safe_name(raw_cname)
+                f_size = max(0, int(child.get("size") or 0))
+                f_mime = str(child.get("mime_type") or "")
+                f_direct = str(child.get("file") or "").strip()
+                items.append({
+                    "id": sub_url,
+                    "path": sub_url,
+                    "url": sub_url,
+                    "name": f_name,
+                    "raw_name": raw_cname,
+                    "type": "file",
+                    "is_folder": False,
+                    "mimeType": f_mime,
+                    "size": f_size,
+                    "provider": "links",
+                    "meta": {
+                        "provider": "links",
+                        "cloud_host": "Yandex Disk",
+                        "type": "file",
+                        "size": f_size,
+                        "mimeType": f_mime,
+                        "yandex_public_key": eff_public_key,
+                        "yandex_path": child_api_path,
+                        "yandex_direct_url": f_direct,
+                        "yandex_direct_ts": now_ts if f_direct else 0.0,
+                    },
+                })
+
+        if res_title:
+            titles = getattr(self, "_last_folder_titles", None)
+            if not isinstance(titles, dict):
+                titles = {}
+                self._last_folder_titles = titles
+            titles[url] = res_title
+
+        return res_title, items, data
+
+    async def _download_yandex_folder(
+        self,
+        url: str,
+        dest_dir: Path,
+        progress: JobState,
+        *,
+        proxy: str | None = None,
+        prefetched_root: dict[str, Any] | None = None,
+    ) -> list[Path]:
+        folder_title, items, raw_meta = await self._list_yandex_folder_items(
+            url, progress=progress, proxy=proxy, prefetched_root=prefetched_root,
+        )
+        if raw_meta and str(raw_meta.get("type") or "").lower() == "file":
+            return await self._download_yandex_disk(
+                url, dest_dir, str(raw_meta.get("name") or ""), progress, proxy=proxy, _prefetched_meta=raw_meta,
+            )
+        if not items:
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"Yandex Disk folder is empty or unavailable: {url}")
+
+        progress.log(f"[Yandex] Found {len(items)} item(s) in Yandex Disk folder '{folder_title or url[:60]}'.")
+        options = (progress.payload or {}).get("options", {}) if hasattr(progress, "payload") else {}
+        conc = max(1, min(16, int(options.get("download_concurrency") or 4)))
+        sem = asyncio.Semaphore(conc)
+        results: list[Path] = []
+
+        async def _dl_entry(entry: dict[str, Any]) -> list[Path]:
+            progress.check_cancelled()
+            if entry.get("type") == "folder" or entry.get("is_folder"):
+                sub_dir = dest_dir / safe_name(str(entry.get("name") or "folder"), is_dir=True)
+                sub_dir.mkdir(parents=True, exist_ok=True)
+                return await self._download_yandex_folder(entry["url"], sub_dir, progress, proxy=proxy)
+            async with sem:
+                progress.check_cancelled()
+                return await self._download_yandex_disk(
+                    entry["url"], dest_dir, entry.get("name"), progress, file_ref=entry, proxy=proxy,
+                )
+
+        for batch in await asyncio.gather(*(_dl_entry(it) for it in items)):
+            results.extend(batch)
+        return results
+
+    async def _download_yandex_disk(
+        self,
+        url: str,
+        dest_dir: Path,
+        name: str | None,
+        progress: JobState,
+        file_ref: dict[str, Any] | None = None,
+        proxy: str | None = None,
+        _prefetched_meta: dict[str, Any] | None = None,
+    ) -> list[Path]:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        parsed = self._parse_yandex_disk_url(url)
+        if parsed["kind"] == "private":
+            raise ProviderFailure(
+                "SOURCE_FILE_NOT_FOUND",
+                f"Yandex Disk private account URL cannot be accessed directly ({url}). Click Share in Yandex Disk and paste the public disk.yandex.*/d/... or /i/... link.",
+            )
+
+        meta = (file_ref or {}).get("meta") if isinstance((file_ref or {}).get("meta"), dict) else {}
+        public_key = str((meta or {}).get("yandex_public_key") or parsed["public_key"]).strip()
+        sub_path = str((meta or {}).get("yandex_path") if "yandex_path" in (meta or {}) else parsed["path"]).strip()
+        fallback_pk = parsed["fallback_public_key"] if public_key == parsed["public_key"] else ""
+        if not public_key:
+            raise ProviderFailure("SOURCE_FILE_NOT_FOUND", f"Invalid Yandex Disk URL: {url}")
+
+        active_px = proxy
+        cached_direct = str((meta or {}).get("yandex_direct_url") or "").strip()
+        cached_ts = float((meta or {}).get("yandex_direct_ts") or 0.0)
+        use_cached_direct = bool(cached_direct and active_px is None and (time.time() - cached_ts) < 240.0)
+
+        real_name = str((file_ref or {}).get("raw_name") or "").strip()
+        direct_url = cached_direct if use_cached_direct else ""
+
+        try:
+            if not direct_url:
+                res_meta = _prefetched_meta
+                need_meta = res_meta is None and (not real_name and (not name or is_placeholder_link_name(name, url)) or (parsed["kind"] in ("d", "hash") and not (meta or {}).get("type")))
+                if need_meta:
+                    q_res: dict[str, Any] = {"public_key": public_key, "limit": 1000, "offset": 0}
+                    if sub_path:
+                        q_res["path"] = sub_path
+                    res_meta, active_px = await self._yandex_api_get(
+                        self._YANDEX_PUBLIC_RESOURCES_API,
+                        q_res,
+                        fallback_public_key=fallback_pk,
+                        progress=progress,
+                        proxy=active_px,
+                    )
+                    public_key = str(q_res.get("public_key") or public_key)
+
+                if res_meta is not None:
+                    if str(res_meta.get("type") or "").lower() == "dir":
+                        return await self._download_yandex_folder(
+                            url, dest_dir, progress, proxy=active_px, prefetched_root=res_meta,
+                        )
+                    real_name = str(res_meta.get("name") or real_name).strip()
+                    if isinstance(file_ref, dict) and res_meta.get("size") and not file_ref.get("size"):
+                        file_ref["size"] = int(res_meta["size"])
+                    direct_url = str(res_meta.get("file") or "").strip()
+
+                if not direct_url:
+                    direct_url, active_px = await self._resolve_yandex_download_url(
+                        public_key,
+                        sub_path,
+                        fallback_public_key=fallback_pk,
+                        progress=progress,
+                        proxy=active_px,
+                    )
+        except ProviderFailure as api_exc:
+            if api_exc.code in ("YANDEX_DOWNLOAD_DISABLED", "PROVIDER_RATE_LIMITED") and not sub_path:
+                progress.log(f"[Yandex] Direct download restricted ({api_exc.message}); attempting media stream fallback via yt-dlp...")
+                try:
+                    fallback_name = safe_name(name) if (name and not is_placeholder_link_name(name, url)) else (safe_name(real_name) if real_name else None)
+                    return await self._download_ytdlp(url, dest_dir, fallback_name, progress, proxy=active_px)
+                except Exception as ytdlp_exc:
+                    progress.log(f"[Yandex] yt-dlp stream fallback unavailable: {ytdlp_exc}")
+            if api_exc.code == "YANDEX_DOWNLOAD_DISABLED":
+                raise ProviderFailure("SOURCE_FILE_NOT_FOUND", api_exc.message) from api_exc
+            raise
+
+        out_name: str | None = None
+        if name and not is_placeholder_link_name(name, url):
+            out_name = safe_name(name)
+        elif real_name:
+            out_name = safe_name(real_name)
+        else:
+            q_fn = (parse_qs(urlparse(direct_url).query).get("filename") or [""])[0]
+            if q_fn:
+                out_name = safe_name(unquote(q_fn))
+            else:
+                out_name = safe_name(f"yandex_{parsed['short_id'] or 'file'}.bin")
+
+        progress.log(f"[Yandex] Downloading {out_name}...")
+        try:
+            return await self._download_aria2(direct_url, dest_dir, out_name, progress, proxy=active_px)
+        except Exception as first_dl_exc:
+            if use_cached_direct:
+                progress.log(f"[Yandex] Cached download URL expired or rejected ({first_dl_exc}); minting fresh download URL...")
+                direct_url, active_px = await self._resolve_yandex_download_url(
+                    public_key,
+                    sub_path,
+                    fallback_public_key=fallback_pk,
+                    progress=progress,
+                    proxy=active_px,
+                )
+                try:
+                    return await self._download_aria2(direct_url, dest_dir, out_name, progress, proxy=active_px)
+                except Exception:
+                    return await self._download_http_stream(direct_url, dest_dir, out_name, progress, proxy=active_px)
+            return await self._download_http_stream(direct_url, dest_dir, out_name, progress, proxy=active_px)
 
     @staticmethod
     def _evp_bytes_to_key(password: bytes, salt: bytes, key_len: int = 32, iv_len: int = 16) -> tuple[bytes, bytes]:
@@ -6004,6 +6594,8 @@ class LinksProvider(BaseProvider):
             return await self._download_dropbox(url, dest_dir, name, progress, is_folder=(link_type == "dropbox_folder"), proxy=proxy)
         elif link_type == "onedrive":
             return await self._download_onedrive(url, dest_dir, name, progress, proxy=proxy)
+        elif link_type in ("yandex_disk", "yandex_folder"):
+            return await self._download_yandex_disk(url, dest_dir, name, progress, file_ref=file_ref, proxy=proxy)
         elif link_type == "sorafolder":
             return await self._download_sorafolder(url, dest_dir, name, progress)
         elif link_type == "ytdlp":
@@ -6044,7 +6636,14 @@ class LinksProvider(BaseProvider):
 
     def is_folder_link(self, url: str) -> bool:
         """Return True if URL points to a multi-file cloud folder or album list."""
-        ltype = self._classify_link(str(url or ""))
+        u = str(url or "").strip()
+        ltype = self._classify_link(u)
+        if ltype == "yandex_folder":
+            return True
+        if ltype == "yandex_disk":
+            titles = getattr(self, "_last_folder_titles", None)
+            if isinstance(titles, dict) and u in titles:
+                return True
         return ltype in ("mega_folder", "gdrive_folder", "mediafire_folder", "pixeldrain_list", "dropbox_folder")
 
     async def list_files(self, credentials: dict[str, Any], path_or_id: str) -> dict[str, Any]:
@@ -6059,6 +6658,9 @@ class LinksProvider(BaseProvider):
             self._last_folder_titles = titles
         if ltype == "gdrive_folder":
             title, items = await self._list_gdrive_folder_items(url, credentials=credentials)
+            return {"name": title, "items": items}
+        if ltype in ("yandex_disk", "yandex_folder"):
+            title, items, _ = await self._list_yandex_folder_items(url)
             return {"name": title, "items": items}
         if ltype == "mega_folder":
             items = await self._list_mega_folder_nodes(url)
@@ -6234,8 +6836,12 @@ class LinksProvider(BaseProvider):
 
         name = safe_name(raw_name) if raw_name else None
         link_type = "telegram" if str(file_ref.get("type") or "").lower() == "telegram" else self._classify_link(url)
-        if name and link_type in ("gdrive", "mega_file", "mediafire", "pixeldrain", "gofile_page", "dropbox", "telegram") and is_placeholder_link_name(raw_name, url):
+        if name and link_type in ("gdrive", "mega_file", "mediafire", "pixeldrain", "gofile_page", "dropbox", "telegram", "yandex_disk", "yandex_folder") and is_placeholder_link_name(raw_name, url):
             name = None
+        if link_type == "direct" and "downloader.disk.yandex." in str(url).lower() and (not name or is_placeholder_link_name(raw_name, url)):
+            q_fn = (parse_qs(urlparse(str(url)).query).get("filename") or [""])[0]
+            if q_fn:
+                name = safe_name(unquote(q_fn))
         if link_type == "direct":
             check_sources = f"{page_url} {headers.get('Referer', '')} {headers.get('referer', '')}".lower()
             if any(d in check_sources for d in ("archivebate.com", "playmogo.com", "doods.pro", "dooood.com", "doodstream", "cloudatacdn.com", "myvidplay.com", "livecamsrip.com", "ds2play", "dsvplay", "dood.")):
