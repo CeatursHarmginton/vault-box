@@ -40,6 +40,7 @@ OPTIMIZED_EXIF_DESC = "VaultBox_Optimized:true"
 EXIF_IMAGE_DESCRIPTION = 0x010E
 EXIF_USER_COMMENT = 0x9286
 
+
 def clamp_quality(value: Any, default: int = 95, min_quality: int = MIN_QUALITY) -> int:
     try:
         q = int(float(value))
@@ -52,8 +53,10 @@ def clamp_quality(value: Any, default: int = 95, min_quality: int = MIN_QUALITY)
     floor = max(1, min(100, floor))
     return max(floor, min(100, q))
 
+
 def option_min_quality(options: dict[str, Any]) -> int:
     return clamp_quality(options.get("min_quality", MIN_QUALITY), MIN_QUALITY, 1)
+
 
 def is_image_already_optimized(path: Path) -> bool:
     """
@@ -88,6 +91,7 @@ def is_image_already_optimized(path: Path) -> bool:
         return False
     return False
 
+
 def embed_optimization_metadata(file_path: Path) -> bool:
     """
     Embeds optimization metadata into an existing image file.
@@ -116,16 +120,20 @@ def embed_optimization_metadata(file_path: Path) -> bool:
         return False
     return False
 
+
 def should_optimize_image_file(path: Path, options: dict[str, Any]) -> bool:
     suffix = path.suffix.lower()
     if suffix not in IMAGE_EXTENSIONS:
         return False
-    if not options.get("force_reoptimize", False) and is_image_already_optimized(path):
-        return False
+    if not options.get("force_reoptimize", False):
+        from .ai_upscaler import is_upscaled_filename
+        if is_upscaled_filename(path.name) or is_image_already_optimized(path):
+            return False
     size = path.stat().st_size
     min_target = int(float(options.get("min_target_mb", 1.0)) * 1024 * 1024)
     max_target = int(float(options.get("max_target_mb", 3.0)) * 1024 * 1024)
     return size < min_target if options.get("upscale") else size > max_target
+
 
 def _optimize_workers(options: dict[str, Any], image_count: int) -> int:
     try:
@@ -138,6 +146,7 @@ def _optimize_workers(options: dict[str, Any], image_count: int) -> int:
     if options.get("upscale") and shutil.which("realesrgan-ncnn-vulkan"):
         return min(image_count, min(4, max(2, cpu // 2)))
     return min(image_count, min(32, max(2, cpu - 1)))
+
 
 def compress_image(src_path: Path, dest_path: Path, q: int, scale: float = 1.0) -> bool:
     """
@@ -157,7 +166,7 @@ def compress_image(src_path: Path, dest_path: Path, q: int, scale: float = 1.0) 
             return True
         except Exception as e:
             logger.warning(f"pyvips compression failed: {e}. Trying fallback.")
-            
+
     if PIL_AVAILABLE:
         try:
             img = PILImage.open(src_path)
@@ -186,8 +195,9 @@ def compress_image(src_path: Path, dest_path: Path, q: int, scale: float = 1.0) 
                 logger.warning(f"vips CLI failed: {res.stderr.decode(errors='ignore')}")
         except Exception as e:
             logger.warning(f"vips CLI run failed: {e}")
-            
+
     return False
+
 
 def copy_or_convert_image(src_path: Path, dest_path: Path, q: int) -> None:
     if src_path.suffix.lower() in (".jpg", ".jpeg") and dest_path.suffix.lower() in (".jpg", ".jpeg"):
@@ -201,11 +211,13 @@ def copy_or_convert_image(src_path: Path, dest_path: Path, q: int) -> None:
             time.sleep(0.2)
     raise RuntimeError(f"Failed to convert image to JPEG: {src_path}")
 
+
 def copy_original_image(src_path: Path, dest_dir: Path) -> Path:
     dest_path = dest_dir / src_path.name
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src_path, dest_path)
     return dest_path
+
 
 def _valid_optimized_output(src_path: Path, out_path: Path, scale: float) -> bool:
     if not out_path.exists() or out_path.stat().st_size <= 0:
@@ -219,6 +231,7 @@ def _valid_optimized_output(src_path: Path, out_path: Path, scale: float) -> boo
             return out.size == expected
     except Exception:
         return False
+
 
 def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any], adaptive_quality: int) -> tuple[Path | None, int, str]:
     """
@@ -238,7 +251,7 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
     start_quality = clamp_quality(options.get("start_quality", 95), 95, min_quality)
     auto_size = options.get("auto_size", True)
     scale = float(options.get("resolution_scale", 1.0))
-    
+
     size = src_path.stat().st_size
     dest_ext = ".jpg" if src_path.suffix.lower() not in (".jpg", ".jpeg") else src_path.suffix.lower()
     dest_path = dest_dir / f"{src_path.stem}{dest_ext}"
@@ -256,7 +269,7 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
             return dest_path, quality, "Thành công (Converted)"
         dest_path = copy_original_image(src_path, dest_dir)
         return dest_path, quality, "Giữ nguyên"
-        
+
     # 2. Upscale if too small (Real-ESRGAN placeholder or keep as-is)
     if size < min_target:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -275,7 +288,7 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
                         return dest_path, quality, "Thành công (Upscaled)"
                 except Exception as e:
                     logger.warning(f"Real-ESRGAN failed: {e}")
-            
+
         if src_path.suffix.lower() not in (".jpg", ".jpeg"):
             try:
                 copy_or_convert_image(src_path, dest_path, quality)
@@ -294,18 +307,18 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
     q = adaptive_quality if auto_size else quality
     q = clamp_quality(q, quality, min_quality)
     final_q = q
-    
+
     temp_fd, temp_path_str = tempfile.mkstemp(suffix=dest_ext)
     os.close(temp_fd)
     temp_path = Path(temp_path_str)
-    
+
     best_temp_fd, best_temp_str = tempfile.mkstemp(suffix=dest_ext)
     os.close(best_temp_fd)
     best_temp = Path(best_temp_str)
     best_size = size  # Track best compressed size (start at original)
     best_q = q
     invalid_output_seen = False
-    
+
     try:
         while q >= min_quality:
             if not compress_image(src_path, temp_path, q, scale):
@@ -318,19 +331,19 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
                     break
                 q -= 5
                 continue
-            
+
             # Track best compressed result (smallest)
             if temp_size < best_size:
                 shutil.copy2(temp_path, best_temp)
                 best_size = temp_size
                 best_q = q
-            
+
             if not auto_size or temp_size <= max_target:
                 final_q = q
                 shutil.copy2(temp_path, dest_path)
                 return dest_path, final_q, "Success"
             q -= 5
-            
+
         # Loop exhausted — use best compressed result if smaller than original
         if best_size < size:
             shutil.copy2(best_temp, dest_path)
@@ -348,14 +361,56 @@ def optimize_image_file(src_path: Path, dest_dir: Path, options: dict[str, Any],
     finally:
         temp_path.unlink(missing_ok=True)
         best_temp.unlink(missing_ok=True)
-        
+
     return dest_path, final_q, status
+
 
 def _is_inside(path: Path, root: Path) -> bool:
     try:
         return path.resolve().is_relative_to(root.resolve())
     except (OSError, ValueError):
         return False
+
+
+def _handle_passthrough_files(
+    passthrough: list[Path],
+    input_dir: Path,
+    output_dir: Path,
+    results: list[dict[str, Any]],
+    job_state: Any,
+    cancel_check: Callable[[], None] | None = None,
+) -> None:
+    from .ai_upscaler import is_upscaled_filename, is_video_already_optimized
+    for p in passthrough:
+        if cancel_check:
+            cancel_check()
+        relative_path = p.relative_to(input_dir)
+        rel_posix = str(relative_path).replace("\\", "/")
+        sz = p.stat().st_size
+        if p.suffix.lower() in VIDEO_EXTENSIONS and (is_upscaled_filename(p.name) or is_video_already_optimized(p)):
+            if job_state is not None and hasattr(job_state, "log"):
+                job_state.log(f"[SKIP] Bỏ qua video đã upscale ở chế độ Downscale: {rel_posix}")
+            results.append({
+                "name": rel_posix,
+                "source_name": rel_posix,
+                "original_size": sz,
+                "optimized_size": sz,
+                "status": "Skipped (Upscaled video)",
+                "quality": "-",
+            })
+            continue
+        target_path = output_dir / relative_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p, target_path)
+        results.append({
+            "name": rel_posix,
+            "source_name": rel_posix,
+            "original_size": sz,
+            "optimized_size": sz,
+            "status": "Skipped",
+            "quality": "-",
+        })
+
 
 def optimize_directory(
     input_dir: Path,
@@ -366,11 +421,22 @@ def optimize_directory(
 ) -> list[dict[str, Any]]:
     """
     Scans the input directory, processes all files, and outputs to the output directory.
-    Non-image files are copied as-is.
-    Groups images by folder and resets adaptive quality per folder (like fiximg_vips.ps1).
+    When options.get("upscale") is True, delegates to the AI Super-Resolution engine (ai_upscaler).
+    In Downscale mode, non-image files (except upscaled videos) are copied as-is, and images
+    are grouped by folder with per-folder adaptive quality.
     """
+    if options.get("upscale") and not options.get("_use_legacy_ncnn"):
+        from .ai_upscaler import upscale_directory
+        return upscale_directory(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            options=options,
+            job_state=job_state,
+            cancel_check=cancel_check,
+        )
+
     all_files = [p for p in input_dir.rglob("*") if p.is_file() and not _is_inside(p, output_dir)]
-    
+
     # Separate images and non-images
     images = []
     passthrough = []
@@ -379,19 +445,17 @@ def optimize_directory(
             images.append(p)
         else:
             passthrough.append(p)
-            
+
     # Group images by folder, sort by folder path, then by size within each folder
-    # This exactly replicates fiximg_vips.ps1 which groups by folder, resets
-    # adaptiveQualityStart per folder, and sorts by size within each group
     images.sort(key=lambda x: (str(x.parent), x.stat().st_size))
     folder_groups: list[tuple[str, list[Path]]] = []
     for folder_key, group in groupby(images, key=lambda x: str(x.parent)):
         folder_groups.append((folder_key, list(group)))
-    
+
     min_quality = option_min_quality(options)
     start_quality = clamp_quality(options.get("start_quality", 95), 95, min_quality)
     max_target = int(float(options.get("max_target_mb", 3.0)) * 1024 * 1024)
-    
+
     results: list[dict[str, Any]] = []
     total_images = len(images)
     processed = 0
@@ -442,24 +506,7 @@ def optimize_directory(
                 processed += 1
                 set_optimize_progress(processed)
         results.extend(item for item in ordered if item is not None)
-
-        for p in passthrough:
-            if cancel_check:
-                cancel_check()
-            relative_path = p.relative_to(input_dir)
-            target_path = output_dir / relative_path
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(p, target_path)
-            sz = p.stat().st_size
-            results.append({
-                "name": str(relative_path).replace("\\", "/"),
-                "source_name": str(relative_path).replace("\\", "/"),
-                "original_size": sz,
-                "optimized_size": sz,
-                "status": "Skipped",
-                "quality": "-"
-            })
-
+        _handle_passthrough_files(passthrough, input_dir, output_dir, results, job_state, cancel_check)
         return results
 
     counter_lock = Lock()
@@ -523,23 +570,6 @@ def optimize_directory(
     else:
         for folder_key, folder_images in folder_groups:
             results.extend(process_group(folder_key, folder_images))
-    
-    # Copy files that should pass through unchanged and record them as skipped.
-    for p in passthrough:
-        if cancel_check:
-            cancel_check()
-        relative_path = p.relative_to(input_dir)
-        target_path = output_dir / relative_path
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(p, target_path)
-        sz = p.stat().st_size
-        results.append({
-            "name": str(relative_path).replace("\\", "/"),
-            "source_name": str(relative_path).replace("\\", "/"),
-            "original_size": sz,
-            "optimized_size": sz,
-            "status": "Skipped",
-            "quality": "-"
-        })
-        
+
+    _handle_passthrough_files(passthrough, input_dir, output_dir, results, job_state, cancel_check)
     return results

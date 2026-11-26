@@ -530,17 +530,27 @@ class TeraBoxProvider(BaseProvider):
         parent = str(PurePosixPath(source_path).parent)
         parent = "/" if parent == "." else parent
         old_name = PurePosixPath(source_path).name
+        raw_new_name = str(source_ref.get("name") or local_path.name or old_name).strip()
+        from ..utils.ai_upscaler import is_upscaled_filename
+        keep_upscaled_name = is_upscaled_filename(raw_new_name)
+        new_name = safe_name(raw_new_name) if (keep_upscaled_name and raw_new_name) else old_name
         options = progress.payload.setdefault("options", {})
         old_replace = options.get("replace")
         options["replace"] = True
         try:
-            await self.upload_file(credentials, local_path, {"id": parent, "relative_path": old_name}, progress)
+            await self.upload_file(credentials, local_path, {"id": parent, "relative_path": new_name}, progress)
         finally:
             if old_replace is None:
                 options.pop("replace", None)
             else:
                 options["replace"] = old_replace
-        return {"ok": True, "old_path": source_path, "new_name": old_name, "renamed": False}
+        renamed = new_name != old_name
+        if renamed:
+            try:
+                await self.delete_file(credentials, {"path": source_path})
+            except Exception as exc:
+                progress.log(f"[TeraBox] Uploaded {new_name}, warning deleting old {old_name}: {exc}")
+        return {"ok": True, "old_path": source_path, "new_name": new_name, "renamed": renamed}
 
     async def delete_file(self, credentials: dict[str, Any], file_ref: dict[str, Any]) -> dict[str, Any]:
         s = await self._session(credentials)

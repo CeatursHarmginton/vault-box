@@ -12,11 +12,13 @@ from ..config import FOLDER_DOWNLOAD_CONCURRENCY, IS_KAGGLE, UPLOAD_FILE_CONCURR
 from ..providers import PROVIDERS
 from ..providers.base import ProviderFailure, close_shared_clients, dict_lock, download_with_retry, is_skippable_download_failure, safe_name
 from ..security import redact
+from ..utils.ai_upscaler import is_upscaled_filename
 from ..utils.image_optimizer import VIDEO_EXTENSIONS
 from ..utils.media_converter import (
     convert_directory,
     is_auto_convert_enabled,
     is_file_filter_enabled,
+    resolve_conversion_decision,
     resolve_conversion_target,
     should_download_file_item,
 )
@@ -639,25 +641,39 @@ async def run_transfer(job: JobState) -> None:
                 job.set(status="completed", step="completed")
                 return
         if options.get("optimize_image"):
-            auto_convert_on = is_auto_convert_enabled(_live_options(job, options))
-            skipped_videos = [
-                item for item in file_items
-                if _is_video_item(item) and not (auto_convert_on and resolve_conversion_decision(item, options)[1])
-            ]
-            for item in skipped_videos:
-                job.files_skipped += 1
-                _record_optimized_skip(job, item, "Skipped")
-                job.log(f"[SKIP] Video ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
-            skipped_archives = [item for item in file_items if not options.get("extract") and _is_archive_item(item)]
-            for item in skipped_archives:
-                job.files_skipped += 1
-                _record_optimized_skip(job, item, "Skipped")
-                job.log(f"[SKIP] Archive ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
-            file_items = [
-                item for item in file_items
-                if not (_is_video_item(item) and not (auto_convert_on and resolve_conversion_decision(item, options)[1]))
-                and not (not options.get("extract") and _is_archive_item(item))
-            ]
+            live_opts = _live_options(job, options)
+            is_upscale_mode = bool(live_opts.get("upscale"))
+            force_reopt = bool(live_opts.get("force_reoptimize"))
+            auto_convert_on = is_auto_convert_enabled(live_opts)
+            filtered_file_items: list[dict[str, Any]] = []
+            for item in file_items:
+                item_label = item.get("name") or item.get("id") or "file"
+                if _is_video_item(item):
+                    already_upscaled = is_upscaled_filename(_item_name(item))
+                    if is_upscale_mode:
+                        if already_upscaled and not force_reopt:
+                            job.files_skipped += 1
+                            _record_optimized_skip(job, item, "Skipped (Already upscaled)")
+                            job.log(f"[SKIP] Video already has -upscaled suffix: {item_label}")
+                            continue
+                    else:
+                        if already_upscaled:
+                            job.files_skipped += 1
+                            _record_optimized_skip(job, item, "Skipped (Upscaled video)")
+                            job.log(f"[SKIP] Upscaled video ignored in downscale mode: {item_label}")
+                            continue
+                        if not (auto_convert_on and resolve_conversion_decision(item, live_opts)[1]):
+                            job.files_skipped += 1
+                            _record_optimized_skip(job, item, "Skipped")
+                            job.log(f"[SKIP] Video ignored by image optimizer: {item_label}")
+                            continue
+                if not live_opts.get("extract") and _is_archive_item(item):
+                    job.files_skipped += 1
+                    _record_optimized_skip(job, item, "Skipped")
+                    job.log(f"[SKIP] Archive ignored by image optimizer: {item_label}")
+                    continue
+                filtered_file_items.append(item)
+            file_items = filtered_file_items
         job.files_to_download = len(file_items)
 
         strategy = str(options.get("transfer_strategy") or options.get("transferStrategy") or "").lower()
@@ -905,7 +921,7 @@ async def run_transfer(job: JobState) -> None:
 
         if options.get("optimize_image"):
             job.set(step="optimizing")
-            job.log("Starting image optimization...")
+            job.log("Starting AI upscale..." if options.get("upscale") else "Starting image optimization...")
             from ..utils.image_optimizer import optimize_directory
             opt_input = out_root
             opt_dest = dirs["output"] / "optimized"
@@ -916,10 +932,27 @@ async def run_transfer(job: JobState) -> None:
             )
             out_root = opt_dest
             outputs = [p for p in out_root.rglob("*") if p.is_file()]
+            skipped_in_opt = sum(
+                1
+                for f in (job.optimized_files or [])
+                if str(f.get("status") or "").lower().startswith("skip")
+                and not (out_root / str(f.get("name") or "")).is_file()
+            )
+            if skipped_in_opt:
+                job.files_skipped += skipped_in_opt
+            if not outputs:
+                job.log("All candidate files already meet optimization/upscale criteria; skipping upload.")
+                _mark_remaining_items_completed(job, source)
+                _log_skip_summary(job)
+                job.set(status="completed", step="completed")
+                return
             
-            # Only ask for confirmation if there are actual optimized image results or converted files
+            # Only ask for confirmation if there are actual optimized/upscaled results or converted files
             has_converted = bool(getattr(job, "converted_files", None))
-            actual_compressed = [f for f in (job.optimized_files or []) if f.get("status") != "Skipped"]
+            actual_compressed = [
+                f for f in (job.optimized_files or [])
+                if not str(f.get("status") or "").lower().startswith("skip")
+            ]
             if actual_compressed or has_converted:
                 is_opt_page = bool(options.get("is_optimize_page") or payload.get("is_optimize_page") or payload.get("mode") == "optimize" or payload.get("job_type") == "optimize")
                 conf_mode = options.get("confirm_action") or options.get("confirmation_mode")
@@ -1050,21 +1083,53 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         item_name_str = _item_name(item)
         item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
         if item_type != "folder" and _is_video_item(item):
-            auto_convert_on = is_auto_convert_enabled(_live_options(job, options))
-            should_convert = auto_convert_on and resolve_conversion_decision(item, options)[1]
-            if not should_convert:
-                job.files_skipped += 1
-                _record_optimized_skip(job, item, "Skipped")
-                job.log(f"[SKIP] Video ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
-                job.finish_item(item_k, status="skipped", name=item_name_str)
-                timing = job.item_timings.get(item_k) or {}
-                job.completed_items.append({
-                    **item_ref,
-                    "startTime": timing.get("startTime"),
-                    "endTime": timing.get("endTime"),
-                    "duration": timing.get("duration"),
-                })
-                continue
+            live_opts = _live_options(job, options)
+            is_upscale_mode = bool(live_opts.get("upscale"))
+            force_reopt = bool(live_opts.get("force_reoptimize"))
+            already_upscaled = is_upscaled_filename(item_name_str)
+            if is_upscale_mode:
+                if already_upscaled and not force_reopt:
+                    job.files_skipped += 1
+                    _record_optimized_skip(job, item, "Skipped (Already upscaled)")
+                    job.log(f"[SKIP] Video already has -upscaled suffix: {item.get('name') or item.get('id') or 'file'}")
+                    job.finish_item(item_k, status="skipped", name=item_name_str)
+                    timing = job.item_timings.get(item_k) or {}
+                    job.completed_items.append({
+                        **item_ref,
+                        "startTime": timing.get("startTime"),
+                        "endTime": timing.get("endTime"),
+                        "duration": timing.get("duration"),
+                    })
+                    continue
+            else:
+                if already_upscaled:
+                    job.files_skipped += 1
+                    _record_optimized_skip(job, item, "Skipped (Upscaled video)")
+                    job.log(f"[SKIP] Upscaled video ignored in downscale mode: {item.get('name') or item.get('id') or 'file'}")
+                    job.finish_item(item_k, status="skipped", name=item_name_str)
+                    timing = job.item_timings.get(item_k) or {}
+                    job.completed_items.append({
+                        **item_ref,
+                        "startTime": timing.get("startTime"),
+                        "endTime": timing.get("endTime"),
+                        "duration": timing.get("duration"),
+                    })
+                    continue
+                auto_convert_on = is_auto_convert_enabled(live_opts)
+                should_convert = auto_convert_on and resolve_conversion_decision(item, live_opts)[1]
+                if not should_convert:
+                    job.files_skipped += 1
+                    _record_optimized_skip(job, item, "Skipped")
+                    job.log(f"[SKIP] Video ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
+                    job.finish_item(item_k, status="skipped", name=item_name_str)
+                    timing = job.item_timings.get(item_k) or {}
+                    job.completed_items.append({
+                        **item_ref,
+                        "startTime": timing.get("startTime"),
+                        "endTime": timing.get("endTime"),
+                        "duration": timing.get("duration"),
+                    })
+                    continue
         if item_type != "folder" and not options.get("extract") and _is_archive_item(item):
             job.files_skipped += 1
             _record_optimized_skip(job, item, "Skipped")
@@ -1169,23 +1234,36 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
                 optimize_input = conv_root
 
         job.set(step="optimizing")
-        job.log(f"Starting image optimization: {_batch_name(batch_items)}")
+        opt_label = "AI upscale" if options.get("upscale") else "image optimization"
+        job.log(f"Starting {opt_label}: {_batch_name(batch_items)}")
         batch_results = await asyncio.to_thread(
             optimize_directory, optimize_input, batch_output, options, job,
             cancel_check=job.check_cancelled,
         )
         job.optimized_files.extend(batch_results)
+        skipped_in_batch = sum(
+            1
+            for f in (batch_results or [])
+            if str(f.get("status") or "").lower().startswith("skip")
+            and not (batch_output / str(f.get("name") or "")).is_file()
+        )
+        if skipped_in_batch:
+            job.files_skipped += skipped_in_batch
         batch_files = [p for p in batch_output.rglob("*") if p.is_file()]
         has_converted_batch = bool(getattr(job, "converted_files", None))
-        if not batch_results and not batch_files:
-            job.log(f"No files found for optimization or conversion: {_batch_name(batch_items)}")
+        if not batch_files:
+            job.log(f"No output files staged after {opt_label}: {_batch_name(batch_items)}")
             shutil.rmtree(batch_input, ignore_errors=True)
             shutil.rmtree(batch_output.parent, ignore_errors=True)
             if not item_failed:
                 _finish_items(job, source, batch_items)
             continue
 
-        if (batch_results or has_converted_batch or batch_files) and action is None:
+        actual_batch_processed = [
+            f for f in (batch_results or [])
+            if not str(f.get("status") or "").lower().startswith("skip")
+        ]
+        if (actual_batch_processed or has_converted_batch or batch_files) and action is None:
             is_opt_page = bool(options.get("is_optimize_page") or (job.payload or {}).get("is_optimize_page") or (job.payload or {}).get("mode") == "optimize" or (job.payload or {}).get("job_type") == "optimize")
             conf_mode = options.get("confirm_action") or options.get("confirmation_mode")
             if conf_mode == "replace":
@@ -2273,7 +2351,7 @@ def _needs_download_batches(items: list[dict[str, Any]], root: Path, options: di
 
 def _download_budget(root: Path, options: dict[str, Any]) -> int:
     free = min(shutil.disk_usage(root).free, COLAB_DEFAULT_FREE_BYTES)
-    if options.get("extract"):
+    if options.get("extract") or options.get("upscale"):
         return max(1, free // 3)
     if options.get("optimize_image"):
         return max(1, free // 2)
@@ -3115,7 +3193,18 @@ def _optimized_replace_refs(job: JobState, results: list[dict[str, Any]], output
         if not name:
             continue
         ref = source_refs.get(str((input_root / source_name).resolve())) if source_name else None
-        ref = ref or by_stem.get(PurePosixPath(name).stem)
+        if not ref:
+            out_stem = PurePosixPath(name).stem
+            stem_candidates: list[str] = []
+            if source_name:
+                stem_candidates.append(PurePosixPath(source_name).stem)
+            stem_candidates.append(out_stem)
+            if out_stem.lower().endswith("-upscaled"):
+                stem_candidates.append(out_stem[:-9])
+            for st in stem_candidates:
+                if st and st in by_stem:
+                    ref = by_stem[st]
+                    break
         if not ref:
             continue
         output_path = output_root / name

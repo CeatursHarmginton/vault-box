@@ -111,12 +111,14 @@ def _drive_mounted() -> bool:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
+    from .utils.ai_upscaler import get_ai_upscale_status
     return {
         "ok": True,
         "service": "vaultbox-colab-worker",
         "version": "2.0.0",
         "environment": ENV_NAME.lower(),
         "envName": ENV_NAME,
+        "aiUpscale": get_ai_upscale_status(),
         "autoStop": {
             "enabled": AUTO_STOP_ENABLED,
             "idleMinutes": AUTO_STOP_IDLE_MINUTES,
@@ -127,12 +129,14 @@ async def health() -> dict[str, Any]:
 
 @app.post("/connect/verify", dependencies=[Depends(require_token)])
 async def connect_verify() -> dict[str, Any]:
+    from .utils.ai_upscaler import get_ai_upscale_status
     return {
         "ok": True,
         "providers": list(PROVIDERS),
         "publicUrl": PUBLIC_URL,
         "environment": ENV_NAME.lower(),
         "envName": ENV_NAME,
+        "aiUpscale": get_ai_upscale_status(),
         "autoStop": {
             "enabled": AUTO_STOP_ENABLED,
             "idleMinutes": AUTO_STOP_IDLE_MINUTES,

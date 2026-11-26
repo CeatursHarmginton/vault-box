@@ -483,6 +483,15 @@ def resolve_conversion_decision(item_or_path: Any, options: dict[str, Any] | Non
     if cat not in ("image", "video"):
         return cat, False, None, "unsupported_category"
 
+    opts = options or {}
+    if cat == "video" and opts.get("optimize_image") and not opts.get("upscale"):
+        from .ai_upscaler import is_upscaled_filename, is_video_already_optimized
+        fname = extract_item_filename(item_or_path)
+        if is_upscaled_filename(fname):
+            return cat, False, None, "skipped_upscaled_video"
+        if isinstance(item_or_path, Path) and item_or_path.is_file() and is_video_already_optimized(item_or_path):
+            return cat, False, None, "skipped_optimized_video"
+
     _, norm_ext = extract_item_ext(item_or_path, category=cat)
     if cat == "video" and norm_ext in ("m3u8", "mpd"):
         # Streaming manifests are first assembled to .mp4 before file conversion applies

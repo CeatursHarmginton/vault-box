@@ -800,11 +800,23 @@ class DriveProvider(BaseProvider):
             dest = self._mount_path(source_ref)
             if not dest.is_file():
                 raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Drive mounted file path not found")
-            progress.set(step="uploading", current_file=dest.name)
-            await asyncio.to_thread(shutil.copy2, local_path, dest)
+            raw_new_name = str(source_ref.get("name") or local_path.name or dest.name).strip()
+            new_name = safe_name(raw_new_name) if raw_new_name else dest.name
+            new_dest = dest.with_name(new_name)
+            progress.set(step="uploading", current_file=new_dest.name)
+            tmp_dest = dest.parent / f".tmp_vb_{os.getpid()}_{int(time.time() * 1000)}_{new_dest.name}"
+            try:
+                await asyncio.to_thread(shutil.copy2, local_path, tmp_dest)
+                await asyncio.to_thread(os.replace, tmp_dest, new_dest)
+                if new_dest.resolve() != dest.resolve():
+                    await asyncio.to_thread(dest.unlink, True)
+            finally:
+                if tmp_dest.exists():
+                    tmp_dest.unlink(missing_ok=True)
             size = local_path.stat().st_size
             progress.add_bytes(size, size, "upload", str(local_path))
-            return {"id": dest.relative_to(DRIVE_MOUNT).as_posix(), "name": dest.name, "path": dest.relative_to(DRIVE_MOUNT).as_posix()}
+            rel_posix = new_dest.relative_to(DRIVE_MOUNT).as_posix()
+            return {"id": rel_posix, "name": new_dest.name, "path": rel_posix}
         if self._web_session(credentials):
             if not fid:
                 raise ProviderFailure("SOURCE_FILE_NOT_FOUND", "Drive file id missing")

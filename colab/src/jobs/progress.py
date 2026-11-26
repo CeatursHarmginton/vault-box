@@ -312,6 +312,21 @@ class JobState:
             ("archive_passwords", "archivePasswords"),
             ("auto_convert", "autoConvert"),
             ("file_filter", "fileFilter"),
+            ("optimize_mode", "optimizeMode"),
+            ("model_preset", "modelPreset"),
+            ("target_resolution", "targetResolution"),
+            ("resource_target_pct", "resourceTargetPct"),
+            ("size_profile", "sizeProfile"),
+            ("encoder_choice", "encoderChoice"),
+            ("torch_compile_mode", "torchCompileMode"),
+            ("clean_temp_and_cache", "cleanTempAndCache"),
+            ("delete_uploaded_source_in_colab", "deleteUploadedSourceInColab"),
+            ("preview_seconds", "previewSeconds"),
+            ("start_time", "startTime"),
+            ("batch_size", "batchSize"),
+            ("denoise_strength", "denoiseStrength"),
+            ("use_fp16", "useFp16"),
+            ("overwrite_output", "overwriteOutput"),
         )
         normalized = dict(new_options)
         for k1, k2 in alias_pairs:
