@@ -581,24 +581,81 @@ def _skip_filtered_item(item: dict[str, Any], progress: JobState) -> bool:
 
 
 def _skip_optimize_item(item: dict[str, Any], progress: JobState) -> bool:
-    if not (progress.payload.get("options") or {}).get("optimize_image"):
+    options = (progress.payload or {}).get("options") or {} if hasattr(progress, "payload") and isinstance(progress.payload, dict) else {}
+    if not options.get("optimize_image"):
         return False
-    options = progress.payload.get("options") or {}
+
+    from ..utils.ai_upscaler import is_upscaled_filename
+    from ..utils.image_optimizer import VIDEO_EXTENSIONS
+    from ..utils.media_converter import is_auto_convert_enabled, resolve_conversion_decision
+
     name = str(item.get("name") or item.get("server_filename") or item.get("path") or item.get("id") or "")
     lower_name = name.lower()
     suffix = Path(name).suffix.lower()
-    if suffix not in IMAGE_EXTENSIONS:
-        if options.get("extract") and (lower_name.endswith(ARCHIVE_DOWNLOAD_EXTENSIONS) or (len(suffix) == 4 and suffix[1:].isdigit())):
+    is_archive = lower_name.endswith(ARCHIVE_DOWNLOAD_EXTENSIONS) or (len(suffix) == 4 and suffix[1:].isdigit())
+    is_upscale_mode = bool(options.get("upscale"))
+    force_reopt = bool(options.get("force_reoptimize"))
+
+    # 1. Always enforce -upscaled skip rules
+    if is_upscale_mode:
+        if not force_reopt and is_upscaled_filename(name):
+            return True
+    else:
+        if suffix in VIDEO_EXTENSIONS and is_upscaled_filename(name):
+            return True
+        if suffix in IMAGE_EXTENSIONS and not force_reopt and is_upscaled_filename(name):
+            return True
+
+    # 2. When explicit Download File Filter state is present from UI:
+    #    - If enabled=True, `_skip_filtered_item` already filtered by user's ticked categories/formats.
+    #    - If enabled=False, user turned the filter OFF to allow ALL files through!
+    raw_ff = options.get("file_filter") if isinstance(options.get("file_filter"), dict) else options.get("fileFilter")
+    if isinstance(raw_ff, dict):
+        if not is_upscale_mode and suffix in (".jpg", ".jpeg"):
+            if is_auto_convert_enabled(options) and resolve_conversion_decision(item, options)[1]:
+                return False
+            size = int(item.get("size") or item.get("file_size") or item.get("bytes") or 0)
+            if size > 0:
+                max_target = int(float(options.get("max_target_mb", 3.0)) * 1024 * 1024)
+                return size <= max_target
+        return False
+
+    # 3. Legacy fallback when `file_filter` dict is not provided in payload
+    if is_upscale_mode:
+        if suffix in VIDEO_EXTENSIONS or suffix in IMAGE_EXTENSIONS:
+            if options.get("_use_legacy_ncnn") and suffix in (".jpg", ".jpeg"):
+                size = int(item.get("size") or item.get("file_size") or item.get("bytes") or 0)
+                if size > 0:
+                    min_target = int(float(options.get("min_target_mb", 1.0)) * 1024 * 1024)
+                    return size >= min_target
+            return False
+        if options.get("extract") and is_archive:
+            return False
+        if is_auto_convert_enabled(options) and resolve_conversion_decision(item, options)[1]:
             return False
         return True
+
+    if suffix in VIDEO_EXTENSIONS:
+        if is_auto_convert_enabled(options) and resolve_conversion_decision(item, options)[1]:
+            return False
+        return True
+
+    if suffix not in IMAGE_EXTENSIONS:
+        if options.get("extract") and is_archive:
+            return False
+        if is_auto_convert_enabled(options) and resolve_conversion_decision(item, options)[1]:
+            return False
+        return True
+
+    if is_auto_convert_enabled(options) and resolve_conversion_decision(item, options)[1]:
+        return False
     if suffix not in (".jpg", ".jpeg"):
         return False
     size = int(item.get("size") or item.get("file_size") or item.get("bytes") or 0)
     if not size:
         return False
-    min_target = int(float(options.get("min_target_mb", 1.0)) * 1024 * 1024)
     max_target = int(float(options.get("max_target_mb", 3.0)) * 1024 * 1024)
-    return size >= min_target if options.get("upscale") else size <= max_target
+    return size <= max_target
 
 
 def _remember_source_ref(progress: JobState, path: Path, item: dict[str, Any]) -> None:

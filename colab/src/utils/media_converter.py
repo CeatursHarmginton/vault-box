@@ -212,12 +212,46 @@ def detect_file_category(item_or_name: Any) -> str:
 # 1. Download File Filter
 # ============================================================================
 
+VALID_FILTER_CATEGORIES = ("video", "image", "archive", "audio", "document")
+
+
 @dataclass
 class FileFilterConfig:
     enabled: bool = False
     mode: str = "all"        # "all" | "include" | "except"
-    category: str = "all"    # "all" | "video" | "image" | "archive" | "audio" | "document"
+    category: str = "all"    # "all" | single category | comma-joined categories
+    categories: list[str] = field(default_factory=list)
     formats: list[str] = field(default_factory=list)
+
+
+def _normalize_filter_categories(raw_cats: Any, raw_single: Any = None) -> list[str]:
+    tokens: list[str] = []
+    if isinstance(raw_cats, (list, tuple, set)):
+        for item in raw_cats:
+            for part in str(item or "").split(","):
+                tok = part.strip().lower()
+                if tok:
+                    tokens.append(tok)
+    elif isinstance(raw_cats, str) and raw_cats.strip():
+        for part in raw_cats.split(","):
+            tok = part.strip().lower()
+            if tok:
+                tokens.append(tok)
+    elif raw_single is not None:
+        for part in str(raw_single or "").split(","):
+            tok = part.strip().lower()
+            if tok:
+                tokens.append(tok)
+
+    if "all" in tokens:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in tokens:
+        if tok in VALID_FILTER_CATEGORIES and tok not in seen:
+            seen.add(tok)
+            out.append(tok)
+    return out
 
 
 def parse_file_filter(options: dict[str, Any] | None) -> FileFilterConfig:
@@ -228,32 +262,38 @@ def parse_file_filter(options: dict[str, Any] | None) -> FileFilterConfig:
 
     if not isinstance(raw, dict):
         mode = str(opts.get("file_filter_mode") or opts.get("fileFilterMode") or "all").strip().lower()
-        category = str(opts.get("file_filter_category") or opts.get("fileFilterCategory") or "all").strip().lower()
+        raw_cats = opts.get("file_filter_categories")
+        if raw_cats is None:
+            raw_cats = opts.get("fileFilterCategories")
+        raw_cat = opts.get("file_filter_category") or opts.get("fileFilterCategory") or "all"
+        categories = _normalize_filter_categories(raw_cats, raw_cat)
         formats = normalize_format_list(opts.get("file_filter_formats") or opts.get("fileFilterFormats"))
         explicit_enabled = opts.get("file_filter_enabled")
         if explicit_enabled is None:
             explicit_enabled = opts.get("fileFilterEnabled")
     else:
         mode = str(raw.get("mode") or "all").strip().lower()
-        category = str(raw.get("category") or "all").strip().lower()
+        raw_cats = raw.get("categories")
+        raw_cat = raw.get("category") or "all"
+        categories = _normalize_filter_categories(raw_cats, raw_cat)
         formats = normalize_format_list(raw.get("formats"))
         explicit_enabled = raw.get("enabled")
 
-    if mode not in ("all", "include", "except"):
-        mode = "all"
     if mode == "exclude":
         mode = "except"
-    if category not in ("all", "video", "image", "archive", "audio", "document"):
-        category = "all"
+    if mode not in ("all", "include", "except"):
+        mode = "all"
 
     if explicit_enabled is False:
-        return FileFilterConfig(enabled=False, mode="all", category="all", formats=[])
+        return FileFilterConfig(enabled=False, mode="all", category="all", categories=[], formats=[])
 
-    is_active = (mode != "all" and (bool(formats) or category != "all")) or (category != "all")
+    category_summary = ",".join(categories) if categories else "all"
+    is_active = bool(categories) or (mode != "all" and bool(formats))
     return FileFilterConfig(
         enabled=is_active,
         mode=mode,
-        category=category,
+        category=category_summary,
+        categories=categories,
         formats=formats,
     )
 
@@ -262,11 +302,18 @@ def is_file_filter_enabled(options: dict[str, Any] | None) -> bool:
     return parse_file_filter(options).enabled
 
 
+def _category_for_ext(ext_no_dot: str) -> str:
+    if not ext_no_dot:
+        return "other"
+    return detect_file_category(f"sample.{ext_no_dot.lstrip('.').lower()}")
+
+
 def should_download_file_item(item_or_name: Any, options: dict[str, Any] | None) -> bool:
     """
     Evaluate whether a file item should be downloaded according to `options['file_filter']`.
+    Supports single or multiple ticked categories (`categories: ["image", "video", ...]`)
+    as well as optional custom extension lists (`formats`).
     Folders always return True so their contents can be listed and filtered individually.
-    Default ('all' mode, 'all' category) returns True for every file.
     """
     if isinstance(item_or_name, dict):
         if (
@@ -285,24 +332,39 @@ def should_download_file_item(item_or_name: Any, options: dict[str, Any] | None)
 
     file_cat = detect_file_category(item_or_name)
     raw_ext, norm_ext = extract_item_ext(item_or_name)
+    candidates = {x for x in (raw_ext, norm_ext) if x}
 
-    if cfg.category != "all" and file_cat != cfg.category:
-        return False
+    cat_set = set(cfg.categories)
+    fmt_set = set(cfg.formats)
 
     if cfg.mode == "all":
-        return True
-
-    fmt_set = set(cfg.formats)
-    if not fmt_set:
-        return True
-
-    candidates = {x for x in (raw_ext, norm_ext) if x}
-    matched = bool(candidates & fmt_set)
+        return (file_cat in cat_set) if cat_set else True
 
     if cfg.mode == "include":
-        return matched
+        if candidates and fmt_set and bool(candidates & fmt_set):
+            return True
+        if not cat_set:
+            return bool(candidates & fmt_set) if fmt_set else True
+        if file_cat not in cat_set:
+            return False
+        if not fmt_set:
+            return True
+        # If fmt_set specifies extensions belonging to this category, narrow within this category;
+        # otherwise (e.g. user ticked Video and also added '.srt'), accept the whole ticked category.
+        cat_specific_fmts = {f for f in fmt_set if _category_for_ext(f) == file_cat}
+        if cat_specific_fmts:
+            return bool(candidates & cat_specific_fmts)
+        return True
+
     if cfg.mode == "except":
-        return not matched
+        if candidates and fmt_set and bool(candidates & fmt_set):
+            return False
+        if cat_set and not fmt_set:
+            return file_cat not in cat_set
+        if cat_set and fmt_set:
+            return file_cat in cat_set
+        return True
+
     return True
 
 

@@ -641,12 +641,15 @@ def test_frontend_upscale_options_and_candidate_rules_via_node():
     ):
         assert f'id="{dom_id}"' in js, f"Missing control {dom_id} in colab_transfer.js"
 
-    # 3. Extract and execute candidate functions in Node
+    # 3. Extract and execute candidate + multi-category filter functions in Node
     start = js.index("function hasUpscaledSuffix(item)")
     end = js.index("function parentRemotePath(path)", start)
     snippet = js[start:end]
 
     test_script = f"""
+    function escapeHtml(s) {{ return String(s ?? ""); }}
+    function $(id) {{ return null; }}
+    const document = {{ querySelectorAll: () => [] }};
     const OPT_IMAGE_EXTENSIONS = new Set(["jpg", "jpeg", "png", "webp", "bmp", "tiff", "tif"]);
     function isVideoFile(item) {{
       const n = String(item?.name || item?.path || "").toLowerCase();
@@ -667,9 +670,36 @@ def test_frontend_upscale_options_and_candidate_rules_via_node():
     const vidUpscaledAvi = {{ name: "clip-upscaled.avi", size: 20 * 1024 * 1024 }};
     const imgLarge = {{ name: "photo.jpg", size: 6 * 1024 * 1024 }};
     const imgSmall = {{ name: "icon.png", size: 200 * 1024 }};
+    const docTxt = {{ name: "notes.txt", size: 1024 }};
 
-    // Upscale mode: accepts plain video + any image regardless of size, skips -upscaled
-    const upOpts = {{ upscale: true, optimize_mode: "upscale", min_target_mb: 1, max_target_mb: 9999 }};
+    // Check mode defaults: Downscale -> ["image"], Upscale -> ["video"]
+    const defDown = getDefaultOptimizeFileFilter("downscale");
+    const defUp = getDefaultOptimizeFileFilter("upscale");
+    if (!defDown.enabled || defDown.mode !== "include" || JSON.stringify(defDown.categories) !== '["image"]') {{
+      throw new Error("Downscale default filter must be include [image]");
+    }}
+    if (!defUp.enabled || defUp.mode !== "include" || JSON.stringify(defUp.categories) !== '["video"]') {{
+      throw new Error("Upscale default filter must be include [video]");
+    }}
+
+    // Default Upscale filter accepts video, skips image & txt
+    if (!passesFileFilter(vidPlain, defUp)) throw new Error("defUp must accept video");
+    if (passesFileFilter(imgLarge, defUp)) throw new Error("defUp must skip image by default");
+    if (passesFileFilter(docTxt, defUp)) throw new Error("defUp must skip txt");
+
+    // Default Downscale filter accepts image, skips video & txt
+    if (!passesFileFilter(imgLarge, defDown)) throw new Error("defDown must accept image");
+    if (passesFileFilter(vidPlain, defDown)) throw new Error("defDown must skip video by default");
+
+    // Multi-category tick ["image", "video"] accepts BOTH image & video, skips txt
+    const multiCat = {{ enabled: true, mode: "include", categories: ["image", "video"], formats: [] }};
+    if (!passesFileFilter(vidPlain, multiCat) || !passesFileFilter(imgSmall, multiCat)) {{
+      throw new Error("Multi-category [image, video] must accept both image and video");
+    }}
+    if (passesFileFilter(docTxt, multiCat)) throw new Error("Multi-category [image, video] must skip txt");
+
+    // Upscale mode with [image, video]: accepts plain video + any image regardless of size, skips -upscaled
+    const upOpts = {{ upscale: true, optimize_mode: "upscale", min_target_mb: 1, max_target_mb: 9999, fileFilter: multiCat }};
     if (!isOptimizeCandidate(vidPlain, upOpts)) throw new Error("Upscale should accept plain video");
     if (!isOptimizeCandidate(imgLarge, upOpts)) throw new Error("Upscale should accept image > 1MB");
     if (!isOptimizeCandidate(imgSmall, upOpts)) throw new Error("Upscale should accept small image");
@@ -687,5 +717,128 @@ def test_frontend_upscale_options_and_candidate_rules_via_node():
     if (isOptimizeInput(vidUpscaledAvi, downOpts)) throw new Error("Downscale must skip clip-upscaled.avi even with autoConvert");
     if (!isOptimizeCandidate(imgLarge, downOpts)) throw new Error("Downscale should accept image > max_target_mb");
     if (isOptimizeCandidate(imgSmall, downOpts)) throw new Error("Downscale should not compress small image");
+
+    // Turning OFF fileFilter (enabled: false) allows ALL files (video, image, txt, etc.), except -upscaled!
+    const ffOff = {{ enabled: false, mode: "include", categories: ["video"], formats: [], _optFilterVersion: 2 }};
+    const upOffOpts = {{ upscale: true, optimize_mode: "upscale", fileFilter: ffOff }};
+    const downOffOpts = {{ upscale: false, optimize_mode: "downscale", fileFilter: ffOff }};
+    if (!isOptimizeCandidate(vidPlain, upOffOpts) || !isOptimizeCandidate(imgSmall, upOffOpts) || !isOptimizeCandidate(docTxt, upOffOpts)) {{
+      throw new Error("Turning filter OFF in Upscale must allow all files");
+    }}
+    if (!isOptimizeCandidate(vidPlain, downOffOpts) || !isOptimizeCandidate(docTxt, downOffOpts)) {{
+      throw new Error("Turning filter OFF in Downscale must allow non-upscaled video and txt");
+    }}
+    if (isOptimizeInput(vidUpscaled, downOffOpts)) {{
+      throw new Error("Even with filter OFF, Downscale must still skip -upscaled video");
+    }}
     """
     subprocess.run([node, "-e", test_script], check=True)
+
+
+def test_folder_download_upscale_and_multi_category_file_filter(tmp_path):
+    from src.providers.base import BaseProvider
+
+    class DummyFolderProvider(BaseProvider):
+        name = "dummy_folder_prov"
+
+        async def validate_credentials(self, credentials):
+            return {"ok": True}
+
+        async def list_files(self, credentials, path_or_id):
+            return {
+                "items": [
+                    {"id": "v1", "name": "01_talking_suit_360p_audio.mp4", "size": 5_000_000},
+                    {"id": "v2", "name": "02_talking_glasses_360p.mp4", "size": 4_000_000},
+                    {"id": "v_done", "name": "03_done-upscaled.mp4", "size": 9_000_000},
+                    {"id": "i1", "name": "poster.jpg", "size": 5_000_000},
+                    {"id": "d1", "name": "notes.txt", "size": 1200},
+                ]
+            }
+
+        async def download_file(self, credentials, file_ref, local_path, progress):
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(b"media-bytes")
+            return local_path
+
+        async def upload_file(self, credentials, local_path, target_folder, progress):
+            return {"ok": True}
+
+    prov = DummyFolderProvider()
+
+    # 1. Upscale default filter (categories=["video"]) -> downloads ONLY non-upscaled videos!
+    job_up_vid = JobState(
+        "folder-up-vid",
+        {
+            "options": {
+                "optimize_image": True,
+                "upscale": True,
+                "file_filter": {"enabled": True, "mode": "include", "categories": ["video"], "formats": []},
+            }
+        },
+    )
+    dl_vid = asyncio.run(prov.download_folder({}, {"id": "testUpscale", "name": "testUpscale"}, tmp_path / "dl1", job_up_vid))
+    assert sorted(p.name for p in dl_vid) == [
+        "01_talking_suit_360p_audio.mp4",
+        "02_talking_glasses_360p.mp4",
+    ]
+
+    # 2. Upscale with BOTH ["video", "image"] ticked -> downloads videos + poster.jpg, skips -upscaled & notes.txt!
+    job_up_both = JobState(
+        "folder-up-both",
+        {
+            "options": {
+                "optimize_image": True,
+                "upscale": True,
+                "file_filter": {"enabled": True, "mode": "include", "categories": ["video", "image"], "formats": []},
+            }
+        },
+    )
+    dl_both = asyncio.run(prov.download_folder({}, {"id": "testUpscale", "name": "testUpscale"}, tmp_path / "dl2", job_up_both))
+    assert sorted(p.name for p in dl_both) == [
+        "01_talking_suit_360p_audio.mp4",
+        "02_talking_glasses_360p.mp4",
+        "poster.jpg",
+    ]
+
+    # 3. Downscale default filter (categories=["image"]) -> downloads ONLY poster.jpg (>3MB), skips all videos & txt!
+    job_down = JobState(
+        "folder-down-img",
+        {
+            "options": {
+                "optimize_image": True,
+                "upscale": False,
+                "max_target_mb": 3.0,
+                "file_filter": {"enabled": True, "mode": "include", "categories": ["image"], "formats": []},
+            }
+        },
+    )
+    dl_down = asyncio.run(prov.download_folder({}, {"id": "testUpscale", "name": "testUpscale"}, tmp_path / "dl3", job_down))
+    assert [p.name for p in dl_down] == ["poster.jpg"]
+
+    # 4. Filter turned OFF (enabled=False) -> allows ALL files (videos, poster.jpg, notes.txt), only skipping -upscaled!
+    job_ff_off = JobState(
+        "folder-ff-off",
+        {
+            "options": {
+                "is_optimize_page": True,
+                "optimize_image": True,
+                "upscale": True,
+                "file_filter": {"enabled": False, "mode": "include", "categories": ["video"], "formats": []},
+            }
+        },
+    )
+    dl_all = asyncio.run(prov.download_folder({}, {"id": "testUpscale", "name": "testUpscale"}, tmp_path / "dl4", job_ff_off))
+    assert sorted(p.name for p in dl_all) == [
+        "01_talking_suit_360p_audio.mp4",
+        "02_talking_glasses_360p.mp4",
+        "notes.txt",
+        "poster.jpg",
+    ]
+
+    # 5. Multi-category exclude mode in media_converter
+    ex_opts = {"file_filter": {"enabled": True, "mode": "except", "categories": ["video", "audio"], "formats": []}}
+    assert media_converter.should_download_file_item("clip.mp4", ex_opts) is False
+    assert media_converter.should_download_file_item("song.mp3", ex_opts) is False
+    assert media_converter.should_download_file_item("photo.png", ex_opts) is True
+    assert media_converter.should_download_file_item("doc.pdf", ex_opts) is True
+

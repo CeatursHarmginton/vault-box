@@ -1602,11 +1602,17 @@ def upscale_directory(
         key=lambda p: p.as_posix().lower(),
     )
 
+    from .media_converter import is_file_filter_enabled, should_download_file_item
+
     videos: list[Path] = []
     images: list[Path] = []
     other_files: list[Path] = []
+    filter_on = is_file_filter_enabled(options)
 
     for p in all_files:
+        if filter_on and not should_download_file_item(p.name, options):
+            other_files.append(p)
+            continue
         ext = p.suffix.lower()
         if ext in VIDEO_EXTENSIONS:
             videos.append(p)
@@ -1743,12 +1749,18 @@ def upscale_directory(
                         log_fn=log_fn,
                     )
 
-    # 3. Record non-media files as Skipped (without copying unnecessary files unless extracted archive requires it)
+    # 3. Handle non-media passthrough files (when filter is OFF or extra categories are included)
+    passthrough_copy = not bool(options.get("replace"))
     for p in other_files:
         if cancel_check:
             cancel_check()
-        rel_str = p.relative_to(input_dir).as_posix()
+        rel_path = p.relative_to(input_dir)
+        rel_str = rel_path.as_posix()
         sz = p.stat().st_size if p.exists() else 0
+        if passthrough_copy and (not filter_on or should_download_file_item(p.name, options)):
+            target_p = output_dir / rel_path
+            target_p.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, target_p)
         results.append({
             "name": rel_str,
             "source_name": rel_str,

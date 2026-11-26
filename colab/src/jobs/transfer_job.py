@@ -18,6 +18,7 @@ from ..utils.media_converter import (
     convert_directory,
     is_auto_convert_enabled,
     is_file_filter_enabled,
+    parse_file_filter,
     resolve_conversion_decision,
     resolve_conversion_target,
     should_download_file_item,
@@ -645,6 +646,7 @@ async def run_transfer(job: JobState) -> None:
             is_upscale_mode = bool(live_opts.get("upscale"))
             force_reopt = bool(live_opts.get("force_reoptimize"))
             auto_convert_on = is_auto_convert_enabled(live_opts)
+            has_explicit_ff = isinstance(live_opts.get("file_filter") or live_opts.get("fileFilter"), dict)
             filtered_file_items: list[dict[str, Any]] = []
             for item in file_items:
                 item_label = item.get("name") or item.get("id") or "file"
@@ -662,12 +664,12 @@ async def run_transfer(job: JobState) -> None:
                             _record_optimized_skip(job, item, "Skipped (Upscaled video)")
                             job.log(f"[SKIP] Upscaled video ignored in downscale mode: {item_label}")
                             continue
-                        if not (auto_convert_on and resolve_conversion_decision(item, live_opts)[1]):
+                        if not has_explicit_ff and not (auto_convert_on and resolve_conversion_decision(item, live_opts)[1]):
                             job.files_skipped += 1
                             _record_optimized_skip(job, item, "Skipped")
                             job.log(f"[SKIP] Video ignored by image optimizer: {item_label}")
                             continue
-                if not live_opts.get("extract") and _is_archive_item(item):
+                if not has_explicit_ff and not live_opts.get("extract") and _is_archive_item(item):
                     job.files_skipped += 1
                     _record_optimized_skip(job, item, "Skipped")
                     job.log(f"[SKIP] Archive ignored by image optimizer: {item_label}")
@@ -905,10 +907,12 @@ async def run_transfer(job: JobState) -> None:
             job.log(f"Extract stage output files: {len(outputs)}")
 
         if is_file_filter_enabled(options) and out_root.exists():
-            for p in list(out_root.rglob("*")):
-                if p.is_file() and not should_download_file_item(p.name, options):
-                    p.unlink(missing_ok=True)
-            outputs = [p for p in out_root.rglob("*") if p.is_file()]
+            ff_cfg = parse_file_filter(options)
+            if not (options.get("extract") and ff_cfg.categories == ["archive"] and not ff_cfg.formats):
+                for p in list(out_root.rglob("*")):
+                    if p.is_file() and not should_download_file_item(p.name, options):
+                        p.unlink(missing_ok=True)
+                outputs = [p for p in out_root.rglob("*") if p.is_file()]
 
         if is_auto_convert_enabled(_live_options(job, options)):
             out_root, outputs = await _run_auto_convert_stage(
@@ -1082,8 +1086,23 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         item_k = _queue_item_key(source, item)
         item_name_str = _item_name(item)
         item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
+        if item_type != "folder" and is_file_filter_enabled(options) and not should_download_file_item(item, options):
+            job.files_skipped += 1
+            _record_optimized_skip(job, item, "Skipped")
+            job.log(f"[File-Filter] Skipped file excluded by filter: {item.get('name') or item.get('id') or 'file'}")
+            job.finish_item(item_k, status="skipped", name=item_name_str)
+            timing = job.item_timings.get(item_k) or {}
+            job.completed_items.append({
+                **item_ref,
+                "startTime": timing.get("startTime"),
+                "endTime": timing.get("endTime"),
+                "duration": timing.get("duration"),
+            })
+            continue
+
+        live_opts = _live_options(job, options)
+        has_explicit_ff = isinstance(live_opts.get("file_filter") or live_opts.get("fileFilter"), dict)
         if item_type != "folder" and _is_video_item(item):
-            live_opts = _live_options(job, options)
             is_upscale_mode = bool(live_opts.get("upscale"))
             force_reopt = bool(live_opts.get("force_reoptimize"))
             already_upscaled = is_upscaled_filename(item_name_str)
@@ -1117,7 +1136,7 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
                     continue
                 auto_convert_on = is_auto_convert_enabled(live_opts)
                 should_convert = auto_convert_on and resolve_conversion_decision(item, live_opts)[1]
-                if not should_convert:
+                if not has_explicit_ff and not should_convert:
                     job.files_skipped += 1
                     _record_optimized_skip(job, item, "Skipped")
                     job.log(f"[SKIP] Video ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
@@ -1130,24 +1149,10 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
                         "duration": timing.get("duration"),
                     })
                     continue
-        if item_type != "folder" and not options.get("extract") and _is_archive_item(item):
+        if not has_explicit_ff and item_type != "folder" and not options.get("extract") and _is_archive_item(item):
             job.files_skipped += 1
             _record_optimized_skip(job, item, "Skipped")
             job.log(f"[SKIP] Archive ignored by image optimizer: {item.get('name') or item.get('id') or 'file'}")
-            job.finish_item(item_k, status="skipped", name=item_name_str)
-            timing = job.item_timings.get(item_k) or {}
-            job.completed_items.append({
-                **item_ref,
-                "startTime": timing.get("startTime"),
-                "endTime": timing.get("endTime"),
-                "duration": timing.get("duration"),
-            })
-            continue
-
-        if item_type != "folder" and is_file_filter_enabled(options) and not should_download_file_item(item, options):
-            job.files_skipped += 1
-            _record_optimized_skip(job, item, "Skipped")
-            job.log(f"[File-Filter] Skipped file excluded by filter: {item.get('name') or item.get('id') or 'file'}")
             job.finish_item(item_k, status="skipped", name=item_name_str)
             timing = job.item_timings.get(item_k) or {}
             job.completed_items.append({
@@ -1221,9 +1226,11 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
             job.log(f"Extract stage output files: {len(outputs)}")
 
         if is_file_filter_enabled(options) and optimize_input.exists():
-            for p in list(optimize_input.rglob("*")):
-                if p.is_file() and not should_download_file_item(p.name, options):
-                    p.unlink(missing_ok=True)
+            ff_cfg = parse_file_filter(options)
+            if not (options.get("extract") and ff_cfg.categories == ["archive"] and not ff_cfg.formats):
+                for p in list(optimize_input.rglob("*")):
+                    if p.is_file() and not should_download_file_item(p.name, options):
+                        p.unlink(missing_ok=True)
 
         if is_auto_convert_enabled(_live_options(job, options)):
             conv_outputs = [p for p in optimize_input.rglob("*") if p.is_file()]
