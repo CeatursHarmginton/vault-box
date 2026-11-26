@@ -1109,6 +1109,9 @@ def test_span_conv3xc_reparam_freeze_nhwc_guard_and_log_copy_spacing():
         def __init__(self) -> None:
             self.update_calls = 0
             self.eval_conv = object()
+            self.weight_concat = "tmp_w"
+            self.bias_concat = "tmp_b"
+            self._modules = {"conv": object(), "sk": object(), "eval_conv": self.eval_conv}
 
         def update_params(self) -> None:
             self.update_calls += 1
@@ -1121,21 +1124,14 @@ def test_span_conv3xc_reparam_freeze_nhwc_guard_and_log_copy_spacing():
         def modules(self):
             return [self, self.c1, self.c2]
 
-    class FakePlainNet:
-        def modules(self):
-            return [self]
-
     span_net = FakeSpanNet()
-    plain_net = FakePlainNet()
-    assert ai_upscaler._is_reparam_or_span_model(span_net, "custom_model") is True
-    assert ai_upscaler._is_reparam_or_span_model(plain_net, "2xLiveActionV1_SPAN") is True
-    assert ai_upscaler._is_reparam_or_span_model(plain_net, "2xNomosUni_span_multijpg_ldl") is True
-    assert ai_upscaler._is_reparam_or_span_model(plain_net, "4xNomos8kSC") is False
-
     ai_upscaler._freeze_reparam_modules(span_net)
     assert span_net.c1.update_calls == 1
     assert span_net.c2.update_calls == 1
-    # Subsequent forward passes calling mod.update_params() must be a no-op (0 extra mutations!)
+    assert "conv" not in span_net.c1._modules and "sk" not in span_net.c1._modules
+    assert "eval_conv" in span_net.c1._modules
+    assert span_net.c1.weight_concat is None
+    # Subsequent forward passes calling mod.update_params() must be a no-op (0 extra mutations -> keeps NHWC strides!)
     span_net.c1.update_params()
     span_net.c2.update_params()
     assert span_net.c1.update_calls == 1

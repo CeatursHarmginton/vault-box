@@ -617,26 +617,11 @@ def download_if_needed(
         tmp_dest.unlink(missing_ok=True)
 
 
-def _is_reparam_or_span_model(net: Any, preset_name: str = "") -> bool:
-    """Detect SPAN / Conv3XC re-parameterizable architectures whose dynamic weight fusion conflicts with NHWC strides."""
-    if "span" in str(preset_name or "").lower():
-        return True
-    if "span" in type(net).__name__.lower():
-        return True
-    try:
-        for mod in net.modules():
-            cls_low = type(mod).__name__.lower()
-            if "conv3xc" in cls_low or hasattr(mod, "eval_conv") or callable(getattr(mod, "update_params", None)):
-                return True
-    except Exception:
-        pass
-    return False
-
-
 def _freeze_reparam_modules(net: Any) -> None:
     """
-    Materialize `Conv3XC.update_params()` once in FP32 eval mode and replace `update_params` with a no-op
-    so inference never mutates `eval_conv.weight.data` strides across batches or inside `torch.compile` / XLA.
+    Materialize `Conv3XC.update_params()` once in FP32 eval mode, prune training-only branches (`conv`, `sk`),
+    and replace `update_params` with a no-op so inference never recomputes 20x weight fusions per batch or
+    overwrites `eval_conv.weight.data` `channels_last` (NHWC) strides back to NCHW inside `torch.compile` / XLA.
     """
     try:
         for mod in net.modules():
@@ -644,6 +629,14 @@ def _freeze_reparam_modules(net: Any) -> None:
             if callable(upd) and hasattr(mod, "eval_conv"):
                 upd()
                 setattr(mod, "update_params", lambda: None)
+                if hasattr(mod, "weight_concat"):
+                    setattr(mod, "weight_concat", None)
+                if hasattr(mod, "bias_concat"):
+                    setattr(mod, "bias_concat", None)
+                sub_mods = getattr(mod, "_modules", None)
+                if isinstance(sub_mods, dict):
+                    sub_mods.pop("conv", None)
+                    sub_mods.pop("sk", None)
     except Exception:
         pass
 
@@ -696,13 +689,15 @@ def load_upscale_model(
         target_dtype = torch.bfloat16 if use_bf16 else torch.float32
         descriptor.to(dtype=target_dtype)
         descriptor.to(device=device)
+        if isinstance(getattr(descriptor.model, "mean", None), torch.Tensor):
+            descriptor.model.mean = descriptor.model.mean.to(device=device, dtype=target_dtype)
         return descriptor
 
     is_cuda = dev_type == "cuda"
-    if fp16 and is_cuda and descriptor.supports_half:
-        descriptor.to(device=device, dtype=torch.float16)
-    else:
-        descriptor.to(device=device, dtype=torch.float32)
+    target_dtype = torch.float16 if (fp16 and is_cuda and descriptor.supports_half) else torch.float32
+    descriptor.to(device=device, dtype=target_dtype)
+    if isinstance(getattr(descriptor.model, "mean", None), torch.Tensor):
+        descriptor.model.mean = descriptor.model.mean.to(device=device, dtype=target_dtype)
     return descriptor
 
 
@@ -896,13 +891,16 @@ def resize_sr_gpu(sr: Any, out_h: int, out_w: int) -> Any:
     sr_h, sr_w = sr.shape[-2], sr.shape[-1]
     if sr_h == out_h and sr_w == out_w:
         return sr
-    is_xla = str(getattr(getattr(sr, "device", None), "type", "")).startswith("xla")
-    if is_xla:
+    dev_type = str(getattr(getattr(sr, "device", None), "type", ""))
+    if dev_type.startswith("xla"):
         # Avoid `antialias=True` on XLA which triggers host CPU fallback (`aten::_upsample_bicubic2d_aa`).
         mode = "bilinear" if (out_h < sr_h or out_w < sr_w) else "bicubic"
         return F.interpolate(sr.float(), size=(out_h, out_w), mode=mode, align_corners=False).to(sr.dtype)
     if out_h < sr_h and (sr_h / out_h) > 1.25:
         return F.interpolate(sr.float(), size=(out_h, out_w), mode="bicubic", align_corners=False, antialias=True).to(sr.dtype)
+    if dev_type == "cuda":
+        # Match Video2X.ipynb native FP16 CUDA bicubic interpolation (avoids 3x full-HD FP32 copies per batch).
+        return F.interpolate(sr, size=(out_h, out_w), mode="bicubic", align_corners=False)
     return F.interpolate(sr.float(), size=(out_h, out_w), mode="bicubic", align_corners=False).to(sr.dtype)
 
 
@@ -1319,8 +1317,7 @@ def process_single_video(
     out_w, out_h = compute_target_dims(in_w, in_h, model.scale, target_resolution)
 
     use_channels_last = False
-    allow_nhwc = has_cuda and model_dtype == torch.float16 and not _is_reparam_or_span_model(model.model, selected_model)
-    if allow_nhwc:
+    if has_cuda and model_dtype == torch.float16:
         try:
             model.model.to(memory_format=torch.channels_last)
             with torch.inference_mode():
@@ -1339,7 +1336,7 @@ def process_single_video(
         x = batch_u8_gpu.permute(0, 3, 1, 2)
         if use_channels_last:
             x = x.contiguous(memory_format=torch.channels_last)
-        else:
+        elif is_tpu:
             x = x.contiguous()
         return x.to(dtype=model_dtype).div_(255.0)
 
