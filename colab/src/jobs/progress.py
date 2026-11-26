@@ -48,6 +48,7 @@ class JobState:
     _phase_total_keys: set[tuple[str, str]] = field(default_factory=set)
     _phase_done_by_name: dict[str, int] = field(default_factory=dict)
     _phase_total_by_name: dict[str, int] = field(default_factory=dict)
+    _file_accounted_bytes: dict[tuple[str, str], int] = field(default_factory=dict)
     files_downloaded: int = 0
     files_to_download: int = 0
     files_uploaded: int = 0
@@ -224,6 +225,8 @@ class JobState:
         matched_key = total_key or self.current_file
         if matched_key:
             base_k = matched_key.replace("\\", "/").rstrip("/").split("/")[-1]
+            acc_key = (phase, base_k or matched_key)
+            self._file_accounted_bytes[acc_key] = self._file_accounted_bytes.get(acc_key, 0) + n
             target_entry = self.active_files.get(matched_key) or self.active_files.get(base_k)
             if target_entry:
                 target_entry["bytes_done"] = target_entry.get("bytes_done", 0) + n
@@ -236,6 +239,43 @@ class JobState:
             self._tick_at = now
             self._tick_bytes = self.bytes_done
         self.updated_at = now
+
+    def sync_resumed_file_bytes(self, name: str, done_bytes: int, total: int = 0, phase: str = "download") -> None:
+        """Reconcile byte counters when resuming an existing partial file so bytes are never double-counted."""
+        if not name or done_bytes < 0:
+            return
+        base_k = name.replace("\\", "/").rstrip("/").split("/")[-1] or name
+        acc_key = (phase, base_k)
+        already_counted = self._file_accounted_bytes.get(acc_key, 0)
+        delta = done_bytes - already_counted
+        if phase != self._phase:
+            self._phase = phase
+            self._phase_done = self._phase_done_by_name.get(phase, 0)
+            self._phase_total = self._phase_total_by_name.get(phase, 0)
+        if total > 0:
+            key = (phase, name)
+            key_base = (phase, base_k)
+            if key not in self._phase_total_keys and key_base not in self._phase_total_keys:
+                self._phase_total += total
+                self._phase_total_keys.add(key)
+                if base_k != name:
+                    self._phase_total_keys.add(key_base)
+        if delta != 0:
+            self.bytes_done = max(0, self.bytes_done + delta)
+            self._phase_done = max(0, self._phase_done + delta)
+            self._phase_done_by_name[phase] = self._phase_done
+            self._file_accounted_bytes[acc_key] = done_bytes
+            self._tick_bytes = max(0, self._tick_bytes + delta)
+        if self._phase_total:
+            self.bytes_total = self._phase_total
+            setattr(self.progress, phase, min(100, self._phase_done / self._phase_total * 100))
+            self._phase_total_by_name[phase] = self._phase_total
+        target_entry = self.active_files.get(name) or self.active_files.get(base_k)
+        if target_entry:
+            target_entry["bytes_done"] = done_bytes
+            if total > 0 and not target_entry.get("size"):
+                target_entry["size"] = total
+        self.updated_at = time.time()
 
     def set_phase_progress(
         self,

@@ -267,11 +267,20 @@ class LinksProvider(BaseProvider):
                                     + f"\n{high_speed_marker}\n"
                                     + "ConnLimit 4096\n"
                                     + "SocksPort 127.0.0.1:9050 IsolateSOCKSAuth KeepAliveIsolateSOCKSAuth\n"
+                                    + "ControlPort 127.0.0.1:9060\n"
+                                    + "CookieAuthentication 0\n"
                                     + "NumEntryGuards 8\n"
                                     + "CircuitBuildTimeout 15\n"
                                     + "LearnCircuitBuildTimeout 0\n"
                                     + "MaxCircuitDirtiness 7200\n"
                                     + "CircuitStreamTimeout 60\n"
+                                )
+                                needs_restart = True
+                            elif "ControlPort 127.0.0.1:9060" not in txt:
+                                txt = (
+                                    txt.rstrip()
+                                    + "\nControlPort 127.0.0.1:9060\n"
+                                    + "CookieAuthentication 0\n"
                                 )
                                 needs_restart = True
                             if needs_restart:
@@ -288,6 +297,8 @@ class LinksProvider(BaseProvider):
                                 "tor",
                                 "--ConnLimit", "4096",
                                 "--SocksPort", "127.0.0.1:9050 IsolateSOCKSAuth KeepAliveIsolateSOCKSAuth",
+                                "--ControlPort", "127.0.0.1:9060",
+                                "--CookieAuthentication", "0",
                                 "--NumEntryGuards", "8",
                                 "--MaxCircuitDirtiness", "7200",
                                 "--RunAsDaemon", "1",
@@ -335,6 +346,8 @@ class LinksProvider(BaseProvider):
 
     _TOR_TURBO_EXTRA_PORTS: tuple[int, ...] = (9051, 9052, 9053)
     _tor_turbo_daemons: list[str] = []
+    _tor_newnym_ts: dict[int, float] = {}
+    _tor_newnym_notice_ts: float = 0.0
     _mega_direct_cooldown_until: float = 0.0
     _mega_direct_notice_ts: float = 0.0
     _mega_direct_was_throttled: bool = False
@@ -383,10 +396,24 @@ class LinksProvider(BaseProvider):
                     "cached-microdescs.new",
                 )
                 for port in self._TOR_TURBO_EXTRA_PORTS:
+                    ctrl_port = port + 10
+                    data_dir = Path(f"/tmp/vb_tor_{port}")
+                    torrc_f = data_dir / "torrc"
                     if _port_open(port):
-                        continue
+                        try:
+                            if torrc_f.is_file() and f"ControlPort 127.0.0.1:{ctrl_port}" in torrc_f.read_text(encoding="utf-8", errors="ignore"):
+                                continue
+                            pid_f = data_dir / "tor.pid"
+                            if pid_f.is_file():
+                                pid_txt = pid_f.read_text(encoding="utf-8", errors="ignore").strip()
+                                if pid_txt.isdigit():
+                                    subprocess.run(["kill", "-9", pid_txt], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                    time.sleep(0.2)
+                        except Exception:
+                            continue
+                        if _port_open(port):
+                            continue
                     try:
-                        data_dir = Path(f"/tmp/vb_tor_{port}")
                         data_dir.mkdir(parents=True, exist_ok=True)
                         os.chmod(data_dir, 0o700)
                         if cache_src.is_dir():
@@ -399,11 +426,12 @@ class LinksProvider(BaseProvider):
                                         os.chmod(dst_f, 0o600)
                                     except Exception:
                                         pass
-                        torrc_f = data_dir / "torrc"
                         torrc_f.write_text(
                             f"DataDirectory {data_dir}\n"
                             f"PidFile {data_dir}/tor.pid\n"
                             f"SocksPort 127.0.0.1:{port} IsolateSOCKSAuth KeepAliveIsolateSOCKSAuth\n"
+                            f"ControlPort 127.0.0.1:{ctrl_port}\n"
+                            "CookieAuthentication 0\n"
                             "ConnLimit 4096\n"
                             "NumEntryGuards 8\n"
                             "CircuitBuildTimeout 10\n"
@@ -444,7 +472,77 @@ class LinksProvider(BaseProvider):
             pool["idle"] = []  # LIFO stack of verified fast (proxy_url, httpx.AsyncClient)
             pool["rr"] = 0
             pool["sem"] = asyncio.Semaphore(64)
+            pool["tor_sem"] = asyncio.Semaphore(16)
+        elif "tor_sem" not in pool:
+            pool["tor_sem"] = asyncio.Semaphore(16)
         return pool
+
+    async def _rotate_tor_newnym(self, progress: JobState | None = None, proxy_hint: str | None = None) -> bool:
+        """Send SIGNAL NEWNYM to Tor ControlPort(s) (with 10.5s per-daemon cooldown) to obtain fresh Exit IPs."""
+        from ..providers.base import _loop_store
+
+        locks = _loop_store("mega_tor_locks")
+        lock = locks.get("newnym")
+        if lock is None:
+            lock = locks["newnym"] = asyncio.Lock()
+
+        target_ports: list[int] = []
+        if proxy_hint:
+            m_port = re.search(r"127\.0\.0\.1:(905\d)\b", str(proxy_hint))
+            if m_port:
+                target_ports.append(int(m_port.group(1)))
+        if not target_ports:
+            target_ports = [9050, *self._TOR_TURBO_EXTRA_PORTS]
+
+        rotated_ports: set[int] = set()
+        async with lock:
+            now = time.monotonic()
+            for socks_port in target_ports:
+                last_ts = type(self)._tor_newnym_ts.get(socks_port, 0.0)
+                if (now - last_ts) < 10.5:
+                    continue
+                ctrl_port = socks_port + 10
+                writer: asyncio.StreamWriter | None = None
+                try:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection("127.0.0.1", ctrl_port),
+                        timeout=1.2,
+                    )
+                    writer.write(b'AUTHENTICATE ""\r\nSIGNAL NEWNYM\r\nQUIT\r\n')
+                    await asyncio.wait_for(writer.drain(), timeout=1.0)
+                    reply = await asyncio.wait_for(reader.read(256), timeout=1.2)
+                    if b"250" in reply:
+                        type(self)._tor_newnym_ts[socks_port] = time.monotonic()
+                        rotated_ports.add(socks_port)
+                except Exception:
+                    pass
+                finally:
+                    if writer is not None:
+                        try:
+                            writer.close()
+                            await writer.wait_closed()
+                        except Exception:
+                            pass
+
+            if rotated_ports:
+                pool = self._get_mega_circuit_pool()
+                idle: list[tuple[str, httpx.AsyncClient]] = pool.get("idle") or []
+                kept_idle: list[tuple[str, httpx.AsyncClient]] = []
+                stale_clients: list[httpx.AsyncClient] = []
+                for px_u, cli_obj in idle:
+                    if any(f"127.0.0.1:{p}" in str(px_u) for p in rotated_ports):
+                        stale_clients.append(cli_obj)
+                    else:
+                        kept_idle.append((px_u, cli_obj))
+                pool["idle"] = kept_idle
+                for stale_cli in stale_clients:
+                    await self._discard_mega_circuit(stale_cli)
+
+                now_wall = time.time()
+                if progress and (now_wall - type(self)._tor_newnym_notice_ts) >= 20.0:
+                    type(self)._tor_newnym_notice_ts = now_wall
+                    progress.log("[Proxy] Đã xoay mạch Tor (SIGNAL NEWNYM) sang Exit IP mới để tiếp tục tải phần còn thiếu...")
+        return bool(rotated_ports)
 
     def _acquire_mega_circuit(self, daemons: list[str]) -> tuple[str, httpx.AsyncClient]:
         from ..providers.base import track_client
@@ -2795,6 +2893,37 @@ class LinksProvider(BaseProvider):
             type(self)._mega_direct_notice_ts = now
             progress.log("[MEGA] Direct IP bandwidth limit reached; switching to Multi-Circuit Tor Turbo pool and resuming...")
 
+    @staticmethod
+    def _pack_int_ranges(indices: set[int]) -> list[list[int]]:
+        if not indices:
+            return []
+        ordered = sorted(indices)
+        ranges: list[list[int]] = [[ordered[0], ordered[0]]]
+        for val in ordered[1:]:
+            if val == ranges[-1][1] + 1:
+                ranges[-1][1] = val
+            else:
+                ranges.append([val, val])
+        return ranges
+
+    @staticmethod
+    def _unpack_int_ranges(ranges: list[Any], upper_bound: int) -> set[int]:
+        out: set[int] = set()
+        if upper_bound <= 0 or not isinstance(ranges, list):
+            return out
+        for item in ranges:
+            try:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    lo = max(0, int(item[0]))
+                    hi = min(upper_bound - 1, int(item[1]))
+                    if lo <= hi:
+                        out.update(range(lo, hi + 1))
+                elif isinstance(item, int) and 0 <= item < upper_bound:
+                    out.add(item)
+            except (TypeError, ValueError):
+                continue
+        return out
+
     async def _download_mega_stream_decrypt(
         self,
         dl_url: str,
@@ -2806,14 +2935,28 @@ class LinksProvider(BaseProvider):
         proxy: str | None = None,
         refresh_url: Any = None,
     ) -> Path:
+        import contextlib
         import threading
         from ..providers.base import shared_client, track_client
         from ..utils.http import ensure_socks_support
 
         dest.parent.mkdir(parents=True, exist_ok=True)
         part_path = dest.with_suffix(dest.suffix + ".part")
+        ckpt_path = dest.parent / f".{dest.name}.ckpt.part"
+        ckpt_tmp_path = dest.parent / f".{dest.name}.ckpt.tmp.part"
+        key_fp = hashlib.sha256(file_key + file_iv + f":{expected_size}".encode("ascii")).hexdigest()[:24]
         progress.current_file = dest.name
         req_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36"}
+
+        def _cleanup_partial_files() -> None:
+            part_path.unlink(missing_ok=True)
+            ckpt_path.unlink(missing_ok=True)
+            ckpt_tmp_path.unlink(missing_ok=True)
+
+        def _is_cancel_exc(exc_obj: BaseException | None) -> bool:
+            if exc_obj is None:
+                return False
+            return isinstance(exc_obj, asyncio.CancelledError) or exc_obj.__class__.__name__ == "JobCancelled"
 
         def _make_decryptor(initial_iv: bytes, byte_offset: int = 0) -> Any:
             if byte_offset > 0:
@@ -2840,24 +2983,59 @@ class LinksProvider(BaseProvider):
 
         # Fallback path when exact byte size is unknown (or 0-byte node)
         if expected_size <= 0:
-            part_path.unlink(missing_ok=True)
             done = 0
+            resumed_stream = False
+            if part_path.is_file() and ckpt_path.is_file():
+                try:
+                    meta_s = json.loads(ckpt_path.read_text(encoding="utf-8"))
+                    if isinstance(meta_s, dict) and meta_s.get("key_fp") == key_fp and meta_s.get("mode") == "stream":
+                        raw_sz = part_path.stat().st_size
+                        done = (raw_sz // 16) * 16
+                        if raw_sz != done:
+                            with part_path.open("r+b") as f_tr:
+                                f_tr.truncate(done)
+                        resumed_stream = done > 0
+                except Exception:
+                    done = 0
+            if not resumed_stream:
+                part_path.unlink(missing_ok=True)
+                done = 0
+                try:
+                    ckpt_path.write_text(json.dumps({"v": 1, "key_fp": key_fp, "mode": "stream"}), encoding="utf-8")
+                except Exception:
+                    pass
+            else:
+                sync_fn = getattr(progress, "sync_resumed_file_bytes", None)
+                if callable(sync_fn):
+                    sync_fn(dest.name, done, 0, phase="download")
+                progress.log(f"[MEGA] Tiếp tục tải nối tiếp {dest.name}: đã giữ {done / (1024 * 1024):.1f} MB, tải tiếp phần còn lại...")
+
+            initial_done = done
             worker_px: str | None = proxy
             worker_cli: httpx.AsyncClient | None = None
             saw_rl = False
+            stall_attempts = 0
+            max_stall_attempts = 18
+            consecutive_509 = 0
             try:
-                for attempt in range(12):
+                while stall_attempts < max_stall_attempts:
                     progress.check_cancelled()
                     if done % 16 != 0:
                         done = (done // 16) * 16
                         if part_path.exists():
                             with part_path.open("r+b") as f_tr:
                                 f_tr.truncate(done)
+                    daemons: list[str] = []
                     use_tor = bool(worker_px) or (time.time() < type(self)._mega_direct_cooldown_until)
                     if use_tor:
                         daemons = await self._ensure_mega_tor_pool(progress)
                         if not daemons:
-                            raise ProviderFailure("PROVIDER_RATE_LIMITED", "MEGA bandwidth quota exceeded and Tor proxy unavailable")
+                            raise ProviderFailure(
+                                "PROVIDER_RATE_LIMITED",
+                                "MEGA bandwidth quota exceeded and Tor proxy unavailable",
+                                progress_bytes=max(0, done - initial_done),
+                                done_bytes=done,
+                            )
                         if worker_cli is None:
                             if worker_px:
                                 ensure_socks_support()
@@ -2868,10 +3046,14 @@ class LinksProvider(BaseProvider):
                     else:
                         active_cli = shared_client("mega_dl_direct", follow_redirects=True, timeout=httpx.Timeout(connect=20.0, read=45.0, write=30.0, pool=30.0))
 
+                    used_px = worker_px
                     curr_u = url_state["dl_url"]
                     req_u = f"{curr_u.rstrip('/')}/{done}-" if done > 0 else curr_u
                     decryptor = _make_decryptor(file_iv, done)
                     rotate_cli = False
+                    need_refresh = False
+                    pos_before = done
+                    last_stream_exc: Exception | None = None
                     try:
                         async with active_cli.stream("GET", req_u, headers=req_headers) as resp:
                             if resp.status_code in (509, 429):
@@ -2883,10 +3065,19 @@ class LinksProvider(BaseProvider):
                                     await asyncio.sleep(0.5)
                                 else:
                                     rotate_cli = True
+                                    consecutive_509 += 1
+                                    if consecutive_509 >= 2:
+                                        await self._rotate_tor_newnym(progress, used_px)
+                                    if refresh_url is not None and consecutive_509 >= 4 and consecutive_509 % 4 == 0:
+                                        need_refresh = True
                                     await asyncio.sleep(1.0 + random.uniform(0.4, 1.2))
+                            elif resp.status_code in (403, 404, 410) and refresh_url is not None:
+                                rotate_cli = use_tor
+                                need_refresh = True
                             else:
                                 resp.raise_for_status()
                                 saw_rl = False
+                                consecutive_509 = 0
                                 total = done + int(resp.headers.get("content-length") or 0)
                                 with part_path.open("ab" if done > 0 else "wb") as fh:
                                     async for chunk in resp.aiter_bytes(131072):
@@ -2903,23 +3094,65 @@ class LinksProvider(BaseProvider):
                                             fh.write(tail)
                                             done += len(tail)
                                 break
-                    except ProviderFailure:
-                        raise
-                    except Exception as exc:
+                    except BaseException as exc:
+                        if _is_cancel_exc(exc):
+                            _cleanup_partial_files()
+                            raise
+                        if isinstance(exc, ProviderFailure):
+                            raise
+                        last_stream_exc = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
                         rotate_cli = use_tor
-                        if attempt == 11:
-                            raise ProviderFailure("DOWNLOAD_FAILED", f"MEGA file stream failed for {dest.name}: {exc}") from exc
+
+                    if done > pos_before:
+                        stall_attempts = 0
+                        consecutive_509 = 0
+                    else:
+                        stall_attempts += 1
+
                     if rotate_cli:
                         await self._discard_mega_circuit(worker_cli)
                         worker_px = None
                         worker_cli = None
-                    if saw_rl and attempt == 11:
-                        raise ProviderFailure("PROVIDER_RATE_LIMITED", f"MEGA bandwidth quota exceeded (HTTP 509) for {dest.name}")
+
+                    if need_refresh and refresh_url is not None:
+                        async with refresh_lock:
+                            if url_state["dl_url"] == curr_u:
+                                ref_px = worker_px
+                                if ref_px is None and use_tor and daemons:
+                                    ref_px = self._isolated_proxy(random.choice(daemons), uuid.uuid4().hex[:10])
+                                try:
+                                    fresh_u = await refresh_url(ref_px)
+                                    if fresh_u:
+                                        url_state["dl_url"] = fresh_u
+                                except Exception as ref_exc:
+                                    last_stream_exc = ref_exc
+
+                    if stall_attempts >= max_stall_attempts:
+                        prog_delta = max(0, done - initial_done)
+                        if saw_rl:
+                            raise ProviderFailure(
+                                "PROVIDER_RATE_LIMITED",
+                                f"MEGA bandwidth quota exceeded (HTTP 509) for {dest.name}",
+                                progress_bytes=prog_delta,
+                                done_bytes=done,
+                            )
+                        raise ProviderFailure(
+                            "DOWNLOAD_FAILED",
+                            f"MEGA file stream failed for {dest.name}: {last_stream_exc or 'stream interrupted'}",
+                            progress_bytes=prog_delta,
+                            done_bytes=done,
+                        )
+            except BaseException as outer_exc:
+                if _is_cancel_exc(outer_exc):
+                    _cleanup_partial_files()
+                raise
             finally:
                 self._release_mega_circuit(worker_px, worker_cli)
 
             if not part_path.exists():
                 part_path.write_bytes(b"")
+            ckpt_path.unlink(missing_ok=True)
+            ckpt_tmp_path.unlink(missing_ok=True)
             part_path.replace(dest)
             return dest
 
@@ -2932,23 +3165,125 @@ class LinksProvider(BaseProvider):
         else:
             chunk_size = 4 * 1024 * 1024  # 4 MB (262,144 AES blocks)
 
-        chunk_queue: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
-        pos = 0
-        chunk_count = 0
-        while pos < expected_size:
-            end = min(expected_size - 1, pos + chunk_size - 1)
-            chunk_queue.put_nowait((pos, end))
-            pos = end + 1
-            chunk_count += 1
+        total_chunks = (expected_size + chunk_size - 1) // chunk_size
+        completed_chunks: set[int] = set()
+        partial_offsets: dict[int, int] = {}
+        loaded_valid_ckpt = False
 
-        with part_path.open("wb") as f_alloc:
-            f_alloc.truncate(expected_size)
+        if part_path.is_file() and ckpt_path.is_file():
+            try:
+                if part_path.stat().st_size == expected_size:
+                    raw_ckpt = json.loads(ckpt_path.read_text(encoding="utf-8"))
+                    if (
+                        isinstance(raw_ckpt, dict)
+                        and raw_ckpt.get("v") == 1
+                        and raw_ckpt.get("key_fp") == key_fp
+                        and int(raw_ckpt.get("expected_size") or 0) == expected_size
+                        and int(raw_ckpt.get("chunk_size") or 0) == chunk_size
+                    ):
+                        completed_chunks = self._unpack_int_ranges(raw_ckpt.get("completed") or [], total_chunks)
+                        raw_partial = raw_ckpt.get("partial") or {}
+                        if isinstance(raw_partial, dict):
+                            for k_idx, raw_off in raw_partial.items():
+                                c_idx = int(k_idx)
+                                if c_idx < 0 or c_idx >= total_chunks or c_idx in completed_chunks:
+                                    continue
+                                c_s = c_idx * chunk_size
+                                c_e = min(expected_size - 1, c_s + chunk_size - 1)
+                                aligned_off = c_s + ((max(c_s, int(raw_off)) - c_s) // 16) * 16
+                                if aligned_off > c_e:
+                                    completed_chunks.add(c_idx)
+                                elif aligned_off > c_s:
+                                    partial_offsets[c_idx] = aligned_off
+                        loaded_valid_ckpt = True
+            except Exception:
+                completed_chunks = set()
+                partial_offsets = {}
+                loaded_valid_ckpt = False
+
+        ckpt_lock = threading.Lock()
+        last_ckpt_save = [0.0]
+
+        def _compute_done_bytes() -> int:
+            with ckpt_lock:
+                total_done = 0
+                for idx in completed_chunks:
+                    c_s = idx * chunk_size
+                    c_e = min(expected_size - 1, c_s + chunk_size - 1)
+                    total_done += (c_e - c_s + 1)
+                for idx, off in partial_offsets.items():
+                    if idx not in completed_chunks:
+                        c_s = idx * chunk_size
+                        total_done += max(0, off - c_s)
+                return min(expected_size, total_done)
+
+        def _save_ckpt(*, force: bool = False) -> None:
+            now_m = time.monotonic()
+            with ckpt_lock:
+                if not force and (now_m - last_ckpt_save[0]) < 0.8:
+                    return
+                last_ckpt_save[0] = now_m
+                payload_str = json.dumps(
+                    {
+                        "v": 1,
+                        "key_fp": key_fp,
+                        "expected_size": expected_size,
+                        "chunk_size": chunk_size,
+                        "completed": self._pack_int_ranges(completed_chunks),
+                        "partial": {str(k): v for k, v in sorted(partial_offsets.items()) if k not in completed_chunks},
+                    },
+                    separators=(",", ":"),
+                )
+                try:
+                    ckpt_tmp_path.write_text(payload_str, encoding="utf-8")
+                    ckpt_tmp_path.replace(ckpt_path)
+                except Exception:
+                    pass
+
+        if not loaded_valid_ckpt:
+            with part_path.open("wb") as f_alloc:
+                f_alloc.truncate(expected_size)
+            _save_ckpt(force=True)
+
+        initial_done_bytes = _compute_done_bytes()
+        if initial_done_bytes > 0:
+            sync_fn = getattr(progress, "sync_resumed_file_bytes", None)
+            if callable(sync_fn):
+                sync_fn(dest.name, initial_done_bytes, expected_size, phase="download")
+            if initial_done_bytes < expected_size:
+                pct_done = (initial_done_bytes / expected_size) * 100.0
+                done_mb = initial_done_bytes / (1024 * 1024)
+                tot_mb = expected_size / (1024 * 1024)
+                rem_mb = (expected_size - initial_done_bytes) / (1024 * 1024)
+                progress.log(
+                    f"[MEGA] Tiếp tục tải nối tiếp {dest.name}: đã giữ {done_mb:.1f}/{tot_mb:.1f} MB "
+                    f"({pct_done:.1f}%), chỉ tải bù {rem_mb:.1f} MB còn thiếu..."
+                )
+
+        if len(completed_chunks) >= total_chunks:
+            ckpt_path.unlink(missing_ok=True)
+            ckpt_tmp_path.unlink(missing_ok=True)
+            part_path.replace(dest)
+            self._validate_downloaded_files([dest])
+            return dest
+
+        chunk_queue: asyncio.Queue[tuple[int, int, int]] = asyncio.Queue()
+        pending_chunk_count = 0
+        for c_idx in range(total_chunks):
+            if c_idx in completed_chunks:
+                continue
+            c_start = c_idx * chunk_size
+            c_end = min(expected_size - 1, c_start + chunk_size - 1)
+            chunk_queue.put_nowait((c_idx, c_start, c_end))
+            pending_chunk_count += 1
 
         write_lock = threading.Lock()
         has_pwrite = hasattr(os, "pwrite")
         fatal_errors: list[BaseException] = []
-        pool_sem = self._get_mega_circuit_pool()["sem"]
-        worker_count = min(chunk_count, 12)
+        circuit_pool = self._get_mega_circuit_pool()
+        pool_sem = circuit_pool["sem"]
+        tor_sem = circuit_pool["tor_sem"]
+        worker_count = min(max(1, pending_chunk_count), 12)
 
         with part_path.open("r+b") as f_out:
             fd = f_out.fileno()
@@ -2961,6 +3296,20 @@ class LinksProvider(BaseProvider):
                         f_out.seek(offset)
                         f_out.write(data)
 
+            def _record_partial(c_idx: int, c_start: int, c_end: int, curr_write_pos: int) -> None:
+                if curr_write_pos > c_end:
+                    with ckpt_lock:
+                        completed_chunks.add(c_idx)
+                        partial_offsets.pop(c_idx, None)
+                    _save_ckpt(force=False)
+                elif curr_write_pos > c_start:
+                    safe_pos = c_start + ((curr_write_pos - c_start) // 16) * 16
+                    if safe_pos > c_start:
+                        with ckpt_lock:
+                            if c_idx not in completed_chunks:
+                                partial_offsets[c_idx] = safe_pos
+                        _save_ckpt(force=False)
+
             async def _chunk_worker(worker_id: int) -> None:
                 w_px: str | None = None
                 w_cli: httpx.AsyncClient | None = None
@@ -2968,26 +3317,32 @@ class LinksProvider(BaseProvider):
                 try:
                     while not fatal_errors:
                         try:
-                            c_start, c_end = chunk_queue.get_nowait()
+                            c_idx, c_start, c_end = chunk_queue.get_nowait()
                         except asyncio.QueueEmpty:
                             return
 
-                        write_pos = c_start
+                        with ckpt_lock:
+                            write_pos = partial_offsets.get(c_idx, c_start)
                         consecutive_403 = 0
+                        consecutive_509 = 0
                         saw_rate_limit = False
                         last_exc: Exception | None = None
+                        stall_attempts = 0
+                        max_stall_attempts = 40
+                        total_attempts = 0
 
-                        for attempt in range(36):
+                        while write_pos <= c_end and stall_attempts < max_stall_attempts:
                             progress.check_cancelled()
                             if fatal_errors:
+                                _record_partial(c_idx, c_start, c_end, write_pos)
                                 return
-                            if write_pos > c_end:
-                                break
 
+                            daemons: list[str] = []
                             use_tor = bool(proxy) or (time.time() < type(self)._mega_direct_cooldown_until)
                             if use_tor:
                                 daemons = await self._ensure_mega_tor_pool(progress)
                                 if not daemons:
+                                    _record_partial(c_idx, c_start, c_end, write_pos)
                                     raise ProviderFailure("PROVIDER_RATE_LIMITED", f"MEGA bandwidth quota exceeded and Tor proxy unavailable for {dest.name}")
                                 if w_cli is None:
                                     if proxy and worker_id == 0 and not used_explicit_px:
@@ -3018,6 +3373,7 @@ class LinksProvider(BaseProvider):
                                     limits=httpx.Limits(max_connections=160, max_keepalive_connections=80),
                                 )
 
+                            used_px = w_px
                             curr_url = url_state["dl_url"]
                             if write_pos == 0 and c_end == expected_size - 1:
                                 req_url = curr_url
@@ -3027,10 +3383,15 @@ class LinksProvider(BaseProvider):
                             rotate_circuit = False
                             need_refresh = False
                             bytes_attempt = 0
+                            pos_before = write_pos
                             t_stream = time.monotonic()
+                            total_attempts += 1
 
                             try:
-                                async with pool_sem:
+                                async with contextlib.AsyncExitStack() as sem_stack:
+                                    await sem_stack.enter_async_context(pool_sem)
+                                    if use_tor:
+                                        await sem_stack.enter_async_context(tor_sem)
                                     decryptor = _make_decryptor(file_iv, write_pos)
                                     rem = b""
                                     needed = c_end - write_pos + 1
@@ -3044,8 +3405,6 @@ class LinksProvider(BaseProvider):
                                                 await asyncio.sleep(0.5)
                                             else:
                                                 rotate_circuit = True
-                                                pool = self._get_mega_circuit_pool()
-                                                pool.get("idle", []).clear()
                                         elif resp.status_code in (403, 404, 410):
                                             consecutive_403 += 1
                                             if not use_tor:
@@ -3079,6 +3438,7 @@ class LinksProvider(BaseProvider):
                                             async for raw in resp.aiter_bytes(131072):
                                                 progress.check_cancelled()
                                                 if fatal_errors:
+                                                    _record_partial(c_idx, c_start, c_end, write_pos)
                                                     return
                                                 if not raw:
                                                     continue
@@ -3108,11 +3468,11 @@ class LinksProvider(BaseProvider):
                                                     progress.add_bytes(len(plain), expected_size, "download", dest.name)
                                                 if write_pos > c_end:
                                                     break
-                                                if use_tor and attempt < 20:
+                                                if use_tor and stall_attempts < 24:
                                                     elapsed_s = time.monotonic() - t_stream
                                                     is_endgame = chunk_queue.empty() and (c_end - write_pos) > 512 * 1024
-                                                    grace_s = 3.5 if is_endgame else 4.5
-                                                    min_bps = 450 * 1024 if is_endgame else 240 * 1024
+                                                    grace_s = 6.0 if is_endgame else 8.0
+                                                    min_bps = 96 * 1024 if is_endgame else 64 * 1024
                                                     if elapsed_s >= grace_s and (bytes_attempt / elapsed_s) < min_bps:
                                                         raise _SlowMegaCircuit()
                             except _SlowMegaCircuit:
@@ -3120,26 +3480,46 @@ class LinksProvider(BaseProvider):
                             except asyncio.CancelledError:
                                 raise
                             except ProviderFailure:
+                                _record_partial(c_idx, c_start, c_end, write_pos)
                                 raise
                             except Exception as exc:
+                                if _is_cancel_exc(exc):
+                                    raise
                                 last_exc = exc
                                 if use_tor:
                                     rotate_circuit = True
                                 else:
                                     await asyncio.sleep(0.4)
 
+                            _record_partial(c_idx, c_start, c_end, write_pos)
+
+                            if write_pos > pos_before:
+                                stall_attempts = 0
+                                consecutive_509 = 0
+                            else:
+                                stall_attempts += 1
+                                if saw_rate_limit:
+                                    consecutive_509 += 1
+                                    if use_tor and consecutive_509 >= 2:
+                                        await self._rotate_tor_newnym(progress, used_px)
+                                    if refresh_url is not None and consecutive_509 >= 4 and consecutive_509 % 4 == 0:
+                                        need_refresh = True
+
                             if rotate_circuit:
                                 await self._discard_mega_circuit(w_cli)
                                 w_px = None
                                 w_cli = None
                                 if saw_rate_limit:
-                                    await asyncio.sleep(1.2 + random.uniform(0.4, 1.4))
+                                    await asyncio.sleep(1.0 + random.uniform(0.3, 1.1))
 
                             if need_refresh and refresh_url is not None:
                                 async with refresh_lock:
                                     if url_state["dl_url"] == curr_url:
+                                        ref_px = w_px
+                                        if ref_px is None and use_tor and daemons:
+                                            ref_px = self._isolated_proxy(daemons[total_attempts % len(daemons)], uuid.uuid4().hex[:10])
                                         try:
-                                            fresh_u = await refresh_url(w_px)
+                                            fresh_u = await refresh_url(ref_px)
                                             if fresh_u:
                                                 url_state["dl_url"] = fresh_u
                                         except Exception as ref_exc:
@@ -3148,7 +3528,7 @@ class LinksProvider(BaseProvider):
                             if write_pos > c_end:
                                 if use_tor and w_cli is not None and bytes_attempt >= 512 * 1024:
                                     rate = bytes_attempt / max(0.05, time.monotonic() - t_stream)
-                                    if rate < 320 * 1024:
+                                    if rate < 80 * 1024:
                                         await self._discard_mega_circuit(w_cli)
                                         w_px = None
                                         w_cli = None
@@ -3179,19 +3559,43 @@ class LinksProvider(BaseProvider):
 
             tasks = [asyncio.create_task(_chunk_worker(i)) for i in range(worker_count)]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            for res_item in results:
-                if isinstance(res_item, asyncio.CancelledError):
-                    part_path.unlink(missing_ok=True)
-                    raise res_item
-            if fatal_errors:
-                part_path.unlink(missing_ok=True)
-                err = fatal_errors[0]
-                if isinstance(err, BaseException):
-                    raise err
+            f_out.flush()
 
+        cancel_err = next((r for r in [*results, *fatal_errors] if isinstance(r, BaseException) and _is_cancel_exc(r)), None)
+        if cancel_err is not None or bool(getattr(progress, "cancel", False)):
+            _cleanup_partial_files()
+            if cancel_err is not None:
+                raise cancel_err
+            progress.check_cancelled()
+
+        if fatal_errors:
+            _save_ckpt(force=True)
+            err = fatal_errors[0]
+            if isinstance(err, ProviderFailure):
+                curr_done = _compute_done_bytes()
+                err.details = {
+                    **(err.details or {}),
+                    "progress_bytes": max(0, curr_done - initial_done_bytes),
+                    "done_bytes": curr_done,
+                    "total_bytes": expected_size,
+                }
+            if isinstance(err, BaseException):
+                raise err
+
+        ckpt_path.unlink(missing_ok=True)
+        ckpt_tmp_path.unlink(missing_ok=True)
         part_path.replace(dest)
         self._validate_downloaded_files([dest])
         return dest
+
+    async def _resolve_mega_api_proxy(self, proxy: str | None, progress: JobState | None = None) -> str | None:
+        if proxy:
+            return proxy
+        if time.time() < type(self)._mega_direct_cooldown_until:
+            daemons = await self._ensure_mega_tor_pool(progress)
+            if daemons:
+                return self._isolated_proxy(random.choice(daemons), uuid.uuid4().hex[:10]) or daemons[0]
+        return None
 
     async def _download_mega_file(
         self,
@@ -3212,17 +3616,20 @@ class LinksProvider(BaseProvider):
         iv_hex = str(meta.get("mega_iv_hex") or "")
 
         if folder_id and node_id and key_hex and iv_hex:
-            res = await self._mega_api_req([{"a": "g", "g": 1, "n": node_id}], params={"n": folder_id}, proxy=proxy)
+            api_px = await self._resolve_mega_api_proxy(proxy, progress)
+            res = await self._mega_api_req([{"a": "g", "g": 1, "n": node_id}], params={"n": folder_id}, proxy=api_px)
             dl_url = str(res.get("g") or "")
             if not dl_url:
                 raise ProviderFailure("DOWNLOAD_FAILED", f"MEGA did not return download URL for folder node {node_id}")
             file_sz = int(res.get("s") if res.get("s") is not None else (meta.get("size") or file_ref.get("size") or 0))
             out_name = safe_name(name or file_ref.get("name") or f"{node_id}.bin")
             dest = dest_dir / out_name
-            progress.log(f"[MEGA] Downloading & decrypting node {out_name} ({file_sz} bytes)...")
+            if not (dest_dir / f".{out_name}.ckpt.part").is_file():
+                progress.log(f"[MEGA] Downloading & decrypting node {out_name} ({file_sz} bytes)...")
 
             async def _refresh_folder_node_url(px_hint: str | None = None) -> str:
-                r_new = await self._mega_api_req([{"a": "g", "g": 1, "n": node_id}], params={"n": folder_id}, proxy=px_hint or proxy)
+                eff_px = px_hint or await self._resolve_mega_api_proxy(proxy, progress)
+                r_new = await self._mega_api_req([{"a": "g", "g": 1, "n": node_id}], params={"n": folder_id}, proxy=eff_px)
                 return str(r_new.get("g") or "")
 
             downloaded_path = await self._download_mega_stream_decrypt(
@@ -3250,7 +3657,8 @@ class LinksProvider(BaseProvider):
         file_key = self._mega_a32_to_bytes([k_a32[0] ^ k_a32[4], k_a32[1] ^ k_a32[5], k_a32[2] ^ k_a32[6], k_a32[3] ^ k_a32[7]])
         file_iv = self._mega_a32_to_bytes([k_a32[4], k_a32[5], 0, 0])
 
-        res = await self._mega_api_req([{"a": "g", "g": 1, "p": file_id}], proxy=proxy)
+        api_px = await self._resolve_mega_api_proxy(proxy, progress)
+        res = await self._mega_api_req([{"a": "g", "g": 1, "p": file_id}], proxy=api_px)
         dl_url = str(res.get("g") or "")
         if not dl_url:
             raise ProviderFailure("DOWNLOAD_FAILED", f"MEGA did not return download URL for file {file_id}")
@@ -3262,10 +3670,12 @@ class LinksProvider(BaseProvider):
             out_name = safe_name(name)
         file_sz = int(res.get("s") if res.get("s") is not None else (file_ref.get("size") or 0))
         dest = dest_dir / out_name
-        progress.log(f"[MEGA] Downloading & decrypting {out_name} ({file_sz} bytes)...")
+        if not (dest_dir / f".{out_name}.ckpt.part").is_file():
+            progress.log(f"[MEGA] Downloading & decrypting {out_name} ({file_sz} bytes)...")
 
         async def _refresh_public_file_url(px_hint: str | None = None) -> str:
-            r_new = await self._mega_api_req([{"a": "g", "g": 1, "p": file_id}], proxy=px_hint or proxy)
+            eff_px = px_hint or await self._resolve_mega_api_proxy(proxy, progress)
+            r_new = await self._mega_api_req([{"a": "g", "g": 1, "p": file_id}], proxy=eff_px)
             return str(r_new.get("g") or "")
 
         downloaded_path = await self._download_mega_stream_decrypt(

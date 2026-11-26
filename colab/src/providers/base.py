@@ -141,6 +141,8 @@ async def download_with_retry(
     last: ProviderFailure | None = None
     max_retries = retries
     attempt = 0
+    progress_rounds = 0
+    max_progress_rounds = 64
     while attempt <= max_retries:
         progress.check_cancelled()
         try:
@@ -151,6 +153,30 @@ async def download_with_retry(
             last = exc
             if exc.code == "PROVIDER_RATE_LIMITED" and max_retries < 5:
                 max_retries = 5
+            prog_bytes = 0
+            try:
+                prog_bytes = int((exc.details or {}).get("progress_bytes") or 0)
+            except (TypeError, ValueError):
+                prog_bytes = 0
+            if prog_bytes > 0 and progress_rounds < max_progress_rounds:
+                progress_rounds += 1
+                attempt = 0
+                wait = retry_delay_for(exc, delay, 0)
+                done_b = int((exc.details or {}).get("done_bytes") or prog_bytes)
+                tot_b = int((exc.details or {}).get("total_bytes") or 0)
+                suffix = f"in {int(wait)}s" if wait else "now"
+                if tot_b > 0:
+                    progress.log(
+                        f"[RETRY] Đã lưu {done_b / (1024 * 1024):.1f}/{tot_b / (1024 * 1024):.1f} MB "
+                        f"(+{prog_bytes / (1024 * 1024):.1f} MB lượt này) cho {label}; đổi mạch & tải tiếp {suffix}"
+                    )
+                else:
+                    progress.log(
+                        f"[RETRY] Đã lưu {done_b / (1024 * 1024):.1f} MB "
+                        f"(+{prog_bytes / (1024 * 1024):.1f} MB lượt này) cho {label}; đổi mạch & tải tiếp {suffix}"
+                    )
+                await sleep_cancellable(wait, progress)
+                continue
             if attempt >= max_retries:
                 break
             wait = retry_delay_for(exc, delay, attempt)
