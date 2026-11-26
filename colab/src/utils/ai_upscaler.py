@@ -758,16 +758,30 @@ def get_video_metadata(video_path: Path) -> tuple[int, int, str, float, float, i
 
     avg_fr = st.get("avg_frame_rate", "0/0")
     r_fr = st.get("r_frame_rate", "30/1")
+    avg_num, avg_den = map(int, avg_fr.split("/")) if "/" in avg_fr else (0, 0)
+    avg_fps = (avg_num / avg_den) if avg_den else 0.0
+    r_num, r_den = map(int, r_fr.split("/")) if "/" in r_fr else (30, 1)
+    r_fps = (r_num / r_den) if r_den else 30.0
+
     fps_str = avg_fr
-    num, den = map(int, avg_fr.split("/")) if "/" in avg_fr else (0, 0)
-    fps_val = (num / den) if den else 0.0
+    fps_val = avg_fps
     if fps_val < 1.0 or fps_val > 125.0:
         fps_str = r_fr
-        num, den = map(int, r_fr.split("/")) if "/" in r_fr else (30, 1)
-        fps_val = (num / den) if den else 30.0
+        fps_val = r_fps
         if fps_val > 125.0 or fps_val <= 0:
             fps_str = "30/1"
             fps_val = 30.0
+    elif (
+        1.0 <= r_fps <= 120.0
+        and avg_den > 1001
+        and r_den <= 1001
+        and 0.90 <= (avg_fps / r_fps) <= 1.02
+    ):
+        # VFR stream whose main body runs at standard `r_frame_rate` (e.g. 30/1) with minor VFR pauses/tail
+        # producing an irregular `avg_frame_rate` fraction (e.g. 10305500/354633). Lock to `r_fr` so 30fps
+        # dialogue frames are preserved 1:1 without fractional frame-dropping.
+        fps_str = r_fr
+        fps_val = r_fps
 
     fmt_dur = float(info.get("format", {}).get("duration", 0.0) or 0.0)
     st_dur = float(st.get("duration", 0.0) or 0.0)
@@ -1238,10 +1252,19 @@ def process_single_video(
     overwrite_output = cfg["overwrite_output"]
 
     eff_dur = min(float(preview_seconds), total_dur) if (preview_seconds > 0 and total_dur > 0) else total_dur
-    if preview_seconds <= 0 and start_time.strip() in ("", "00:00:00") and exact_nb_frames > 0:
+    dur_est_frames = int(round(eff_dur * fps_val)) if eff_dur > 0 else None
+    if (
+        preview_seconds <= 0
+        and start_time.strip() in ("", "00:00:00")
+        and exact_nb_frames > 0
+        and (
+            dur_est_frames is None
+            or abs(exact_nb_frames - dur_est_frames) <= max(16, int(0.01 * exact_nb_frames))
+        )
+    ):
         est_frames = exact_nb_frames
     else:
-        est_frames = int(round(eff_dur * fps_val)) if eff_dur > 0 else None
+        est_frames = dur_est_frames or (exact_nb_frames if exact_nb_frames > 0 else None)
 
     eff_denoise = denoise_strength
     auto_reason = None
@@ -1480,17 +1503,19 @@ def process_single_video(
     max_pinned_in = max(3, min(num_in_slots, int((1.5 * (1024 ** 3)) // max(1, batch_in_bytes)))) if has_cuda else 0
 
     in_free_q: queue.Queue[Any] = queue.Queue()
-    in_ready_q: queue.Queue[Any] = queue.Queue()
+    in_ready_q: queue.Queue[Any] = queue.Queue(maxsize=max(4, num_in_slots - 2))
     out_free_q: queue.Queue[Any] = queue.Queue()
     out_ready_q: queue.Queue[Any] = queue.Queue()
 
     for s_idx in range(num_in_slots):
+        is_pinned_in = bool(has_cuda and s_idx < max_pinned_in)
         t_buf = (
             torch.zeros((eff_batch, in_h, in_w, 3), dtype=torch.uint8)
             if is_tpu
-            else torch.empty((eff_batch, in_h, in_w, 3), dtype=torch.uint8, pin_memory=bool(has_cuda and s_idx < max_pinned_in))
+            else torch.empty((eff_batch, in_h, in_w, 3), dtype=torch.uint8, pin_memory=is_pinned_in)
         )
-        in_free_q.put(t_buf)
+        in_ev = torch.cuda.Event() if is_pinned_in else None
+        in_free_q.put((t_buf, in_ev))
 
     for _ in range(num_out_slots):
         t_out = torch.zeros((eff_batch, frame_out_yuv_bytes), dtype=torch.uint8, pin_memory=has_cuda)
@@ -1599,13 +1624,16 @@ def process_single_video(
     if preview_seconds > 0:
         time_args_in.extend(["-t", str(preview_seconds)])
 
+    vf_fps_expr = f"fps={fps_str}" if time_args_in else f"fps={fps_str}:start_time=0"
+    audio_sync_opts = [] if time_args_in else ["-af", "aresample=async=1:first_pts=0"]
+
     hwaccel_in = ["-hwaccel", "cuda"] if use_nvdec else ["-threads", str(dec_threads)]
     ffmpeg_in_cmd = [
         "ffmpeg", "-v", "error",
         *hwaccel_in,
         *time_args_in,
         "-i", str(working_input),
-        "-vf", f"fps={fps_str}",
+        "-vf", vf_fps_expr,
         "-f", "rawvideo", "-pix_fmt", "rgb24",
         "pipe:1",
     ]
@@ -1646,6 +1674,7 @@ def process_single_video(
         "-map", "0:v:0", "-map", "1:a?",
         *video_enc_opts,
         "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
+        *audio_sync_opts,
         "-c:a", "aac", "-b:a", "192k",
         *embed_video_optimization_metadata_args(),
         "-movflags", "+faststart+use_metadata_tags",
@@ -1707,16 +1736,20 @@ def process_single_video(
     def _reader_worker() -> None:
         try:
             while not stop_event.is_set():
-                ok, t_buf = _q_get(in_free_q)
-                if not ok or t_buf is None:
+                ok, slot = _q_get(in_free_q)
+                if not ok or slot is None:
                     break
+                t_buf, in_ev = slot
+                if in_ev is not None:
+                    # Wait until compute_stream finishes async H2D DMA copy from this pinned buffer before overwriting!
+                    in_ev.synchronize()
                 flat_mv = memoryview(t_buf.numpy()).cast("B")
                 got_bytes = _read_exact_into(p_in.stdout, flat_mv)
                 cur_b = got_bytes // frame_in_bytes
                 if cur_b == 0:
-                    in_free_q.put(t_buf)
+                    in_free_q.put((t_buf, in_ev))
                     break
-                if not _q_put(in_ready_q, (cur_b, t_buf)):
+                if not _q_put(in_ready_q, (cur_b, t_buf, in_ev)):
                     break
                 if cur_b < eff_batch:
                     break
@@ -1782,7 +1815,7 @@ def process_single_video(
                 ok, item = _q_get(in_ready_q)
                 if not ok or item is None:
                     break
-                cur_b, t_buf = item
+                cur_b, t_buf, in_ev = item
 
                 if is_tpu:
                     shape_key = (selected_model, str(model_dtype), eff_batch, in_h, in_w, out_h, out_w)
@@ -1803,7 +1836,7 @@ def process_single_video(
 
                     # Send full fixed `eff_batch` buffer so tail batches (`cur_b < eff_batch`) reuse the exact compiled XLA graph.
                     u8_dev = t_buf.to(device=device)
-                    in_free_q.put(t_buf)
+                    in_free_q.put((t_buf, in_ev))
                     inp = _prepare_gpu_batch(u8_dev)
                     del u8_dev
                     sr = _run_tpu_static_sr(inp)
@@ -1831,8 +1864,10 @@ def process_single_video(
                     t_out[:cur_b].copy_(yuv_cpu[:cur_b])
                     del yuv_cpu
                 else:
-                    u8_gpu = t_buf[:cur_b].to(device=device, non_blocking=bool(has_cuda and t_buf.is_pinned()))
-                    in_free_q.put(t_buf)
+                    u8_gpu = t_buf[:cur_b].to(device=device, non_blocking=bool(in_ev is not None))
+                    if in_ev is not None and compute_stream is not None:
+                        in_ev.record(compute_stream)
+                    in_free_q.put((t_buf, in_ev))
 
                     inp = _prepare_gpu_batch(u8_gpu)
                     del u8_gpu

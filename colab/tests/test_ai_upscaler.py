@@ -1160,5 +1160,60 @@ console.log(JSON.stringify({{ t1, t2, t3 }}));
         assert re.search(r"UPSCALEHàng|STARTcut", res["t1"] + res["t2"]) is None
 
 
+def test_h2d_pinned_ring_buffer_sync_and_vfr_audio_video_sync_guards(monkeypatch, tmp_path):
+    # 1. Verify VFR metadata with 30/1 r_frame_rate + irregular avg_frame_rate (cut.mp4: 10305500/354633)
+    # snaps cleanly to 30/1 instead of 29.0596 FPS, while 24000/1001 film inside 30/1 preserves 24000/1001.
+    vfr_30_json = json.dumps({
+        "streams": [{
+            "width": 854,
+            "height": 480,
+            "r_frame_rate": "30/1",
+            "avg_frame_rate": "10305500/354633",
+            "nb_frames": "20611",
+            "duration": "709.266000",
+            "bit_rate": "1100000",
+        }],
+        "format": {"duration": "709.266000", "bit_rate": "1217558"},
+    }).encode("utf-8")
+
+    monkeypatch.setattr(ai_upscaler.subprocess, "check_output", lambda *a, **kw: vfr_30_json)
+    w, h, fps_str, fps_val, dur, nb_f, _ = ai_upscaler.get_video_metadata(tmp_path / "cut.mp4")
+    assert (w, h) == (854, 480)
+    assert fps_str == "30/1"
+    assert fps_val == 30.0
+    assert dur == 709.266
+    assert nb_f == 20611
+
+    ntsc_24_json = json.dumps({
+        "streams": [{
+            "width": 1280,
+            "height": 720,
+            "r_frame_rate": "30/1",
+            "avg_frame_rate": "24000/1001",
+            "nb_frames": "2400",
+            "duration": "100.100000",
+        }],
+        "format": {"duration": "100.100000"},
+    }).encode("utf-8")
+    monkeypatch.setattr(ai_upscaler.subprocess, "check_output", lambda *a, **kw: ntsc_24_json)
+    _, _, fps_str_24, fps_val_24, _, _, _ = ai_upscaler.get_video_metadata(tmp_path / "film.mkv")
+    assert fps_str_24 == "24000/1001"
+    assert abs(fps_val_24 - 23.976) < 0.01
+
+    # 2. Verify H2D CUDA Event synchronization guards pinned input ring-pool buffers from premature overwrite
+    src = (COLAB_ROOT / "src" / "utils" / "ai_upscaler.py").read_text(encoding="utf-8")
+    reader_slice = src[src.index("def _reader_worker()"):src.index("def _writer_worker()")]
+    assert "in_ev.synchronize()" in reader_slice
+    assert reader_slice.index("in_ev.synchronize()") < reader_slice.index("_read_exact_into(")
+
+    cuda_h2d_idx = src.index("u8_gpu = t_buf[:cur_b].to(")
+    cuda_h2d_slice = src[cuda_h2d_idx:cuda_h2d_idx + 320]
+    assert "in_ev.record(compute_stream)" in cuda_h2d_slice
+    assert cuda_h2d_slice.index("in_ev.record(compute_stream)") < cuda_h2d_slice.index("in_free_q.put((t_buf, in_ev))")
+    assert "start_time=0" in src
+    assert "aresample=async=1:first_pts=0" in src
+
+
+
 
 
