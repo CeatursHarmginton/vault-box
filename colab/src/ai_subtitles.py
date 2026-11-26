@@ -503,7 +503,7 @@ async def _get_whisper_model(model_name: str, has_gpu: bool, cpu_threads: int) -
                 except Exception:
                     pass
 
-            threads = max(1, int(cpu_threads))
+            threads = min(16, max(1, int(cpu_threads)))
             os.environ.setdefault("OMP_NUM_THREADS", str(threads))
             m = WhisperModel(
                 model_name,
@@ -540,7 +540,7 @@ async def _get_nllb_translator(has_gpu: bool, cpu_threads: int) -> tuple[Any, An
 
             model_dir = snapshot_download(NLLB_CT2_REPO)
             tok = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
-            threads = max(1, int(cpu_threads))
+            threads = min(16, max(1, int(cpu_threads)))
             if has_gpu:
                 _ensure_cuda_lib_paths()
                 try:
@@ -802,7 +802,7 @@ async def _translate_ollama_keep_context(
         "num_predict": 180 if len(texts) <= 2 else 420,
     }
     if is_cpu:
-        options["num_thread"] = max(1, int(cpu_cores))
+        options["num_thread"] = min(16, max(1, int(cpu_cores)))
 
     req_timeout = 45.0 if is_cpu else 35.0
     try:
@@ -972,6 +972,10 @@ async def colab_ai_health() -> dict[str, Any]:
             "hasGpu": bool(up_st.get("hasGpu") or hw.get("gpu", {}).get("hasGpu")),
             "gpuName": str(up_st.get("gpuName") or hw.get("gpu", {}).get("gpuName") or ""),
             "vramGb": float(up_st.get("vramGb") or 0.0),
+            "hasTpu": bool(up_st.get("hasTpu")),
+            "tpuName": str(up_st.get("tpuName") or ""),
+            "tpuHbmGb": float(up_st.get("tpuHbmGb") or 0.0),
+            "accelerator": str(up_st.get("accelerator") or ("gpu" if up_st.get("hasGpu") else "cpu")),
         },
     }
 

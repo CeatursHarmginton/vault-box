@@ -202,13 +202,88 @@ def is_video_already_optimized(video_path: Path) -> bool:
 
 
 _GPU_PROBE_CACHE: dict[str, Any] | None = None
+_TPU_INIT_LOCK = threading.Lock()
+_TPU_RUNTIME_CACHE: dict[str, Any] | None = None
+_TPU_MODEL_CACHE: dict[tuple[str, float, str], Any] = {}
+_TPU_COMPILED_SHAPES: set[tuple[Any, ...]] = set()
+
+
+def detect_tpu_hardware() -> dict[str, Any]:
+    """
+    Passive, zero-lock Google Cloud / Colab TPU hardware detector.
+    Never calls `xm.xla_device()` so `/dev/vfio/0` is never locked during health checks.
+    """
+    acc_type = (os.environ.get("TPU_ACCELERATOR_TYPE") or "").strip()
+    has_env = bool(
+        acc_type
+        or os.environ.get("COLAB_TPU_ADDR")
+        or os.environ.get("TPU_NAME")
+        or os.environ.get("TPU_WORKER_ID")
+    )
+    has_pci = False
+    has_dev = False
+    if os.name != "nt":
+        try:
+            pci_root = Path("/sys/bus/pci/devices")
+            if pci_root.is_dir():
+                has_pci = any(
+                    p.is_file() and p.read_text(encoding="utf-8", errors="ignore").strip().lower() == "0x1ae0"
+                    for p in pci_root.glob("*/vendor")
+                )
+        except Exception:
+            has_pci = False
+        try:
+            dev_root = Path("/dev")
+            vfio_root = Path("/dev/vfio")
+            has_accel = dev_root.is_dir() and any(dev_root.glob("accel*"))
+            has_vfio_grp = (
+                has_pci
+                and vfio_root.is_dir()
+                and any(p.name.isdigit() for p in vfio_root.glob("*"))
+            )
+            has_dev = bool(has_accel or has_vfio_grp)
+        except Exception:
+            has_dev = False
+
+    has_tpu = bool(has_env or has_pci or has_dev)
+    if not has_tpu:
+        return {"hasTpu": False, "tpuName": "", "tpuHbmGb": 0.0, "acceleratorType": ""}
+
+    low_acc = acc_type.lower()
+    if "v5litepod" in low_acc or "v5e" in low_acc or not acc_type:
+        suffix = acc_type.split("-", 1)[1] if "-" in acc_type else "1"
+        tpu_name = f"TPU v5e-{suffix}"
+        hbm_gb = 16.0
+    elif "v6e" in low_acc:
+        tpu_name = f"TPU {acc_type}"
+        hbm_gb = 32.0
+    elif "v4" in low_acc:
+        tpu_name = f"TPU {acc_type}"
+        hbm_gb = 32.0
+    elif "v3" in low_acc:
+        tpu_name = f"TPU {acc_type}"
+        hbm_gb = 16.0
+    elif "v2" in low_acc:
+        tpu_name = f"TPU {acc_type}"
+        hbm_gb = 8.0
+    else:
+        tpu_name = f"TPU {acc_type}"
+        hbm_gb = 16.0
+
+    return {
+        "hasTpu": True,
+        "tpuName": tpu_name,
+        "tpuHbmGb": hbm_gb,
+        "acceleratorType": acc_type or "v5litepod-1",
+    }
 
 
 def get_ai_upscale_status() -> dict[str, Any]:
-    """Return non-blocking status of AI Upscale packages and GPU availability for worker health."""
+    """Return non-blocking status of AI Upscale packages and GPU/TPU availability for worker health."""
     global _GPU_PROBE_CACHE
     spandrel_ok = importlib.util.find_spec("spandrel") is not None
     safetensors_ok = importlib.util.find_spec("safetensors") is not None
+    torch_xla_ok = importlib.util.find_spec("torch_xla") is not None
     if _GPU_PROBE_CACHE is None:
         has_gpu = False
         gpu_name = ""
@@ -230,11 +305,21 @@ def get_ai_upscale_status() -> dict[str, Any]:
                 pass
         _GPU_PROBE_CACHE = {"hasGpu": has_gpu, "gpuName": gpu_name, "vramGb": vram_gb}
 
+    has_gpu = bool(_GPU_PROBE_CACHE["hasGpu"])
+    tpu_info = {"hasTpu": False, "tpuName": "", "tpuHbmGb": 0.0} if has_gpu else detect_tpu_hardware()
+    has_tpu = bool(tpu_info["hasTpu"])
+    accelerator = "gpu" if has_gpu else ("tpu" if has_tpu else "cpu")
+
     return {
         "installed": bool(spandrel_ok and safetensors_ok),
-        "hasGpu": bool(_GPU_PROBE_CACHE["hasGpu"]),
+        "hasGpu": has_gpu,
         "gpuName": str(_GPU_PROBE_CACHE["gpuName"]),
         "vramGb": float(_GPU_PROBE_CACHE["vramGb"]),
+        "hasTpu": has_tpu,
+        "tpuName": str(tpu_info["tpuName"]),
+        "tpuHbmGb": float(tpu_info["tpuHbmGb"]),
+        "torchXlaInstalled": bool(torch_xla_ok),
+        "accelerator": accelerator,
         "models": list(MODEL_PRESET_OPTIONS),
     }
 
@@ -255,14 +340,33 @@ def _emit_upscale_progress(job_state: Any, *, merge: bool = True, **fields: Any)
 
 
 def ensure_upscale_dependencies(log_fn: Callable[[str], None] | None = None) -> None:
-    """Ensure `spandrel`, `safetensors`, and `einops` are installed (lazy bootstrap if Cell 3 was skipped)."""
+    """Ensure `spandrel`, `safetensors`, `einops` (and `torch_xla` on TPU) are installed safely."""
+    tpu_hw = detect_tpu_hardware()
+    need_tpu_xla = bool(tpu_hw["hasTpu"] and not shutil.which("nvidia-smi") and importlib.util.find_spec("torch_xla") is None)
     missing = [
         pkg for pkg in ("spandrel", "safetensors", "einops")
         if importlib.util.find_spec(pkg) is None
     ]
-    if not missing:
+    if not missing and not need_tpu_xla:
         return
     with _PIP_INSTALL_LOCK:
+        need_tpu_xla = bool(tpu_hw["hasTpu"] and not shutil.which("nvidia-smi") and importlib.util.find_spec("torch_xla") is None)
+        if need_tpu_xla:
+            if log_fn:
+                log_fn(f"[SETUP] Cài đặt runtime PyTorch/XLA cho {tpu_hw['tpuName']}...")
+            if importlib.util.find_spec("torch") is None:
+                subprocess.check_call([
+                    sys.executable, "-m", "pip", "install", "-q",
+                    "torch", "torchvision", "--index-url", "https://download.pytorch.org/whl/cpu",
+                ])
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", "-q",
+                "torch_xla[tpu]",
+                "-f", "https://storage.googleapis.com/libtpu-releases/index.html",
+                "-f", "https://storage.googleapis.com/libtpu-wheels/index.html",
+            ])
+            importlib.invalidate_caches()
+
         still_missing = [
             pkg for pkg in ("spandrel", "safetensors", "einops")
             if importlib.util.find_spec(pkg) is None
@@ -271,13 +375,114 @@ def ensure_upscale_dependencies(log_fn: Callable[[str], None] | None = None) -> 
             return
         if log_fn:
             log_fn(f"[SETUP] Cài đặt thư viện AI Upscale còn thiếu ({', '.join(still_missing)})...")
-        subprocess.check_call([
-            sys.executable, "-m", "pip", "install", "-q", "--upgrade",
-            "spandrel", "safetensors", "einops", "tqdm",
-        ])
+
+        has_xla = importlib.util.find_spec("torch_xla") is not None
+        if has_xla:
+            torch_pin: list[str] = []
+            try:
+                import torch
+                base_ver = str(torch.__version__).split("+")[0].strip()
+                if base_ver:
+                    torch_pin = [f"torch=={base_ver}"]
+            except Exception:
+                pass
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", "-q",
+                *torch_pin, "spandrel", "safetensors", "einops", "tqdm",
+            ])
+        else:
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", "-q", "--upgrade",
+                "spandrel", "safetensors", "einops", "tqdm",
+            ])
         importlib.invalidate_caches()
         if log_fn:
             log_fn("[SETUP] Thư viện Spandrel + Safetensors đã sẵn sàng.")
+
+
+def _init_tpu_runtime(log_fn: Callable[[str], None] | None = None) -> dict[str, Any]:
+    """
+    Lazy singleton initializer for Google Cloud TPU PJRT device + persistent XLA compilation cache.
+    Must only be invoked inside the worker process right before inference so `/dev/vfio/0` is owned cleanly.
+    """
+    global _TPU_RUNTIME_CACHE
+    if _TPU_RUNTIME_CACHE is not None:
+        return _TPU_RUNTIME_CACHE
+
+    with _TPU_INIT_LOCK:
+        if _TPU_RUNTIME_CACHE is not None:
+            return _TPU_RUNTIME_CACHE
+
+        os.environ.setdefault("PJRT_DEVICE", "TPU")
+        cache_dir = (os.environ.get("XLA_PERSISTENT_CACHE_PATH") or "").strip()
+        if not cache_dir:
+            drive_root = Path("/content/drive/MyDrive")
+            cache_dir = str(drive_root / ".vaultbox_xla_cache") if drive_root.is_dir() else "/content/xla_cache"
+            os.environ["XLA_PERSISTENT_CACHE_PATH"] = cache_dir
+        try:
+            Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        import torch_xla  # type: ignore[import-not-found]
+        import torch_xla.core.xla_model as xm  # type: ignore[import-not-found]
+
+        try:
+            if hasattr(torch_xla, "runtime") and hasattr(torch_xla.runtime, "initialize_cache"):
+                torch_xla.runtime.initialize_cache(cache_dir, readonly=False)
+        except Exception:
+            pass
+
+        dev = xm.xla_device()
+
+        def _sync() -> None:
+            if hasattr(torch_xla, "sync"):
+                torch_xla.sync()
+            else:
+                xm.mark_step()
+
+        tpu_hw = detect_tpu_hardware()
+        tpu_name = str(tpu_hw.get("tpuName") or "TPU v5e-1")
+        hbm_bytes = int(float(tpu_hw.get("tpuHbmGb") or 16.0) * (1024 ** 3))
+        try:
+            if hasattr(xm, "get_memory_info"):
+                mem_info = xm.get_memory_info(dev) or {}
+                limit_b = int(mem_info.get("bytes_limit") or mem_info.get("total_memory") or 0)
+                if limit_b > 0:
+                    hbm_bytes = limit_b
+        except Exception:
+            pass
+
+        if log_fn:
+            log_fn(
+                f"[TPU] Đã kết nối {tpu_name} ({hbm_bytes / (1024 ** 3):.1f} GB HBM BF16) | XLA Cache: {cache_dir}"
+            )
+
+        _TPU_RUNTIME_CACHE = {
+            "device": dev,
+            "xm": xm,
+            "sync": _sync,
+            "tpuName": tpu_name,
+            "hbmBytes": hbm_bytes,
+            "cacheDir": cache_dir,
+        }
+        return _TPU_RUNTIME_CACHE
+
+
+def _get_tpu_hbm_used_gb(tpu_rt: dict[str, Any] | None) -> float:
+    if not tpu_rt:
+        return 0.0
+    try:
+        xm = tpu_rt.get("xm")
+        dev = tpu_rt.get("device")
+        if xm is not None and dev is not None and hasattr(xm, "get_memory_info"):
+            info = xm.get_memory_info(dev) or {}
+            used_b = int(info.get("bytes_used") or 0)
+            if used_b > 0:
+                return used_b / (1024 ** 3)
+    except Exception:
+        pass
+    return 0.0
 
 
 def target_short_pixels(res_choice: str) -> int | None:
@@ -334,8 +539,10 @@ def deep_cleanup_system(
                 stg_p.unlink(missing_ok=True)
 
     w_dir = weights_dir or DEFAULT_WEIGHTS_DIR
-    if remove_weights and w_dir.exists():
-        shutil.rmtree(w_dir, ignore_errors=True)
+    if remove_weights:
+        _TPU_MODEL_CACHE.clear()
+        if w_dir.exists():
+            shutil.rmtree(w_dir, ignore_errors=True)
 
     try:
         import torch
@@ -356,6 +563,11 @@ def deep_cleanup_system(
             torch.cuda.ipc_collect()
         except Exception:
             pass
+    elif _TPU_RUNTIME_CACHE is not None:
+        try:
+            _TPU_RUNTIME_CACHE["sync"]()
+        except Exception:
+            pass
 
     if os.name != "nt":
         try:
@@ -366,11 +578,12 @@ def deep_cleanup_system(
     if verbose and label and log_fn:
         ram_tot, ram_av = get_linux_ram_bytes()
         ram_used_gb = max(0.0, (ram_tot - ram_av) / (1024 ** 3))
-        vram_res_gb = (
-            (torch.cuda.memory_reserved(0) / (1024 ** 3))
-            if (torch is not None and torch.cuda.is_available())
-            else 0.0
-        )
+        if torch is not None and torch.cuda.is_available():
+            mem_label = f"VRAM: {torch.cuda.memory_reserved(0) / (1024 ** 3):.2f} GB"
+        elif _TPU_RUNTIME_CACHE is not None:
+            mem_label = f"HBM: {_get_tpu_hbm_used_gb(_TPU_RUNTIME_CACHE):.2f} GB"
+        else:
+            mem_label = "VRAM: 0.00 GB"
         disk_probe = work_dir if (work_dir and work_dir.exists()) else BASE_DIR
         try:
             _, _, ssd_free = shutil.disk_usage(disk_probe)
@@ -378,7 +591,7 @@ def deep_cleanup_system(
             ssd_free = 0
         log_fn(
             f"[CLEANUP] {label} | RAM: {ram_used_gb:.2f}/{ram_tot/(1024**3):.1f} GB | "
-            f"VRAM: {vram_res_gb:.2f} GB | Free SSD: {ssd_free/(1024**3):.1f} GB"
+            f"{mem_label} | Free SSD: {ssd_free/(1024**3):.1f} GB"
         )
 
 
@@ -404,6 +617,37 @@ def download_if_needed(
         tmp_dest.unlink(missing_ok=True)
 
 
+def _is_reparam_or_span_model(net: Any, preset_name: str = "") -> bool:
+    """Detect SPAN / Conv3XC re-parameterizable architectures whose dynamic weight fusion conflicts with NHWC strides."""
+    if "span" in str(preset_name or "").lower():
+        return True
+    if "span" in type(net).__name__.lower():
+        return True
+    try:
+        for mod in net.modules():
+            cls_low = type(mod).__name__.lower()
+            if "conv3xc" in cls_low or hasattr(mod, "eval_conv") or callable(getattr(mod, "update_params", None)):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _freeze_reparam_modules(net: Any) -> None:
+    """
+    Materialize `Conv3XC.update_params()` once in FP32 eval mode and replace `update_params` with a no-op
+    so inference never mutates `eval_conv.weight.data` strides across batches or inside `torch.compile` / XLA.
+    """
+    try:
+        for mod in net.modules():
+            upd = getattr(mod, "update_params", None)
+            if callable(upd) and hasattr(mod, "eval_conv"):
+                upd()
+                setattr(mod, "update_params", lambda: None)
+    except Exception:
+        pass
+
+
 def load_upscale_model(
     preset_name: str,
     device: Any,
@@ -411,6 +655,8 @@ def load_upscale_model(
     dn_strength: float,
     weights_dir: Path | None = None,
     log_fn: Callable[[str], None] | None = None,
+    *,
+    use_bf16: bool = False,
 ) -> Any:
     import torch
     from spandrel import ImageModelDescriptor, ModelLoader
@@ -422,7 +668,10 @@ def load_upscale_model(
     main_path = w_dir / cfg["filename"]
     download_if_needed(cfg["url"], main_path, weights_dir=w_dir, log_fn=log_fn)
 
-    loader = ModelLoader(device=device)
+    dev_type = getattr(device, "type", str(device))
+    is_xla = str(dev_type).startswith("xla")
+    loader_dev = torch.device("cpu") if is_xla else device
+    loader = ModelLoader(device=loader_dev)
     if preset_name == "realesr-general-x4v3" and dn_strength < 1.0:
         wdn_path = w_dir / cfg["wdn_filename"]
         download_if_needed(cfg["wdn_url"], wdn_path, weights_dir=w_dir, log_fn=log_fn)
@@ -442,11 +691,48 @@ def load_upscale_model(
 
     assert isinstance(descriptor, ImageModelDescriptor), "Model không phải dạng Image Super-Resolution!"
     descriptor.eval()
-    is_cuda = getattr(device, "type", str(device)) == "cuda"
+    _freeze_reparam_modules(descriptor.model)
+    if is_xla:
+        target_dtype = torch.bfloat16 if use_bf16 else torch.float32
+        descriptor.to(dtype=target_dtype)
+        descriptor.to(device=device)
+        return descriptor
+
+    is_cuda = dev_type == "cuda"
     if fp16 and is_cuda and descriptor.supports_half:
         descriptor.to(device=device, dtype=torch.float16)
     else:
         descriptor.to(device=device, dtype=torch.float32)
+    return descriptor
+
+
+def _get_cached_tpu_model(
+    preset_name: str,
+    device: Any,
+    use_bf16: bool,
+    dn_strength: float,
+    weights_dir: Path | None = None,
+    log_fn: Callable[[str], None] | None = None,
+    sync_fn: Callable[[], None] | None = None,
+) -> Any:
+    cache_key = (preset_name, round(dn_strength, 3), "bf16" if use_bf16 else "fp32")
+    cached = _TPU_MODEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    _TPU_MODEL_CACHE.clear()
+    gc.collect()
+    descriptor = load_upscale_model(
+        preset_name,
+        device=device,
+        fp16=False,
+        dn_strength=dn_strength,
+        weights_dir=weights_dir,
+        log_fn=log_fn,
+        use_bf16=use_bf16,
+    )
+    if sync_fn is not None:
+        sync_fn()
+    _TPU_MODEL_CACHE[cache_key] = descriptor
     return descriptor
 
 
@@ -520,11 +806,13 @@ def choose_auto_model(
     else:
         scale_needed = 2.0
 
-    fast_gpu = any(tag in gpu_name.upper() for tag in ("A100", "L4", "V100", "H100", "4090", "3090"))
+    upper_dev = gpu_name.upper()
+    fast_gpu = any(tag in upper_dev for tag in ("A100", "L4", "V100", "H100", "4090", "3090"))
+    is_tpu = "TPU" in upper_dev
     frames = est_frames if est_frames else 1800
 
     if scale_needed >= 2.6:
-        if frames <= 1500 or fast_gpu:
+        if frames <= 1500 or fast_gpu or (is_tpu and frames <= 3000):
             return (
                 "4xNomos8kSC",
                 default_dn,
@@ -584,7 +872,8 @@ def rgb_to_yuv420p_bt709(sr: Any) -> Any:
     import torch.nn.functional as F
 
     b, _, h, w = sr.shape
-    sr_c = sr.clamp(0.0, 1.0)
+    sr_base = sr.float() if sr.dtype == torch.bfloat16 else sr
+    sr_c = sr_base.clamp(0.0, 1.0)
     r = sr_c[:, 0]
     g = sr_c[:, 1]
     b_ch = sr_c[:, 2]
@@ -607,6 +896,11 @@ def resize_sr_gpu(sr: Any, out_h: int, out_w: int) -> Any:
     sr_h, sr_w = sr.shape[-2], sr.shape[-1]
     if sr_h == out_h and sr_w == out_w:
         return sr
+    is_xla = str(getattr(getattr(sr, "device", None), "type", "")).startswith("xla")
+    if is_xla:
+        # Avoid `antialias=True` on XLA which triggers host CPU fallback (`aten::_upsample_bicubic2d_aa`).
+        mode = "bilinear" if (out_h < sr_h or out_w < sr_w) else "bicubic"
+        return F.interpolate(sr.float(), size=(out_h, out_w), mode=mode, align_corners=False).to(sr.dtype)
     if out_h < sr_h and (sr_h / out_h) > 1.25:
         return F.interpolate(sr.float(), size=(out_h, out_w), mode="bicubic", align_corners=False, antialias=True).to(sr.dtype)
     return F.interpolate(sr.float(), size=(out_h, out_w), mode="bicubic", align_corners=False).to(sr.dtype)
@@ -648,12 +942,97 @@ def nvenc_available(codec_name: str = "h264_nvenc") -> bool:
     return res.returncode == 0
 
 
-def infer_tiled_single(model: Any, x: Any, tile: int = 384, pad: int = 16) -> Any:
+def _calibrate_tpu_batch(
+    in_w: int,
+    in_h: int,
+    model_scale: int,
+    selected_model: str,
+    target_pct: int,
+    user_b: int,
+    hbm_total_bytes: int,
+) -> int:
+    """
+    Analytical TPU HBM batch sizer (zero dummy forward passes -> zero wasted XLA compilations).
+    Returns deterministic static batch size independent of video length so consecutive videos of
+    identical resolution reuse the exact same compiled XLA graph in 0.0s.
+    """
+    if user_b > 0:
+        return max(1, min(32, user_b))
+
+    in_px = max(1, in_w * in_h)
+    sr_px = in_px * (model_scale * model_scale)
+    if selected_model in HEAVY_MODELS:
+        base_overhead = 2.5 * (1024 ** 3)
+        per_frame = float(in_px * 190 + sr_px * 32)
+        max_cap = 8
+    elif model_scale >= 4:
+        base_overhead = 1.5 * (1024 ** 3)
+        per_frame = float(in_px * 52 + sr_px * 18)
+        max_cap = 16
+    else:
+        base_overhead = 1.4 * (1024 ** 3)
+        per_frame = float(in_px * 46 + sr_px * 16)
+        max_cap = 16
+
+    clamped_pct = max(35, min(85, int(target_pct)))
+    budget = float(hbm_total_bytes) * (clamped_pct / 100.0)
+    usable = max(0.0, budget - base_overhead)
+    raw_b = max(1, int(usable // max(1.0, per_frame)))
+    cand = max(1, min(raw_b, max_cap))
+    if cand >= 8:
+        cand = (cand // 4) * 4
+    elif cand >= 2:
+        cand = (cand // 2) * 2
+    return max(1, cand)
+
+
+def infer_tiled_single(
+    model: Any,
+    x: Any,
+    tile: int = 384,
+    pad: int = 16,
+    *,
+    fixed_tile_shape: bool = False,
+    tpu_device: Any = None,
+    sync_fn: Callable[[], None] | None = None,
+) -> Any:
     import torch
+    import torch.nn.functional as F
 
     b, c, h, w = x.shape
     s = model.scale
-    out = torch.empty((b, c, h * s, w * s), dtype=x.dtype, device=x.device)
+    use_fixed = bool(fixed_tile_shape or tpu_device is not None)
+    if not use_fixed:
+        out = torch.empty((b, c, h * s, w * s), dtype=x.dtype, device=x.device)
+        for y0 in range(0, h, tile):
+            for x0 in range(0, w, tile):
+                y1 = min(y0 + tile, h)
+                x1 = min(x0 + tile, w)
+                py0, py1 = max(y0 - pad, 0), min(y1 + pad, h)
+                px0, px1 = max(x0 - pad, 0), min(x1 + pad, w)
+                patch = x[:, :, py0:py1, px0:px1]
+                sr_patch = model(patch)
+                oy0 = (y0 - py0) * s
+                ox0 = (x0 - px0) * s
+                oh = (y1 - y0) * s
+                ow = (x1 - x0) * s
+                out[:, :, y0 * s : y1 * s, x0 * s : x1 * s] = sr_patch[:, :, oy0 : oy0 + oh, ox0 : ox0 + ow]
+        return out
+
+    # Fixed-shape tile execution for XLA/TPU: every patch has constant static dimensions
+    # `(b, c, full_h, full_w)`, guaranteeing a single XLA compilation across all image sizes.
+    full_span = tile + 2 * pad
+    req_pad_w, req_pad_h = (0, 0)
+    size_req = getattr(model, "size_requirements", None)
+    if size_req is not None and hasattr(size_req, "get_padding"):
+        req_pad_w, req_pad_h = size_req.get_padding(full_span, full_span)
+    full_h = full_span + int(req_pad_h)
+    full_w = full_span + int(req_pad_w)
+
+    out_dtype = torch.float32 if tpu_device is not None else x.dtype
+    out = torch.empty((b, c, h * s, w * s), dtype=out_dtype, device=x.device)
+    raw_net = getattr(model, "model", model)
+
     for y0 in range(0, h, tile):
         for x0 in range(0, w, tile):
             y1 = min(y0 + tile, h)
@@ -661,7 +1040,19 @@ def infer_tiled_single(model: Any, x: Any, tile: int = 384, pad: int = 16) -> An
             py0, py1 = max(y0 - pad, 0), min(y1 + pad, h)
             px0, px1 = max(x0 - pad, 0), min(x1 + pad, w)
             patch = x[:, :, py0:py1, px0:px1]
-            sr_patch = model(patch)
+            need_h = full_h - (py1 - py0)
+            need_w = full_w - (px1 - px0)
+            if need_h > 0 or need_w > 0:
+                patch = F.pad(patch, (0, max(0, need_w), 0, max(0, need_h)), mode="replicate")
+            if tpu_device is not None:
+                patch_dev = patch.to(device=tpu_device)
+                sr_dev = raw_net(patch_dev)
+                sr_patch = sr_dev.float().cpu()
+                del patch_dev, sr_dev
+                if sync_fn is not None:
+                    sync_fn()
+            else:
+                sr_patch = raw_net(patch)
             oy0 = (y0 - py0) * s
             ox0 = (x0 - px0) * s
             oh = (y1 - y0) * s
@@ -808,26 +1199,39 @@ def process_single_video(
     import torch.nn.functional as F
 
     has_cuda = torch.cuda.is_available()
-    if not has_cuda and not cfg["allow_cpu_upscale"]:
+    tpu_hw = {"hasTpu": False, "tpuName": "", "tpuHbmGb": 0.0} if has_cuda else detect_tpu_hardware()
+    is_tpu = bool(not has_cuda and tpu_hw["hasTpu"])
+    if not has_cuda and not is_tpu and not cfg["allow_cpu_upscale"]:
         raise RuntimeError(
-            "Colab Server chưa bật GPU Runtime. Vui lòng vào Runtime > Change runtime type > chọn T4 GPU để chạy AI Video Upscale."
+            "Colab Server chưa bật GPU/TPU Runtime. Vui lòng vào Runtime > Change runtime type > chọn T4 GPU hoặc TPU v5e-1 để chạy AI Video Upscale."
         )
 
-    device = torch.device("cuda" if has_cuda else "cpu")
+    tpu_rt: dict[str, Any] | None = None
     if has_cuda:
+        device = torch.device("cuda")
         torch.backends.cudnn.benchmark = True
         gpu_name_str = torch.cuda.get_device_name(0)
         vram_total_bytes = torch.cuda.get_device_properties(0).total_memory
+        accel_kind = "gpu"
+    elif is_tpu:
+        tpu_rt = _init_tpu_runtime(log_fn=log_fn)
+        device = tpu_rt["device"]
+        gpu_name_str = str(tpu_rt["tpuName"])
+        vram_total_bytes = int(tpu_rt["hbmBytes"])
+        accel_kind = "tpu"
     else:
+        device = torch.device("cpu")
         gpu_name_str = "CPU"
         vram_total_bytes = int(4 * (1024 ** 3))
+        accel_kind = "cpu"
     vram_total_gb = vram_total_bytes / (1024 ** 3)
 
     preview_seconds = cfg["preview_seconds"]
     start_time = cfg["start_time"]
     denoise_strength = cfg["denoise_strength"]
     model_preset = cfg["model_preset"]
-    use_fp16 = cfg["use_fp16"] and has_cuda
+    use_fp16 = bool(cfg["use_fp16"] and has_cuda)
+    use_bf16 = bool(cfg["use_fp16"] and is_tpu)
     resource_target_pct = cfg["resource_target_pct"]
     batch_size = cfg["batch_size"]
     torch_compile_mode = cfg["torch_compile_mode"]
@@ -875,6 +1279,7 @@ def process_single_video(
         active=True,
         phase="loading_model",
         mediaType="video",
+        accelerator=accel_kind,
         currentFile=cur_input.name,
         outputFile=out_filename,
         inRes=f"{in_w}x{in_h}",
@@ -890,19 +1295,32 @@ def process_single_video(
         **({"files": batch_files} if batch_files is not None else {}),
     )
 
-    model = load_upscale_model(
-        selected_model,
-        device=device,
-        fp16=use_fp16,
-        dn_strength=eff_denoise,
-        weights_dir=weights_dir,
-        log_fn=log_fn,
-    )
-    model_dtype = torch.float16 if (use_fp16 and model.supports_half) else torch.float32
+    if is_tpu and tpu_rt is not None:
+        model = _get_cached_tpu_model(
+            selected_model,
+            device=device,
+            use_bf16=use_bf16,
+            dn_strength=eff_denoise,
+            weights_dir=weights_dir,
+            log_fn=log_fn,
+            sync_fn=tpu_rt["sync"],
+        )
+        model_dtype = torch.bfloat16 if use_bf16 else torch.float32
+    else:
+        model = load_upscale_model(
+            selected_model,
+            device=device,
+            fp16=use_fp16,
+            dn_strength=eff_denoise,
+            weights_dir=weights_dir,
+            log_fn=log_fn,
+        )
+        model_dtype = torch.float16 if (use_fp16 and model.supports_half) else torch.float32
     out_w, out_h = compute_target_dims(in_w, in_h, model.scale, target_resolution)
 
     use_channels_last = False
-    if has_cuda and model_dtype == torch.float16:
+    allow_nhwc = has_cuda and model_dtype == torch.float16 and not _is_reparam_or_span_model(model.model, selected_model)
+    if allow_nhwc:
         try:
             model.model.to(memory_format=torch.channels_last)
             with torch.inference_mode():
@@ -921,6 +1339,8 @@ def process_single_video(
         x = batch_u8_gpu.permute(0, 3, 1, 2)
         if use_channels_last:
             x = x.contiguous(memory_format=torch.channels_last)
+        else:
+            x = x.contiguous()
         return x.to(dtype=model_dtype).div_(255.0)
 
     def _calibrate_vram_batch(target_pct: int, user_b: int) -> int:
@@ -982,7 +1402,27 @@ def process_single_video(
                 cand = max(1, (int(cand * 0.75) // 2) * 2)
         return 1
 
-    eff_batch = _calibrate_vram_batch(resource_target_pct, batch_size)
+    if is_tpu:
+        eff_batch = _calibrate_tpu_batch(
+            in_w, in_h, model.scale, selected_model, resource_target_pct, batch_size, vram_total_bytes
+        )
+    else:
+        eff_batch = _calibrate_vram_batch(resource_target_pct, batch_size)
+
+    tpu_pad_w, tpu_pad_h = (0, 0)
+    if is_tpu:
+        size_req = getattr(model, "size_requirements", None)
+        if size_req is not None and hasattr(size_req, "get_padding"):
+            tpu_pad_w, tpu_pad_h = size_req.get_padding(in_w, in_h)
+
+    def _run_tpu_static_sr(x: Any) -> Any:
+        if tpu_pad_w or tpu_pad_h:
+            x = F.pad(x, (0, int(tpu_pad_w), 0, int(tpu_pad_h)), mode="replicate")
+        raw_net = getattr(model, "model", model)
+        out = raw_net(x)
+        if tpu_pad_w or tpu_pad_h:
+            out = out[..., : in_h * model.scale, : in_w * model.scale]
+        return out
 
     def _run_compiled_sr(comp_net: Any, x: Any) -> Any:
         _, _, h, w = x.shape
@@ -1010,10 +1450,17 @@ def process_single_video(
             with torch.inference_mode():
                 _warm_in = torch.zeros((eff_batch, in_h, in_w, 3), dtype=torch.uint8, device=device)
                 _warm_x = _prepare_gpu_batch(_warm_in)
+                # Run 2 warmup passes to verify steady-state Inductor stride guards on Call #2 as well.
                 _ = _run_compiled_sr(_comp_net, _warm_x)
+                _ = _run_compiled_sr(_comp_net, _warm_x)
+                torch.cuda.synchronize(device)
                 compiled_callable = _comp_net
                 del _warm_in, _warm_x
         except Exception as exc:
+            try:
+                torch._dynamo.reset()
+            except Exception:
+                pass
             log_fn(f"[COMPILE] Bỏ qua torch.compile, dùng chế độ Eager ({exc})")
             compiled_callable = None
 
@@ -1041,7 +1488,11 @@ def process_single_video(
     out_ready_q: queue.Queue[Any] = queue.Queue()
 
     for s_idx in range(num_in_slots):
-        t_buf = torch.empty((eff_batch, in_h, in_w, 3), dtype=torch.uint8, pin_memory=bool(has_cuda and s_idx < max_pinned_in))
+        t_buf = (
+            torch.zeros((eff_batch, in_h, in_w, 3), dtype=torch.uint8)
+            if is_tpu
+            else torch.empty((eff_batch, in_h, in_w, 3), dtype=torch.uint8, pin_memory=bool(has_cuda and s_idx < max_pinned_in))
+        )
         in_free_q.put(t_buf)
 
     for _ in range(num_out_slots):
@@ -1085,14 +1536,24 @@ def process_single_video(
         nv_cq, cpu_crf = (24, 20)
         max_br, buf_br = ("12M", "24M") if is_1080_plus else ("6M", "12M")
 
-    dec_short = "NVDEC" if use_nvdec else "CPU"
-    enc_short = nvenc_codec if use_nvenc else "libx264"
-    prec_str = (
-        f"{'FP16+NHWC' if use_channels_last else ('FP16' if model_dtype == torch.float16 else 'FP32')}"
-        f"{'+Compile' if compiled_callable is not None else ''}"
-    )
-    pipe_str = f"{dec_short} -> Tensor Cores -> {enc_short}" if has_cuda else f"{dec_short} -> PyTorch -> {enc_short}"
-    vram_reserved_gb = (torch.cuda.memory_reserved(device) / (1024 ** 3)) if has_cuda else 0.0
+    cpu_cores = os.cpu_count() or 2
+    dec_threads = min(8, max(2, cpu_cores // 3)) if (not use_nvdec and cpu_cores >= 12) else 0
+    enc_threads = min(16, max(2, cpu_cores - 4)) if (not use_nvenc and cpu_cores >= 12) else 0
+    cpu_preset = "faster" if cpu_cores >= 16 else "veryfast"
+
+    dec_short = "NVDEC" if use_nvdec else (f"CPU({dec_threads}t)" if dec_threads > 0 else "CPU")
+    enc_short = nvenc_codec if use_nvenc else (f"libx264({enc_threads}t)" if enc_threads > 0 else "libx264")
+    if is_tpu:
+        prec_str = "BF16+XLA" if use_bf16 else "FP32+XLA"
+        pipe_str = f"{dec_short} -> TPU MXU -> {enc_short}"
+        vram_reserved_gb = _get_tpu_hbm_used_gb(tpu_rt)
+    else:
+        prec_str = (
+            f"{'FP16+NHWC' if use_channels_last else ('FP16' if model_dtype == torch.float16 else 'FP32')}"
+            f"{'+Compile' if compiled_callable is not None else ''}"
+        )
+        pipe_str = f"{dec_short} -> Tensor Cores -> {enc_short}" if has_cuda else f"{dec_short} -> PyTorch -> {enc_short}"
+        vram_reserved_gb = (torch.cuda.memory_reserved(device) / (1024 ** 3)) if has_cuda else 0.0
 
     if file_entry is not None:
         file_entry.update({
@@ -1110,6 +1571,7 @@ def process_single_video(
         active=True,
         phase="upscaling_video",
         mediaType="video",
+        accelerator=accel_kind,
         currentFile=cur_input.name,
         outputFile=out_filename,
         inRes=f"{in_w}x{in_h}",
@@ -1140,7 +1602,7 @@ def process_single_video(
     if preview_seconds > 0:
         time_args_in.extend(["-t", str(preview_seconds)])
 
-    hwaccel_in = ["-hwaccel", "cuda"] if use_nvdec else ["-threads", "0"]
+    hwaccel_in = ["-hwaccel", "cuda"] if use_nvdec else ["-threads", str(dec_threads)]
     ffmpeg_in_cmd = [
         "ffmpeg", "-v", "error",
         *hwaccel_in,
@@ -1167,7 +1629,8 @@ def process_single_video(
     else:
         video_enc_opts = [
             "-c:v", "libx264",
-            "-preset", "veryfast",
+            "-preset", cpu_preset,
+            *(["-threads", str(enc_threads)] if enc_threads > 0 else []),
             "-crf", str(cpu_crf),
             "-maxrate", max_br,
             "-bufsize", buf_br,
@@ -1293,8 +1756,10 @@ def process_single_video(
 
     processed_frames = 0
     t0 = time.time()
+    fps_t0 = t0
+    fps_base_frames = 0
+    peak_tpu_hbm_gb = vram_reserved_gb if is_tpu else 0.0
     last_ui_tick = t0
-    last_log_milestone = 0
     if has_cuda:
         torch.cuda.reset_peak_memory_stats(device)
         compute_stream = torch.cuda.current_stream(device)
@@ -1322,46 +1787,104 @@ def process_single_video(
                     break
                 cur_b, t_buf = item
 
-                u8_gpu = t_buf[:cur_b].to(device=device, non_blocking=bool(has_cuda and t_buf.is_pinned()))
-                in_free_q.put(t_buf)
+                if is_tpu:
+                    shape_key = (selected_model, str(model_dtype), eff_batch, in_h, in_w, out_h, out_w)
+                    need_xla_compile_notice = shape_key not in _TPU_COMPILED_SHAPES
+                    compile_t0 = 0.0
+                    if need_xla_compile_notice:
+                        compile_t0 = time.time()
+                        _emit_upscale_progress(
+                            job_state,
+                            active=True,
+                            phase="compiling_tpu",
+                            accelerator="tpu",
+                            **({"files": batch_files} if batch_files is not None else {}),
+                        )
+                        log_fn(
+                            f"[XLA] Biên dịch đồ thị TPU ({prec_str}) cho khung {eff_batch}x{in_w}x{in_h} -> {out_w}x{out_h}..."
+                        )
 
-                inp = _prepare_gpu_batch(u8_gpu)
-                del u8_gpu
+                    # Send full fixed `eff_batch` buffer so tail batches (`cur_b < eff_batch`) reuse the exact compiled XLA graph.
+                    u8_dev = t_buf.to(device=device)
+                    in_free_q.put(t_buf)
+                    inp = _prepare_gpu_batch(u8_dev)
+                    del u8_dev
+                    sr = _run_tpu_static_sr(inp)
+                    del inp
+                    sr_resized = resize_sr_gpu(sr, out_h, out_w)
+                    del sr
+                    yuv_dev = rgb_to_yuv420p_bt709(sr_resized)
+                    del sr_resized
+                    yuv_cpu = yuv_dev.cpu()
+                    del yuv_dev
+                    if tpu_rt is not None:
+                        tpu_rt["sync"]()
 
-                try:
-                    if compiled_callable is not None and cur_b == eff_batch:
-                        sr = _run_compiled_sr(compiled_callable, inp)
-                    else:
-                        sr = model(inp)
-                except RuntimeError as oom_exc:
-                    if has_cuda and "out of memory" in str(oom_exc).lower():
-                        torch.cuda.empty_cache()
-                        sr_list = [infer_tiled_single(model, inp[i : i + 1]) for i in range(cur_b)]
-                        sr = torch.cat(sr_list, dim=0)
-                    else:
-                        raise
+                    if need_xla_compile_notice:
+                        _TPU_COMPILED_SHAPES.add(shape_key)
+                        comp_sec = max(0.1, time.time() - compile_t0)
+                        log_fn(f"[XLA] Biên dịch hoàn tất trong {comp_sec:.1f}s | Bắt đầu suy luận tốc độ cao")
+                        fps_t0 = time.time()
+                        fps_base_frames = processed_frames + cur_b
 
-                del inp
-                sr_resized = resize_sr_gpu(sr, out_h, out_w)
-                del sr
-                yuv_gpu = rgb_to_yuv420p_bt709(sr_resized)
-                del sr_resized
-
-                ok_out, out_slot = _q_get(out_free_q)
-                if not ok_out or out_slot is None:
-                    break
-                t_out, ev = out_slot
-
-                if has_cuda and compute_done_ev is not None and d2h_stream is not None and ev is not None:
-                    compute_done_ev.record(compute_stream)
-                    with torch.cuda.stream(d2h_stream):
-                        d2h_stream.wait_event(compute_done_ev)
-                        t_out[:cur_b].copy_(yuv_gpu, non_blocking=True)
-                        ev.record(d2h_stream)
-                    yuv_gpu.record_stream(d2h_stream)
+                    ok_out, out_slot = _q_get(out_free_q)
+                    if not ok_out or out_slot is None:
+                        break
+                    t_out, ev = out_slot
+                    t_out[:cur_b].copy_(yuv_cpu[:cur_b])
+                    del yuv_cpu
                 else:
-                    t_out[:cur_b].copy_(yuv_gpu)
-                del yuv_gpu
+                    u8_gpu = t_buf[:cur_b].to(device=device, non_blocking=bool(has_cuda and t_buf.is_pinned()))
+                    in_free_q.put(t_buf)
+
+                    inp = _prepare_gpu_batch(u8_gpu)
+                    del u8_gpu
+
+                    try:
+                        if compiled_callable is not None and cur_b == eff_batch:
+                            try:
+                                sr = _run_compiled_sr(compiled_callable, inp)
+                            except Exception as comp_exc:
+                                if has_cuda and "out of memory" in str(comp_exc).lower():
+                                    raise
+                                compiled_callable = None
+                                try:
+                                    torch._dynamo.reset()
+                                except Exception:
+                                    pass
+                                log_fn(f"[COMPILE] Tự động chuyển sang chế độ Eager ({comp_exc})")
+                                sr = model(inp)
+                        else:
+                            sr = model(inp)
+                    except RuntimeError as oom_exc:
+                        if has_cuda and "out of memory" in str(oom_exc).lower():
+                            torch.cuda.empty_cache()
+                            sr_list = [infer_tiled_single(model, inp[i : i + 1]) for i in range(cur_b)]
+                            sr = torch.cat(sr_list, dim=0)
+                        else:
+                            raise
+
+                    del inp
+                    sr_resized = resize_sr_gpu(sr, out_h, out_w)
+                    del sr
+                    yuv_gpu = rgb_to_yuv420p_bt709(sr_resized)
+                    del sr_resized
+
+                    ok_out, out_slot = _q_get(out_free_q)
+                    if not ok_out or out_slot is None:
+                        break
+                    t_out, ev = out_slot
+
+                    if has_cuda and compute_done_ev is not None and d2h_stream is not None and ev is not None:
+                        compute_done_ev.record(compute_stream)
+                        with torch.cuda.stream(d2h_stream):
+                            d2h_stream.wait_event(compute_done_ev)
+                            t_out[:cur_b].copy_(yuv_gpu, non_blocking=True)
+                            ev.record(d2h_stream)
+                        yuv_gpu.record_stream(d2h_stream)
+                    else:
+                        t_out[:cur_b].copy_(yuv_gpu)
+                    del yuv_gpu
 
                 if not _q_put(out_ready_q, (cur_b, t_out, ev)):
                     break
@@ -1371,7 +1894,10 @@ def process_single_video(
                 if now - last_ui_tick >= 0.8 or (est_frames and processed_frames >= est_frames):
                     last_ui_tick = now
                     elapsed_so_far = max(now - t0, 1e-3)
-                    cur_fps = processed_frames / elapsed_so_far
+                    if is_tpu and fps_base_frames > 0 and processed_frames > fps_base_frames:
+                        cur_fps = (processed_frames - fps_base_frames) / max(now - fps_t0, 1e-3)
+                    else:
+                        cur_fps = processed_frames / elapsed_so_far
                     frame_ratio = min(0.99, processed_frames / est_frames) if (est_frames and est_frames > 0) else 0.5
                     if on_frame_progress:
                         on_frame_progress(frame_ratio)
@@ -1381,11 +1907,15 @@ def process_single_video(
                         if (est_frames and est_frames > processed_frames and cur_fps > 0)
                         else 0
                     )
-                    cur_vram_gb = (
-                        max(torch.cuda.memory_allocated(device), torch.cuda.memory_reserved(device)) / (1024 ** 3)
-                        if has_cuda
-                        else 0.0
-                    )
+                    if has_cuda:
+                        cur_vram_gb = (
+                            max(torch.cuda.memory_allocated(device), torch.cuda.memory_reserved(device)) / (1024 ** 3)
+                        )
+                    elif is_tpu:
+                        cur_vram_gb = _get_tpu_hbm_used_gb(tpu_rt)
+                        peak_tpu_hbm_gb = max(peak_tpu_hbm_gb, cur_vram_gb)
+                    else:
+                        cur_vram_gb = 0.0
                     if file_entry is not None:
                         file_entry.update({
                             "status": "active",
@@ -1401,6 +1931,7 @@ def process_single_video(
                             job_state,
                             active=True,
                             phase="upscaling_video",
+                            accelerator=accel_kind,
                             framesDone=processed_frames,
                             framesTotal=est_frames or 0,
                             filePercent=round(frame_ratio * 100.0, 1),
@@ -1452,11 +1983,14 @@ def process_single_video(
         raise RuntimeError(f"Lỗi luồng xử lý AI Upscale: {worker_errors[0]}")
 
     elapsed = max(time.time() - t0, 1e-6)
-    peak_vram_gb = (
-        max(torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)) / (1024 ** 3)
-        if has_cuda
-        else 0.0
-    )
+    if has_cuda:
+        peak_vram_gb = (
+            max(torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)) / (1024 ** 3)
+        )
+    elif is_tpu:
+        peak_vram_gb = max(peak_tpu_hbm_gb, _get_tpu_hbm_used_gb(tpu_rt))
+    else:
+        peak_vram_gb = 0.0
 
     if rc_out != 0 or not local_tmp_out.exists() or local_tmp_out.stat().st_size < 1024:
         local_tmp_out.unlink(missing_ok=True)
@@ -1496,9 +2030,10 @@ def process_single_video(
             "outputSizeBytes": out_bytes,
             "etaSeconds": 0,
         })
+    mem_tag = "HBM" if is_tpu else "VRAM"
     log_fn(
         f"[{idx}/{total_count}] DONE   {final_output.name} | {processed_frames} frames in {elapsed:.1f}s "
-        f"({avg_fps:.2f} FPS) | {size_mb:.2f} MB | Peak VRAM {peak_vram_gb:.2f}/{vram_total_gb:.1f} GB"
+        f"({avg_fps:.2f} FPS) | {size_mb:.2f} MB | Peak {mem_tag} {peak_vram_gb:.2f}/{vram_total_gb:.1f} GB"
     )
     if on_frame_progress:
         on_frame_progress(1.0)
@@ -1551,9 +2086,13 @@ def process_single_image(
     import torch.nn.functional as F
 
     has_cuda = torch.cuda.is_available()
-    device = torch.device("cuda" if has_cuda else "cpu")
-    gpu_name_str = torch.cuda.get_device_name(0) if has_cuda else "CPU"
-    use_fp16 = cfg["use_fp16"] and has_cuda
+    tpu_hw = {"hasTpu": False, "tpuName": "", "tpuHbmGb": 0.0} if has_cuda else detect_tpu_hardware()
+    is_tpu = bool(not has_cuda and tpu_hw["hasTpu"])
+    tpu_rt = _init_tpu_runtime(log_fn=log_fn) if is_tpu else None
+    device = torch.device("cuda") if has_cuda else (tpu_rt["device"] if tpu_rt is not None else torch.device("cpu"))
+    gpu_name_str = torch.cuda.get_device_name(0) if has_cuda else (str(tpu_rt["tpuName"]) if tpu_rt is not None else "CPU")
+    use_fp16 = bool(cfg["use_fp16"] and has_cuda)
+    use_bf16 = bool(cfg["use_fp16"] and is_tpu)
     denoise_strength = cfg["denoise_strength"]
     model_preset = cfg["model_preset"]
     size_profile = cfg["size_profile"]
@@ -1568,22 +2107,34 @@ def process_single_image(
     else:
         selected_model = model_preset
 
-    cache_key = (selected_model, round(eff_denoise, 3), use_fp16)
-    if model_cache is not None and cache_key in model_cache:
-        model = model_cache[cache_key]
-    else:
-        model = load_upscale_model(
+    if is_tpu and tpu_rt is not None:
+        model = _get_cached_tpu_model(
             selected_model,
             device=device,
-            fp16=use_fp16,
+            use_bf16=use_bf16,
             dn_strength=eff_denoise,
             weights_dir=weights_dir,
             log_fn=log_fn,
+            sync_fn=tpu_rt["sync"],
         )
-        if model_cache is not None:
-            model_cache[cache_key] = model
+        model_dtype = torch.bfloat16 if use_bf16 else torch.float32
+    else:
+        cache_key = (selected_model, round(eff_denoise, 3), use_fp16)
+        if model_cache is not None and cache_key in model_cache:
+            model = model_cache[cache_key]
+        else:
+            model = load_upscale_model(
+                selected_model,
+                device=device,
+                fp16=use_fp16,
+                dn_strength=eff_denoise,
+                weights_dir=weights_dir,
+                log_fn=log_fn,
+            )
+            if model_cache is not None:
+                model_cache[cache_key] = model
+        model_dtype = torch.float16 if (use_fp16 and model.supports_half) else torch.float32
 
-    model_dtype = torch.float16 if (use_fp16 and model.supports_half) else torch.float32
     out_w, out_h = compute_target_dims(in_w, in_h, model.scale, target_resolution)
 
     arr = np.array(work_img, dtype=np.uint8)
@@ -1591,20 +2142,58 @@ def process_single_image(
     alpha_arr = arr[:, :, 3] if has_alpha else None
 
     with torch.inference_mode():
-        inp = torch.from_numpy(rgb_arr).to(device=device).permute(2, 0, 1).unsqueeze(0).to(dtype=model_dtype).div_(255.0)
-        use_tiled = (in_w * in_h > 1280 * 1280) or not has_cuda
-        try:
-            if use_tiled:
-                sr = infer_tiled_single(model, inp, tile=512, pad=16)
-            else:
-                sr = model(inp)
-        except RuntimeError as oom_exc:
-            if has_cuda and "out of memory" in str(oom_exc).lower():
-                torch.cuda.empty_cache()
-                sr = infer_tiled_single(model, inp, tile=384, pad=16)
-            else:
-                raise
-        del inp
+        if is_tpu and tpu_rt is not None:
+            img_shape_key = ("img_tile_512", selected_model, str(model_dtype))
+            need_img_compile = img_shape_key not in _TPU_COMPILED_SHAPES
+            if need_img_compile:
+                _emit_upscale_progress(
+                    job_state,
+                    active=True,
+                    phase="compiling_tpu",
+                    accelerator="tpu",
+                    gpuName=gpu_name_str,
+                    model=selected_model,
+                    precision="BF16+XLA" if use_bf16 else "FP32+XLA",
+                )
+                log_fn(
+                    f"[XLA] Biên dịch đồ thị TPU ({'BF16+XLA' if use_bf16 else 'FP32+XLA'}) cho xử lý ảnh theo ô tĩnh 512x512..."
+                )
+            inp_cpu = torch.from_numpy(rgb_arr).permute(2, 0, 1).unsqueeze(0).to(dtype=model_dtype).div_(255.0)
+            sr = infer_tiled_single(
+                model,
+                inp_cpu,
+                tile=512,
+                pad=16,
+                fixed_tile_shape=True,
+                tpu_device=device,
+                sync_fn=tpu_rt["sync"],
+            )
+            del inp_cpu
+            if need_img_compile:
+                _TPU_COMPILED_SHAPES.add(img_shape_key)
+                _emit_upscale_progress(
+                    job_state,
+                    active=True,
+                    phase="upscaling_image",
+                    accelerator="tpu",
+                    gpuName=gpu_name_str,
+                    model=selected_model,
+                )
+        else:
+            inp = torch.from_numpy(rgb_arr).to(device=device).permute(2, 0, 1).unsqueeze(0).to(dtype=model_dtype).div_(255.0)
+            use_tiled = (in_w * in_h > 1280 * 1280) or not has_cuda
+            try:
+                if use_tiled:
+                    sr = infer_tiled_single(model, inp, tile=512, pad=16)
+                else:
+                    sr = model(inp)
+            except RuntimeError as oom_exc:
+                if has_cuda and "out of memory" in str(oom_exc).lower():
+                    torch.cuda.empty_cache()
+                    sr = infer_tiled_single(model, inp, tile=384, pad=16)
+                else:
+                    raise
+            del inp
 
         sr_resized = resize_sr_gpu(sr, out_h, out_w)
         del sr
@@ -1621,7 +2210,8 @@ def process_single_image(
         del sr_resized
 
         if alpha_arr is not None:
-            alpha_t = torch.from_numpy(alpha_arr).to(device=device, dtype=torch.float32).unsqueeze(0).unsqueeze(0).div_(255.0)
+            alpha_dev = torch.device("cpu") if is_tpu else device
+            alpha_t = torch.from_numpy(alpha_arr).to(device=alpha_dev, dtype=torch.float32).unsqueeze(0).unsqueeze(0).div_(255.0)
             alpha_up = F.interpolate(alpha_t, size=(out_h, out_w), mode="bicubic", align_corners=False)
             out_alpha_u8 = alpha_up.clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8).squeeze(0).squeeze(0).cpu().numpy()
             del alpha_t, alpha_up

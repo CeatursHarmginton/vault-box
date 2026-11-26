@@ -114,13 +114,19 @@ def get_server_features() -> dict[str, Any]:
     from .utils.ai_upscaler import get_ai_upscale_status
     up_st = get_ai_upscale_status()
     fw_ok = importlib.util.find_spec("faster_whisper") is not None
+    has_gpu = bool(up_st.get("hasGpu"))
+    has_tpu = bool(up_st.get("hasTpu"))
     return {
         "driveMounted": _drive_mounted(),
         "aiSubtitles": bool(fw_ok),
         "aiUpscale": bool(up_st.get("installed")),
-        "hasGpu": bool(up_st.get("hasGpu")),
+        "hasGpu": has_gpu,
         "gpuName": str(up_st.get("gpuName") or ""),
         "vramGb": float(up_st.get("vramGb") or 0.0),
+        "hasTpu": has_tpu,
+        "tpuName": str(up_st.get("tpuName") or ""),
+        "tpuHbmGb": float(up_st.get("tpuHbmGb") or 0.0),
+        "accelerator": "gpu" if has_gpu else ("tpu" if has_tpu else "cpu"),
         "environment": ENV_NAME.lower(),
         "envName": ENV_NAME,
     }

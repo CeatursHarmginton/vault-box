@@ -985,8 +985,184 @@ console.log(JSON.stringify({{
   legacyEmojiStripped: !logLegacyEmojiHtml.includes("🎉") && logLegacyEmojiHtml.includes("Hoàn tất"),
 }}));
 """
+    proc = subprocess.run([node, "--input-type=module"], input=node_script, text=True, capture_output=True, check=True)
+    out = json.loads(proc.stdout.strip())
+    assert all(out.values()), f"Frontend JS assertions failed: {out}"
+
+
+def test_tpu_v5e_detection_analytical_batch_notebook_syntax_and_ui_badges(monkeypatch):
+    from src.server import get_server_features
+    from backend.app.colab.client import ColabManager
+
+    # 1. Validate colab/server_launcher.ipynb JSON + Python syntax across every code cell
+    nb_path = COLAB_ROOT / "server_launcher.ipynb"
+    nb_data = json.loads(nb_path.read_text(encoding="utf-8"))
+    code_cells = [c for c in nb_data.get("cells", []) if c.get("cell_type") == "code"]
+    assert len(code_cells) >= 4
+    full_nb_src = []
+    for idx, cell in enumerate(code_cells):
+        src = "".join(cell.get("source", []))
+        full_nb_src.append(src)
+        clean_lines = [
+            ("pass" if ln.lstrip().startswith("!") else ln)
+            for ln in src.splitlines()
+        ]
+        compile("\n".join(clean_lines), f"server_launcher_cell_{idx}", "exec")
+    joined_nb = "\n".join(full_nb_src)
+    assert "torch_xla[tpu]" in joined_nb
+    assert "PJRT_DEVICE" in joined_nb
+    assert "XLA_PERSISTENT_CACHE_PATH" in joined_nb
+    assert "'hasTpu'" in joined_nb
+
+    # 2. Passive TPU v5e-1 detection (zero PJRT / VFIO lock) + server feature propagation
+    orig_which = shutil.which
+    monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "v5litepod-1")
+    monkeypatch.setattr(ai_upscaler.shutil, "which", lambda cmd: None if cmd == "nvidia-smi" else orig_which(cmd))
+    monkeypatch.setattr(ai_upscaler, "_GPU_PROBE_CACHE", None)
+
+    tpu_hw = ai_upscaler.detect_tpu_hardware()
+    assert tpu_hw["hasTpu"] is True
+    assert tpu_hw["tpuName"] == "TPU v5e-1"
+    assert tpu_hw["tpuHbmGb"] == 16.0
+
+    up_status = ai_upscaler.get_ai_upscale_status()
+    assert up_status["hasGpu"] is False
+    assert up_status["hasTpu"] is True
+    assert up_status["tpuName"] == "TPU v5e-1"
+    assert up_status["tpuHbmGb"] == 16.0
+    assert up_status["accelerator"] == "tpu"
+
+    srv_feat = get_server_features()
+    assert srv_feat["hasTpu"] is True
+    assert srv_feat["tpuName"] == "TPU v5e-1"
+    assert srv_feat["accelerator"] == "tpu"
+
+    extracted_tpu = ColabManager._extract_server_features({"features": srv_feat})
+    assert extracted_tpu is not None
+    assert extracted_tpu["hasTpu"] is True
+    assert extracted_tpu["tpuName"] == "TPU v5e-1"
+    assert extracted_tpu["tpuHbmGb"] == 16.0
+    assert extracted_tpu["accelerator"] == "tpu"
+
+    # Also verify TPU v6e-1 HBM detection (32 GB)
+    monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "v6e-1")
+    tpu_v6 = ai_upscaler.detect_tpu_hardware()
+    assert tpu_v6["hasTpu"] is True
+    assert tpu_v6["tpuName"] == "TPU v6e-1"
+    assert tpu_v6["tpuHbmGb"] == 32.0
+
+    # 3. Analytical TPU HBM batch calibration & auto model selection on TPU v5e-1
+    hbm_16gb = 16 * (1024 ** 3)
+    b_360p_heavy = ai_upscaler._calibrate_tpu_batch(360, 360, 4, "4xNomos8kSC", 80, 0, hbm_16gb)
+    b_360p_span = ai_upscaler._calibrate_tpu_batch(640, 360, 2, "2xLiveActionV1_SPAN", 80, 0, hbm_16gb)
+    b_720p_heavy = ai_upscaler._calibrate_tpu_batch(1280, 720, 4, "4xNomos8kSC", 80, 0, hbm_16gb)
+    b_manual = ai_upscaler._calibrate_tpu_batch(640, 360, 2, "2xLiveActionV1_SPAN", 80, 12, hbm_16gb)
+    assert b_360p_heavy == 8
+    assert b_360p_span == 16
+    assert 1 <= b_720p_heavy <= 8
+    assert b_manual == 12
+
+    chosen_tpu, _, _ = ai_upscaler.choose_auto_model(640, 360, "1080p", 2400, 0.05, "TPU v5e-1", 0.4)
+    assert chosen_tpu == "4xNomos8kSC"
+
+    # 4. Verify Frontend TPU server badges & live XLA telemetry rendering
+    colab_js = (REPO_ROOT / "frontend" / "static" / "js" / "colab_transfer.js").read_text(encoding="utf-8")
+    colab_css = (REPO_ROOT / "frontend" / "static" / "colab_transfer.css").read_text(encoding="utf-8")
+    assert ".vb-srv-cap-badge.cap-tpu" in colab_css
+    assert "Compiling TPU XLA" in colab_js
+    assert "compiling_tpu" in colab_js
+
+    node = shutil.which("node")
+    if node:
+        cap_start = colab_js.index("function getConnectedServerFeatures(server)")
+        cap_end = colab_js.index("function pickOptimalColabServer(servers, currentServerId)")
+        node_script = f"""
+import {{ parseColabConnectClipboard }} from {json.dumps((REPO_ROOT / "frontend/static/js/colab_clipboard.js").as_uri())};
+const escapeHtml = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const getEffectiveServerStatus = (s) => s?.status || "offline";
+{colab_js[cap_start:cap_end]}
+
+const parsed = parseColabConnectClipboard('VAULTBOX_COLAB_CONNECT: {{"mode":"server","serverUrl":"https://relay.example.com","roomId":"vb-tpu","serverToken":"tok","features":{{"aiSubtitles":true,"aiUpscale":true,"hasGpu":false,"hasTpu":true,"tpuName":"TPU v5e-1","tpuHbmGb":16,"accelerator":"tpu"}}}}');
+const tpuSrv = {{ id: "s_tpu", name: "Colab TPU", status: "idle", colabReady: true, features: parsed.features }};
+const fullBadges = renderServerCapabilityBadgesHtml(tpuSrv);
+const compactBadges = renderServerCapabilityBadgesHtml(tpuSrv, {{ compact: true }});
+const selectLbl = formatServerSelectLabel(tpuSrv);
+
+console.log(JSON.stringify({{
+  hasTpuBadgeClass: fullBadges.includes("cap-tpu"),
+  hasTpuFullLabel: fullBadges.includes("TPU v5e-1") && fullBadges.includes("16 GB HBM"),
+  hasCompactV5e: compactBadges.includes("v5e-1"),
+  noGpuBadgeOnTpu: !fullBadges.includes("cap-gpu"),
+  selectShowsTpu: selectLbl.includes("TPU v5e-1") && selectLbl.includes("AI Upscale") && selectLbl.includes("AI Sub"),
+}}));
+"""
         proc = subprocess.run([node, "--input-type=module"], input=node_script, text=True, capture_output=True, check=True)
         out = json.loads(proc.stdout.strip())
-        assert all(out.values()), f"Frontend JS assertions failed: {out}"
+        assert all(out.values()), f"TPU Frontend JS assertions failed: {out}"
+
+
+def test_span_conv3xc_reparam_freeze_nhwc_guard_and_log_copy_spacing():
+    import re
+
+    # 1. Simulate SPAN Conv3XC re-parameterizable block whose update_params() mutates eval_conv weight
+    class FakeConv3XC:
+        def __init__(self) -> None:
+            self.update_calls = 0
+            self.eval_conv = object()
+
+        def update_params(self) -> None:
+            self.update_calls += 1
+
+    class FakeSpanNet:
+        def __init__(self) -> None:
+            self.c1 = FakeConv3XC()
+            self.c2 = FakeConv3XC()
+
+        def modules(self):
+            return [self, self.c1, self.c2]
+
+    class FakePlainNet:
+        def modules(self):
+            return [self]
+
+    span_net = FakeSpanNet()
+    plain_net = FakePlainNet()
+    assert ai_upscaler._is_reparam_or_span_model(span_net, "custom_model") is True
+    assert ai_upscaler._is_reparam_or_span_model(plain_net, "2xLiveActionV1_SPAN") is True
+    assert ai_upscaler._is_reparam_or_span_model(plain_net, "2xNomosUni_span_multijpg_ldl") is True
+    assert ai_upscaler._is_reparam_or_span_model(plain_net, "4xNomos8kSC") is False
+
+    ai_upscaler._freeze_reparam_modules(span_net)
+    assert span_net.c1.update_calls == 1
+    assert span_net.c2.update_calls == 1
+    # Subsequent forward passes calling mod.update_params() must be a no-op (0 extra mutations!)
+    span_net.c1.update_params()
+    span_net.c2.update_params()
+    assert span_net.c1.update_calls == 1
+    assert span_net.c2.update_calls == 1
+
+    # 2. Verify formatColabLogLineHtml preserves copyable whitespace between badge tags and message body
+    node = shutil.which("node")
+    if node:
+        colab_js = (REPO_ROOT / "frontend" / "static" / "js" / "colab_transfer.js").read_text(encoding="utf-8")
+        log_start = colab_js.index("function formatColabLogLineHtml(line)")
+        log_end = colab_js.index("function renderColabJobLogs(")
+        node_script = f"""
+const escapeHtml = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+{colab_js[log_start:log_end]}
+const stripTags = (h) => h.replace(/<[^>]+>/g, "");
+const t1 = stripTags(formatColabLogLineHtml("[UPSCALE] Hàng đợi: 1 video | Target: 1080p"));
+const t2 = stripTags(formatColabLogLineHtml("[1/1] START  cut.mp4 (854x480 -> 1920x1080)"));
+const t3 = stripTags(formatColabLogLineHtml("[XLA] Biên dịch đồ thị TPU (BF16+XLA)..."));
+console.log(JSON.stringify({{ t1, t2, t3 }}));
+"""
+        proc = subprocess.run([node, "--input-type=module"], input=node_script, text=True, capture_output=True, check=True)
+        res = json.loads(proc.stdout.strip())
+        assert res["t1"].startswith("UPSCALE Hàng đợi:"), res
+        assert res["t2"].startswith("[1/1] START cut.mp4"), res
+        assert res["t3"].startswith("XLA Biên dịch"), res
+        assert re.search(r"UPSCALEHàng|STARTcut", res["t1"] + res["t2"]) is None
+
+
 
 
