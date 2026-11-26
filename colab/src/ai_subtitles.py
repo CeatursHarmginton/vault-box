@@ -949,9 +949,12 @@ class ColabAISubtitleStreamRequest(BaseModel):
 
 @router.get("/health")
 async def colab_ai_health() -> dict[str, Any]:
+    from .utils.ai_upscaler import get_ai_upscale_status
     hw = _detect_hardware_profile()
     fw_ok = _faster_whisper_installed()
     ollama_ok, ollama_models = await _probe_ollama()
+    up_st = get_ai_upscale_status()
+    drive_mounted = Path("/content/drive/MyDrive").is_dir()
     return {
         "ok": True,
         **hw,
@@ -961,6 +964,15 @@ async def colab_ai_health() -> dict[str, Any]:
         "nllbModel": NLLB_CT2_REPO,
         "ollamaReady": ollama_ok,
         "ollamaModels": ollama_models,
+        "aiUpscale": up_st,
+        "features": {
+            "driveMounted": drive_mounted,
+            "aiSubtitles": bool(fw_ok),
+            "aiUpscale": bool(up_st.get("installed")),
+            "hasGpu": bool(up_st.get("hasGpu") or hw.get("gpu", {}).get("hasGpu")),
+            "gpuName": str(up_st.get("gpuName") or hw.get("gpu", {}).get("gpuName") or ""),
+            "vramGb": float(up_st.get("vramGb") or 0.0),
+        },
     }
 
 

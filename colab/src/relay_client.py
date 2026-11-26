@@ -108,6 +108,8 @@ async def _relay_loop(manager: JobManager) -> None:
                 max_size=4 * 1024 * 1024,
             ) as ws:
                 connected_at = time.monotonic()
+                from .server import get_server_features
+                srv_features = get_server_features()
                 await ws.send(json.dumps({
                     "type": "hello",
                     "role": "colab",
@@ -115,11 +117,13 @@ async def _relay_loop(manager: JobManager) -> None:
                     "envName": ENV_NAME,
                     "serverName": f"VaultBox {ENV_NAME} Worker",
                     "publicUrl": PUBLIC_URL,
+                    "features": srv_features,
                 }))
                 await ws.send(json.dumps({
                     "type": "ready",
                     "colabReady": True,
                     "environment": ENV_NAME,
+                    "features": srv_features,
                 }))
                 print(f"[✓] Successfully connected to Cloudflare Relay room '{COLAB_RELAY_ROOM_ID}' as {ENV_NAME} Worker!", flush=True)
 
@@ -268,6 +272,7 @@ class _JobProgressDelta:
         "confirmAction",
         "targetProvider",
         "targetAccountId",
+        "upscaleProgress",
     )
 
     def __init__(self) -> None:
@@ -429,16 +434,36 @@ async def _monitor(ws, manager: JobManager, job_id: str, initial_view: dict[str,
 
 
 async def _handle_ws_ai_request(ws, msg: dict) -> None:
+    from .server import get_server_features
     req_id = str(msg.get("requestId") or "")
     action = str(msg.get("action") or "")
     payload = dict(msg.get("payload") or {})
     try:
-        if action == "health":
+        if action == "capabilities":
+            features = get_server_features()
+            await ws.send(json.dumps({
+                "type": "ai_response",
+                "requestId": req_id,
+                "serverCapabilities": True,
+                "features": features,
+                "data": {"ok": True, "features": features},
+            }))
+        elif action == "health":
             res = await colab_ai_health()
-            await ws.send(json.dumps({"type": "ai_response", "requestId": req_id, "data": res}))
+            await ws.send(json.dumps({
+                "type": "ai_response",
+                "requestId": req_id,
+                "features": res.get("features") or get_server_features(),
+                "data": res,
+            }))
         elif action == "setup":
             res = await colab_ai_setup(ColabAISetupRequest(**payload))
-            await ws.send(json.dumps({"type": "ai_response", "requestId": req_id, "data": res}))
+            await ws.send(json.dumps({
+                "type": "ai_response",
+                "requestId": req_id,
+                "features": res.get("features") or get_server_features(),
+                "data": res,
+            }))
         elif action == "translate":
             res = await colab_ai_translate(ColabAITranslateRequest(**payload))
             await ws.send(json.dumps({"type": "ai_response", "requestId": req_id, "data": res}))

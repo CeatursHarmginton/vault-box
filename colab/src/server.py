@@ -109,15 +109,33 @@ async def startup() -> None:
 def _drive_mounted() -> bool:
     return DRIVE_MOUNT_PATH.exists() and DRIVE_MOUNT_PATH.is_dir()
 
+def get_server_features() -> dict[str, Any]:
+    import importlib.util
+    from .utils.ai_upscaler import get_ai_upscale_status
+    up_st = get_ai_upscale_status()
+    fw_ok = importlib.util.find_spec("faster_whisper") is not None
+    return {
+        "driveMounted": _drive_mounted(),
+        "aiSubtitles": bool(fw_ok),
+        "aiUpscale": bool(up_st.get("installed")),
+        "hasGpu": bool(up_st.get("hasGpu")),
+        "gpuName": str(up_st.get("gpuName") or ""),
+        "vramGb": float(up_st.get("vramGb") or 0.0),
+        "environment": ENV_NAME.lower(),
+        "envName": ENV_NAME,
+    }
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
     from .utils.ai_upscaler import get_ai_upscale_status
+    features = get_server_features()
     return {
         "ok": True,
         "service": "vaultbox-colab-worker",
         "version": "2.0.0",
         "environment": ENV_NAME.lower(),
         "envName": ENV_NAME,
+        "features": features,
         "aiUpscale": get_ai_upscale_status(),
         "autoStop": {
             "enabled": AUTO_STOP_ENABLED,
@@ -130,12 +148,14 @@ async def health() -> dict[str, Any]:
 @app.post("/connect/verify", dependencies=[Depends(require_token)])
 async def connect_verify() -> dict[str, Any]:
     from .utils.ai_upscaler import get_ai_upscale_status
+    features = get_server_features()
     return {
         "ok": True,
         "providers": list(PROVIDERS),
         "publicUrl": PUBLIC_URL,
         "environment": ENV_NAME.lower(),
         "envName": ENV_NAME,
+        "features": features,
         "aiUpscale": get_ai_upscale_status(),
         "autoStop": {
             "enabled": AUTO_STOP_ENABLED,

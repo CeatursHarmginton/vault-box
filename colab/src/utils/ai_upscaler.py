@@ -201,37 +201,57 @@ def is_video_already_optimized(video_path: Path) -> bool:
     return False
 
 
+_GPU_PROBE_CACHE: dict[str, Any] | None = None
+
+
 def get_ai_upscale_status() -> dict[str, Any]:
     """Return non-blocking status of AI Upscale packages and GPU availability for worker health."""
+    global _GPU_PROBE_CACHE
     spandrel_ok = importlib.util.find_spec("spandrel") is not None
     safetensors_ok = importlib.util.find_spec("safetensors") is not None
-    has_gpu = False
-    gpu_name = ""
-    vram_gb = 0.0
-
-    if shutil.which("nvidia-smi"):
-        try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
-                text=True,
-                timeout=4,
-            ).strip()
-            if out:
-                parts = [p.strip() for p in out.splitlines()[0].split(",")]
-                has_gpu = True
-                gpu_name = parts[0]
-                if len(parts) > 1:
-                    vram_gb = round(float(parts[1]) / 1024.0, 1)
-        except Exception:
-            pass
+    if _GPU_PROBE_CACHE is None:
+        has_gpu = False
+        gpu_name = ""
+        vram_gb = 0.0
+        if shutil.which("nvidia-smi"):
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                    text=True,
+                    timeout=4,
+                ).strip()
+                if out:
+                    parts = [p.strip() for p in out.splitlines()[0].split(",")]
+                    has_gpu = True
+                    gpu_name = parts[0]
+                    if len(parts) > 1:
+                        vram_gb = round(float(parts[1]) / 1024.0, 1)
+            except Exception:
+                pass
+        _GPU_PROBE_CACHE = {"hasGpu": has_gpu, "gpuName": gpu_name, "vramGb": vram_gb}
 
     return {
         "installed": bool(spandrel_ok and safetensors_ok),
-        "hasGpu": has_gpu,
-        "gpuName": gpu_name,
-        "vramGb": vram_gb,
+        "hasGpu": bool(_GPU_PROBE_CACHE["hasGpu"]),
+        "gpuName": str(_GPU_PROBE_CACHE["gpuName"]),
+        "vramGb": float(_GPU_PROBE_CACHE["vramGb"]),
         "models": list(MODEL_PRESET_OPTIONS),
     }
+
+
+def _emit_upscale_progress(job_state: Any, *, merge: bool = True, **fields: Any) -> None:
+    if job_state is None:
+        return
+    if hasattr(job_state, "set_upscale_progress"):
+        job_state.set_upscale_progress(fields, merge=merge)
+    else:
+        prev = getattr(job_state, "upscale_progress", None)
+        if merge and isinstance(prev, dict):
+            setattr(job_state, "upscale_progress", {**prev, **fields})
+        else:
+            setattr(job_state, "upscale_progress", dict(fields))
+        if hasattr(job_state, "updated_at"):
+            job_state.updated_at = time.time()
 
 
 def ensure_upscale_dependencies(log_fn: Callable[[str], None] | None = None) -> None:
@@ -250,14 +270,14 @@ def ensure_upscale_dependencies(log_fn: Callable[[str], None] | None = None) -> 
         if not still_missing:
             return
         if log_fn:
-            log_fn(f"[AI-Upscale] Tự động cài đặt thư viện còn thiếu ({', '.join(still_missing)})...")
+            log_fn(f"[SETUP] Cài đặt thư viện AI Upscale còn thiếu ({', '.join(still_missing)})...")
         subprocess.check_call([
             sys.executable, "-m", "pip", "install", "-q", "--upgrade",
             "spandrel", "safetensors", "einops", "tqdm",
         ])
         importlib.invalidate_caches()
         if log_fn:
-            log_fn("[AI-Upscale] Cài đặt thư viện Spandrel + Safetensors hoàn tất!")
+            log_fn("[SETUP] Thư viện Spandrel + Safetensors đã sẵn sàng.")
 
 
 def target_short_pixels(res_choice: str) -> int | None:
@@ -303,6 +323,7 @@ def deep_cleanup_system(
     remove_weights: bool = False,
     label: str = "",
     log_fn: Callable[[str], None] | None = None,
+    verbose: bool = False,
 ) -> None:
     """Giải phóng toàn diện RAM hệ thống (kể cả glibc heap), GPU VRAM, cache Dynamo và file tạm SSD."""
     for temp_root in filter(None, (work_dir, pathlib.Path("/content") if os.name != "nt" else None)):
@@ -342,7 +363,7 @@ def deep_cleanup_system(
         except Exception:
             pass
 
-    if label and log_fn:
+    if verbose and label and log_fn:
         ram_tot, ram_av = get_linux_ram_bytes()
         ram_used_gb = max(0.0, (ram_tot - ram_av) / (1024 ** 3))
         vram_res_gb = (
@@ -356,9 +377,8 @@ def deep_cleanup_system(
         except Exception:
             ssd_free = 0
         log_fn(
-            f"🧹 [{label}] Đã dọn sạch RAM/GPU/SSD → "
-            f"RAM đang dùng: {ram_used_gb:.2f}/{ram_tot/(1024**3):.1f} GB | "
-            f"VRAM giữ: {vram_res_gb:.2f} GB | SSD trống: {ssd_free/(1024**3):.1f} GB"
+            f"[CLEANUP] {label} | RAM: {ram_used_gb:.2f}/{ram_tot/(1024**3):.1f} GB | "
+            f"VRAM: {vram_res_gb:.2f} GB | Free SSD: {ssd_free/(1024**3):.1f} GB"
         )
 
 
@@ -373,7 +393,7 @@ def download_if_needed(
     if dest.exists() and dest.stat().st_size > 100_000:
         return
     if log_fn:
-        log_fn(f"⬇️ Đang tải model AI: {dest.name} ...")
+        log_fn(f"[MODEL] Tải trọng số AI: {dest.name}")
     tmp_dest = dest.with_suffix(dest.suffix + f".dl_{os.getpid()}_{threading.get_ident()}")
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
@@ -754,6 +774,8 @@ def process_single_video(
     weights_dir: Path | None = None,
     cancel_check: Callable[[], None] | None = None,
     on_frame_progress: Callable[[float], None] | None = None,
+    file_entry: dict[str, Any] | None = None,
+    batch_files: list[dict[str, Any]] | None = None,
 ) -> tuple[Path | None, str, str]:
     """
     Upscale a single video using the full Video2X pipeline:
@@ -768,7 +790,7 @@ def process_single_video(
         cancel_check()
 
     if not cfg["force_reoptimize"] and is_video_already_optimized(cur_input):
-        log_fn(f"[SKIP] Video '{cur_input.name}' đã được tối ưu/upscale trước đó, bỏ qua.")
+        log_fn(f"[{idx}/{total_count}] SKIP   {cur_input.name} | Đã được tối ưu/upscale trước đó")
         return None, "Skipped (Already optimized)", "-"
 
     in_w, in_h, fps_str, fps_val, total_dur, exact_nb_frames, bpp_val = get_video_metadata(cur_input)
@@ -776,7 +798,7 @@ def process_single_video(
 
     if is_already_at_or_above_target(in_w, in_h, target_resolution):
         log_fn(
-            f"[SKIP] Video '{cur_input.name}' ({in_w}x{in_h}) đã đạt hoặc lớn hơn target ({target_resolution}), bỏ qua."
+            f"[{idx}/{total_count}] SKIP   {cur_input.name} ({in_w}x{in_h}) | Đã đạt target {target_resolution}"
         )
         return None, f"Skipped (Already >= {target_resolution.split()[0]})", f"{in_w}x{in_h}"
 
@@ -788,7 +810,7 @@ def process_single_video(
     has_cuda = torch.cuda.is_available()
     if not has_cuda and not cfg["allow_cpu_upscale"]:
         raise RuntimeError(
-            "❌ Colab Server chưa bật GPU Runtime! Vui lòng vào Runtime > Change runtime type > chọn T4 GPU để chạy AI Video Upscale."
+            "Colab Server chưa bật GPU Runtime. Vui lòng vào Runtime > Change runtime type > chọn T4 GPU để chạy AI Video Upscale."
         )
 
     device = torch.device("cuda" if has_cuda else "cpu")
@@ -833,11 +855,40 @@ def process_single_video(
     final_output = dest_dir / out_filename
 
     if final_output.exists() and not overwrite_output:
-        log_fn(f"[SKIP] File đầu ra đã tồn tại ({final_output.name}) và overwrite_output=False.")
+        log_fn(f"[{idx}/{total_count}] SKIP   {final_output.name} | File đã tồn tại (overwrite=False)")
         return final_output, "Skipped (Exists)", "-"
 
     if cancel_check:
         cancel_check()
+
+    if file_entry is not None:
+        file_entry.update({
+            "status": "active",
+            "inRes": f"{in_w}x{in_h}",
+            "model": selected_model,
+            "framesTotal": est_frames or 0,
+            "framesDone": 0,
+            "percent": 0,
+        })
+    _emit_upscale_progress(
+        job_state,
+        active=True,
+        phase="loading_model",
+        mediaType="video",
+        currentFile=cur_input.name,
+        outputFile=out_filename,
+        inRes=f"{in_w}x{in_h}",
+        targetResolution=target_resolution,
+        model=selected_model,
+        gpuName=gpu_name_str,
+        vramTotalGb=round(vram_total_gb, 1),
+        framesDone=0,
+        framesTotal=est_frames or 0,
+        filePercent=0.0,
+        fps=0.0,
+        etaSeconds=None,
+        **({"files": batch_files} if batch_files is not None else {}),
+    )
 
     model = load_upscale_model(
         selected_model,
@@ -953,7 +1004,8 @@ def process_single_video(
     compiled_callable = None
     if want_compile and hasattr(torch, "compile"):
         try:
-            log_fn("⚡ Đang tối ưu hóa nhân GPU bằng torch.compile (mất ~15-25s đầu để tăng tốc toàn bộ video dài)...")
+            _emit_upscale_progress(job_state, phase="compiling", **({"files": batch_files} if batch_files is not None else {}))
+            log_fn(f"[COMPILE] Tối ưu hóa nhân GPU bằng torch.compile cho {cur_input.name}...")
             _comp_net = torch.compile(model.model, mode="default", dynamic=False)
             with torch.inference_mode():
                 _warm_in = torch.zeros((eff_batch, in_h, in_w, 3), dtype=torch.uint8, device=device)
@@ -962,7 +1014,7 @@ def process_single_video(
                 compiled_callable = _comp_net
                 del _warm_in, _warm_x
         except Exception as exc:
-            log_fn(f"ℹ️ Bỏ qua torch.compile, chạy chế độ Eager tiêu chuẩn ({exc})")
+            log_fn(f"[COMPILE] Bỏ qua torch.compile, dùng chế độ Eager ({exc})")
             compiled_callable = None
 
     ram_total_b, ram_avail_b = get_linux_ram_bytes()
@@ -1012,7 +1064,6 @@ def process_single_video(
             _, _, disk_free = shutil.disk_usage(tmp_root)
             if in_sz < 4 * (1024 ** 3) and disk_free > in_sz + 6 * (1024 ** 3):
                 staged_local_input = tmp_root / f"_staged_input_{idx}{cur_input.suffix}"
-                log_fn(f"⚡ Đang nạp nhanh video gốc ({in_sz / (1024**2):.1f} MB) từ Drive vào SSD nội bộ để chống sụt FPS...")
                 shutil.copyfile(str(cur_input), str(staged_local_input))
                 working_input = staged_local_input
         except Exception:
@@ -1034,28 +1085,54 @@ def process_single_video(
         nv_cq, cpu_crf = (24, 20)
         max_br, buf_br = ("12M", "24M") if is_1080_plus else ("6M", "12M")
 
-    dec_name = "NVDEC (GPU)" if use_nvdec else "CPU Multi-thread"
-    enc_name = f"{nvenc_codec} (p4+AQ, cq={nv_cq}, max={max_br})" if use_nvenc else f"libx264 (veryfast, crf={cpu_crf})"
-
-    param_millions = sum(p.numel() for p in model.model.parameters()) / 1e6
+    dec_short = "NVDEC" if use_nvdec else "CPU"
+    enc_short = nvenc_codec if use_nvenc else "libx264"
+    prec_str = (
+        f"{'FP16+NHWC' if use_channels_last else ('FP16' if model_dtype == torch.float16 else 'FP32')}"
+        f"{'+Compile' if compiled_callable is not None else ''}"
+    )
+    pipe_str = f"{dec_short} -> Tensor Cores -> {enc_short}" if has_cuda else f"{dec_short} -> PyTorch -> {enc_short}"
     vram_reserved_gb = (torch.cuda.memory_reserved(device) / (1024 ** 3)) if has_cuda else 0.0
 
-    log_fn("============================================================")
-    log_fn(f"🎬 [{idx}/{total_count}] Video gốc : {cur_input.name} ({in_w}x{in_h} @ {fps_val:.2f} FPS | BPP={bpp_val:.3f})")
-    if auto_reason:
-        log_fn(f"🤖 Auto Model     : Đã chọn '{selected_model}' — {auto_reason}")
-    log_fn(
-        f"🧠 Cấu hình AI    : {selected_model} ({param_millions:.2f}M params | native {model.scale}x | "
-        f"{'FP16+NHWC' if use_channels_last else ('FP16' if model_dtype == torch.float16 else 'FP32')}"
-        f"{'+Compile' if compiled_callable is not None else ''} | batch={eff_batch})"
+    if file_entry is not None:
+        file_entry.update({
+            "status": "active",
+            "outputName": out_filename,
+            "inRes": f"{in_w}x{in_h}",
+            "outRes": f"{out_w}x{out_h}",
+            "model": selected_model,
+            "framesTotal": est_frames or 0,
+            "framesDone": 0,
+            "percent": 0,
+        })
+    _emit_upscale_progress(
+        job_state,
+        active=True,
+        phase="upscaling_video",
+        mediaType="video",
+        currentFile=cur_input.name,
+        outputFile=out_filename,
+        inRes=f"{in_w}x{in_h}",
+        outRes=f"{out_w}x{out_h}",
+        targetResolution=target_resolution,
+        model=selected_model,
+        precision=prec_str,
+        batchSize=eff_batch,
+        pipeline=pipe_str,
+        vramUsedGb=round(vram_reserved_gb, 2),
+        vramTotalGb=round(vram_total_gb, 1),
+        gpuName=gpu_name_str,
+        framesDone=0,
+        framesTotal=est_frames or 0,
+        filePercent=0.0,
+        fps=0.0,
+        etaSeconds=None,
+        **({"files": batch_files} if batch_files is not None else {}),
     )
     log_fn(
-        f"🚀 Tài nguyên cấp : VRAM giữ sẵn ~{vram_reserved_gb:.1f}/{vram_total_gb:.1f} GB | "
-        f"Bộ đệm RAM Prefetch: {alloc_ram_gb:.2f} GB ({num_in_slots * eff_batch} frames đọc trước)"
+        f"[{idx}/{total_count}] START  {cur_input.name} ({in_w}x{in_h} -> {out_w}x{out_h}) | "
+        f"{selected_model} ({prec_str}, B={eff_batch}) | {dec_short} -> {enc_short}"
     )
-    log_fn(f"🎯 Độ phân giải ra: {out_w}x{out_h} ({target_resolution}) → {out_filename}")
-    log_fn(f"⚡ Phần cứng Video: Giải mã {dec_name} → AI Tensor Cores → Mã hóa {enc_name}")
-    log_fn("============================================================")
 
     time_args_in: list[str] = []
     if start_time.strip() and start_time.strip() != "00:00:00":
@@ -1291,24 +1368,48 @@ def process_single_video(
 
                 processed_frames += cur_b
                 now = time.time()
-                if now - last_ui_tick >= 1.5 or (est_frames and processed_frames >= est_frames):
+                if now - last_ui_tick >= 0.8 or (est_frames and processed_frames >= est_frames):
                     last_ui_tick = now
                     elapsed_so_far = max(now - t0, 1e-3)
                     cur_fps = processed_frames / elapsed_so_far
                     frame_ratio = min(0.99, processed_frames / est_frames) if (est_frames and est_frames > 0) else 0.5
                     if on_frame_progress:
                         on_frame_progress(frame_ratio)
+                    pct_disp = int(round(frame_ratio * 100))
+                    eta_sec = (
+                        max(0, int(round((est_frames - processed_frames) / max(cur_fps, 1e-3))))
+                        if (est_frames and est_frames > processed_frames and cur_fps > 0)
+                        else 0
+                    )
+                    cur_vram_gb = (
+                        max(torch.cuda.memory_allocated(device), torch.cuda.memory_reserved(device)) / (1024 ** 3)
+                        if has_cuda
+                        else 0.0
+                    )
+                    if file_entry is not None:
+                        file_entry.update({
+                            "status": "active",
+                            "framesDone": processed_frames,
+                            "framesTotal": est_frames or 0,
+                            "percent": pct_disp,
+                            "fps": round(cur_fps, 2),
+                            "etaSeconds": eta_sec,
+                        })
                     if job_state is not None:
-                        pct_disp = int(round(frame_ratio * 100))
-                        total_disp = f"/{est_frames}" if est_frames else ""
-                        job_state.set(current_file=f"{cur_input.name} ({pct_disp}% · {cur_fps:.1f} FPS)")
-                        milestone = (pct_disp // 10) * 10
-                        if milestone >= last_log_milestone + 10 and milestone <= 90:
-                            last_log_milestone = milestone
-                            log_fn(
-                                f"⏳ [{idx}/{total_count}] {cur_input.name}: {pct_disp}% "
-                                f"({processed_frames}{total_disp} frames @ {cur_fps:.1f} FPS)"
-                            )
+                        job_state.set(current_file=f"{cur_input.name} ({pct_disp}% - {cur_fps:.1f} FPS)")
+                        _emit_upscale_progress(
+                            job_state,
+                            active=True,
+                            phase="upscaling_video",
+                            framesDone=processed_frames,
+                            framesTotal=est_frames or 0,
+                            filePercent=round(frame_ratio * 100.0, 1),
+                            fps=round(cur_fps, 2),
+                            etaSeconds=eta_sec,
+                            elapsedSeconds=round(elapsed_so_far, 1),
+                            vramUsedGb=round(cur_vram_gb, 2),
+                            **({"files": batch_files} if batch_files is not None else {}),
+                        )
 
         _q_put(out_ready_q, None)
         t_writer.join()
@@ -1348,7 +1449,7 @@ def process_single_video(
 
     if worker_errors:
         local_tmp_out.unlink(missing_ok=True)
-        raise RuntimeError(f"❌ Lỗi luồng xử lý AI Upscale: {worker_errors[0]}")
+        raise RuntimeError(f"Lỗi luồng xử lý AI Upscale: {worker_errors[0]}")
 
     elapsed = max(time.time() - t0, 1e-6)
     peak_vram_gb = (
@@ -1360,7 +1461,7 @@ def process_single_video(
     if rc_out != 0 or not local_tmp_out.exists() or local_tmp_out.stat().st_size < 1024:
         local_tmp_out.unlink(missing_ok=True)
         err_msg = "\n".join(in_errs + out_errs)
-        raise RuntimeError(f"❌ Quá trình FFmpeg gặp lỗi (rc_in={rc_in}, rc_out={rc_out}):\n{err_msg}")
+        raise RuntimeError(f"Quá trình FFmpeg gặp lỗi (rc_in={rc_in}, rc_out={rc_out}):\n{err_msg}")
 
     final_output.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -1378,14 +1479,26 @@ def process_single_video(
         and final_output.resolve() != cur_input.resolve()
     ):
         cur_input.unlink(missing_ok=True)
-        log_fn(f"🗑️ Đã xóa bản tải tạm trên Colab SSD: {cur_input.name}")
 
-    size_mb = final_output.stat().st_size / (1024 * 1024)
+    out_bytes = final_output.stat().st_size
+    size_mb = out_bytes / (1024 * 1024)
+    avg_fps = processed_frames / elapsed
     res_tag = _short_res_tag(target_resolution, out_w, out_h)
+    if file_entry is not None:
+        file_entry.update({
+            "status": "done",
+            "outputName": final_output.name,
+            "percent": 100,
+            "framesDone": processed_frames,
+            "framesTotal": max(processed_frames, est_frames or 0),
+            "fps": round(avg_fps, 2),
+            "durationSec": round(elapsed, 1),
+            "outputSizeBytes": out_bytes,
+            "etaSeconds": 0,
+        })
     log_fn(
-        f"🎉 Hoàn tất [{idx}/{total_count}]! Đã xử lý {processed_frames} frames trong {elapsed:.1f}s "
-        f"(trung bình {processed_frames / elapsed:.2f} FPS) | Peak VRAM: {peak_vram_gb:.2f}/{vram_total_gb:.1f} GB | "
-        f"Đầu ra: {final_output.name} ({size_mb:.2f} MB)"
+        f"[{idx}/{total_count}] DONE   {final_output.name} | {processed_frames} frames in {elapsed:.1f}s "
+        f"({avg_fps:.2f} FPS) | {size_mb:.2f} MB | Peak VRAM {peak_vram_gb:.2f}/{vram_total_gb:.1f} GB"
     )
     if on_frame_progress:
         on_frame_progress(1.0)
@@ -1416,7 +1529,7 @@ def process_single_image(
         cancel_check()
 
     if not cfg["force_reoptimize"] and (is_upscaled_filename(cur_input.name) or is_image_already_optimized(cur_input)):
-        log_fn(f"[SKIP] Ảnh '{cur_input.name}' đã được tối ưu/upscale trước đó, bỏ qua.")
+        log_fn(f"[{idx}/{total_count}] SKIP   {cur_input.name} | Đã được tối ưu/upscale trước đó")
         return None, "Skipped (Already optimized)", "-"
 
     with PILImage.open(cur_input) as raw_img:
@@ -1428,7 +1541,7 @@ def process_single_image(
     target_resolution = cfg["target_resolution"]
     if is_already_at_or_above_target(in_w, in_h, target_resolution):
         log_fn(
-            f"[SKIP] Ảnh '{cur_input.name}' ({in_w}x{in_h}) đã đạt hoặc lớn hơn target ({target_resolution}), bỏ qua."
+            f"[{idx}/{total_count}] SKIP   {cur_input.name} ({in_w}x{in_h}) | Đã đạt target {target_resolution}"
         )
         return None, f"Skipped (Already >= {target_resolution.split()[0]})", f"{in_w}x{in_h}"
 
@@ -1568,8 +1681,9 @@ def process_single_image(
         cur_input.unlink(missing_ok=True)
 
     res_tag = _short_res_tag(target_resolution, out_w, out_h)
+    out_img_mb = final_output.stat().st_size / (1024 * 1024) if final_output.exists() else 0.0
     log_fn(
-        f"🖼️ [{idx}/{total_count}] Đã upscale ảnh: {cur_input.name} ({in_w}x{in_h} → {out_w}x{out_h} | {selected_model})"
+        f"[{idx}/{total_count}] DONE   {cur_input.name} ({in_w}x{in_h} -> {out_w}x{out_h}) | {selected_model} | {out_img_mb:.2f} MB"
     )
     return final_output, f"Upscaled ({res_tag})", f"{res_tag} · {selected_model}"
 
@@ -1623,21 +1737,71 @@ def upscale_directory(
 
     total_candidates = len(videos) + len(images)
     results: list[dict[str, Any]] = []
+    batch_files: list[dict[str, Any]] = []
+    for b_idx, img_p in enumerate(images, start=1):
+        batch_files.append({
+            "index": b_idx,
+            "name": img_p.relative_to(input_dir).as_posix(),
+            "mediaType": "image",
+            "status": "pending",
+            "percent": 0,
+        })
+    for v_offset, vid_p in enumerate(videos, start=len(images) + 1):
+        batch_files.append({
+            "index": v_offset,
+            "name": vid_p.relative_to(input_dir).as_posix(),
+            "mediaType": "video",
+            "status": "pending",
+            "percent": 0,
+        })
+
+    done_ok_count = 0
+    skipped_media_count = 0
 
     def _update_overall_progress(completed_units: float) -> None:
-        if total_candidates > 0 and job_state is not None and hasattr(job_state, "progress"):
+        if total_candidates > 0 and job_state is not None:
             pct = min(100.0, max(0.0, (completed_units / total_candidates) * 100.0))
-            setattr(job_state.progress, "optimize", pct)
-            job_state.updated_at = time.time()
+            if hasattr(job_state, "progress"):
+                setattr(job_state.progress, "optimize", pct)
+            _emit_upscale_progress(
+                job_state,
+                overallPercent=round(pct, 1),
+                completedItems=done_ok_count,
+                skippedItems=skipped_media_count,
+                totalItems=total_candidates,
+                files=batch_files,
+            )
 
     work_dir = output_dir.parent / "upscale_work"
-    deep_cleanup_system(work_dir=work_dir, remove_weights=False, label="Trước khi chạy", log_fn=log_fn)
+    deep_cleanup_system(work_dir=work_dir, remove_weights=False, label="Trước khi chạy", log_fn=log_fn, verbose=False)
+
+    if total_candidates > 0:
+        parts_desc = []
+        if videos:
+            parts_desc.append(f"{len(videos)} video")
+        if images:
+            parts_desc.append(f"{len(images)} ảnh")
+        short_prof = cfg["size_profile"].split("(")[0].strip()
+        log_fn(f"[UPSCALE] Hàng đợi: {', '.join(parts_desc)} | Target: {cfg['target_resolution']} | Profile: {short_prof}")
+        _emit_upscale_progress(
+            job_state,
+            merge=False,
+            active=True,
+            phase="preparing",
+            totalItems=total_candidates,
+            completedItems=0,
+            skippedItems=0,
+            currentIndex=1,
+            overallPercent=0.0,
+            filePercent=0.0,
+            targetResolution=cfg["target_resolution"],
+            files=batch_files,
+        )
 
     done_count = 0
 
     # 1. Process Images (reusing loaded Spandrel model in VRAM across image batch for maximum speed)
     if images:
-        log_fn(f"🗂️ Bắt đầu AI Upscale {len(images)} hình ảnh...")
         img_model_cache: dict[tuple[str, float, bool], Any] = {}
         try:
             for i_idx, img_path in enumerate(images, start=1):
@@ -1646,9 +1810,24 @@ def upscale_directory(
                 rel_path = img_path.relative_to(input_dir)
                 rel_str = rel_path.as_posix()
                 orig_size = img_path.stat().st_size if img_path.exists() else 0
+                cur_entry = batch_files[done_count]
+                cur_entry["status"] = "active"
                 if job_state is not None:
                     job_state.set(current_file=rel_str)
+                _emit_upscale_progress(
+                    job_state,
+                    active=True,
+                    phase="upscaling_image",
+                    mediaType="image",
+                    currentIndex=done_count + 1,
+                    currentFile=img_path.name,
+                    filePercent=50.0,
+                    fps=0.0,
+                    etaSeconds=None,
+                    files=batch_files,
+                )
 
+                t_img0 = time.time()
                 out_p, status_msg, badge = process_single_image(
                     img_path,
                     output_dir / rel_path.parent,
@@ -1659,7 +1838,10 @@ def upscale_directory(
                     job_state=job_state,
                     cancel_check=cancel_check,
                 )
+                img_dur = round(max(0.1, time.time() - t_img0), 1)
                 if out_p is None or status_msg.lower().startswith("skipped"):
+                    skipped_media_count += 1
+                    cur_entry.update({"status": "skipped", "percent": 100, "skipReason": status_msg, "durationSec": img_dur})
                     results.append({
                         "name": rel_str,
                         "source_name": rel_str,
@@ -1670,12 +1852,22 @@ def upscale_directory(
                         "mode": "upscale",
                     })
                 else:
+                    done_ok_count += 1
+                    out_sz = out_p.stat().st_size
                     out_rel = out_p.relative_to(output_dir).as_posix()
+                    cur_entry.update({
+                        "status": "done",
+                        "outputName": out_p.name,
+                        "percent": 100,
+                        "outputSizeBytes": out_sz,
+                        "durationSec": img_dur,
+                        "model": badge.split("·")[-1].strip() if "·" in badge else badge,
+                    })
                     results.append({
                         "name": out_rel,
                         "source_name": rel_str,
                         "original_size": orig_size,
-                        "optimized_size": out_p.stat().st_size,
+                        "optimized_size": out_sz,
                         "status": status_msg,
                         "quality": badge,
                         "mode": "upscale",
@@ -1690,11 +1882,11 @@ def upscale_directory(
                     remove_weights=False,
                     label=f"Sau lô {len(images)} ảnh",
                     log_fn=log_fn,
+                    verbose=False,
                 )
 
     # 2. Process Videos sequentially with full per-video deep cleanup (exact Video2X batch loop)
     if videos:
-        log_fn(f"🗂️ Bắt đầu AI Upscale danh sách gồm {len(videos)} video...")
         for v_idx, v_path in enumerate(videos, start=1):
             if cancel_check:
                 cancel_check()
@@ -1702,8 +1894,22 @@ def upscale_directory(
             rel_str = rel_path.as_posix()
             orig_size = v_path.stat().st_size if v_path.exists() else 0
             base_done = float(done_count)
+            cur_entry = batch_files[done_count]
+            cur_entry["status"] = "active"
             if job_state is not None:
                 job_state.set(current_file=rel_str)
+            _emit_upscale_progress(
+                job_state,
+                active=True,
+                phase="preparing",
+                mediaType="video",
+                currentIndex=done_count + 1,
+                currentFile=v_path.name,
+                filePercent=0.0,
+                fps=0.0,
+                etaSeconds=None,
+                files=batch_files,
+            )
 
             try:
                 out_p, status_msg, badge = process_single_video(
@@ -1716,8 +1922,12 @@ def upscale_directory(
                     work_dir=work_dir,
                     cancel_check=cancel_check,
                     on_frame_progress=lambda frac, b=base_done: _update_overall_progress(b + frac),
+                    file_entry=cur_entry,
+                    batch_files=batch_files,
                 )
                 if out_p is None or status_msg.lower().startswith("skipped"):
+                    skipped_media_count += 1
+                    cur_entry.update({"status": "skipped", "percent": 100, "skipReason": status_msg})
                     results.append({
                         "name": rel_str,
                         "source_name": rel_str,
@@ -1728,6 +1938,7 @@ def upscale_directory(
                         "mode": "upscale",
                     })
                 else:
+                    done_ok_count += 1
                     out_rel = out_p.relative_to(output_dir).as_posix()
                     results.append({
                         "name": out_rel,
@@ -1747,7 +1958,22 @@ def upscale_directory(
                         remove_weights=False,
                         label=f"Sau video {v_idx}/{len(videos)}",
                         log_fn=log_fn,
+                        verbose=False,
                     )
+
+    if total_candidates > 0:
+        _emit_upscale_progress(
+            job_state,
+            active=False,
+            phase="completed",
+            completedItems=done_ok_count,
+            skippedItems=skipped_media_count,
+            totalItems=total_candidates,
+            overallPercent=100.0,
+            filePercent=100.0,
+            etaSeconds=0,
+            files=batch_files,
+        )
 
     # 3. Handle non-media passthrough files (when filter is OFF or extra categories are included)
     passthrough_copy = not bool(options.get("replace"))

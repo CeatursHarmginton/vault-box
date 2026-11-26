@@ -842,3 +842,151 @@ def test_folder_download_upscale_and_multi_category_file_filter(tmp_path):
     assert media_converter.should_download_file_item("photo.png", ex_opts) is True
     assert media_converter.should_download_file_item("doc.pdf", ex_opts) is True
 
+
+def test_upscale_live_telemetry_emoji_free_logs_and_server_capability_badges():
+    import re
+    from src.relay_client import _JobProgressDelta
+    from src.server import get_server_features
+    from backend.app.colab.client import ColabJob, ColabManager
+
+    # 1. Verify ai_upscaler.py has ZERO emojis anywhere
+    upscaler_src = (COLAB_ROOT / "src" / "utils" / "ai_upscaler.py").read_text(encoding="utf-8")
+    emoji_re = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]")
+    assert emoji_re.search(upscaler_src) is None, "ai_upscaler.py must not contain any emojis"
+
+    # 2. Verify JobState.set_upscale_progress -> _JobProgressDelta -> ColabManager._apply_transfer_remote
+    js_state = JobState("up-tel-1", {"options": {"optimize_image": True, "upscale": True}})
+    initial_view = js_state.view()
+    delta = _JobProgressDelta()
+    delta.seed(initial_view)
+
+    js_state.set_upscale_progress({
+        "active": True,
+        "phase": "upscaling_video",
+        "totalItems": 5,
+        "completedItems": 1,
+        "currentIndex": 2,
+        "currentFile": "02_clip.mp4",
+        "inRes": "360x360",
+        "outRes": "1080x1080",
+        "model": "4xNomos8kSC",
+        "framesDone": 64,
+        "framesTotal": 122,
+        "filePercent": 52.5,
+        "overallPercent": 30.5,
+        "fps": 1.72,
+        "etaSeconds": 34,
+        "files": [{"index": 1, "name": "01_clip.mp4", "status": "done", "percent": 100}],
+    })
+    prog_payload = delta.build_progress_payload(js_state.view())
+    assert prog_payload["upscaleProgress"]["framesDone"] == 64
+    assert prog_payload["upscaleProgress"]["fps"] == 1.72
+
+    mgr = ColabManager()
+    local_job = ColabJob(
+        id="up-tel-1",
+        mode="optimize",
+        file_id="f1",
+        name="optimize: testUpscale",
+        status="running",
+        progress=0.5,
+        downloaded=0,
+        total=0,
+        speed=0,
+        message="optimizing",
+        output_path=None,
+        remote_job_id="server:up-tel-1",
+        relative_dir=None,
+        drive_output_dir=None,
+        account_id=None,
+        created_at=1000.0,
+        updated_at=1000.0,
+    )
+    mgr._apply_transfer_remote(local_job, prog_payload)
+    view_out = local_job.view()
+    assert view_out["upscaleProgress"]["currentFile"] == "02_clip.mp4"
+    assert view_out["upscaleProgress"]["filePercent"] == 52.5
+
+    # 3. Verify server features extraction & worker get_server_features structure
+    worker_feat = get_server_features()
+    assert {"driveMounted", "aiSubtitles", "aiUpscale", "hasGpu", "gpuName", "vramGb"}.issubset(worker_feat.keys())
+
+    extracted = ColabManager._extract_server_features({
+        "features": {
+            "driveMounted": True,
+            "aiSubtitles": True,
+            "aiUpscale": True,
+            "hasGpu": True,
+            "gpuName": "Tesla T4",
+            "vramGb": 15.0,
+        }
+    })
+    assert extracted is not None
+    assert extracted["aiSubtitles"] is True
+    assert extracted["aiUpscale"] is True
+    assert extracted["driveMounted"] is True
+    assert extracted["gpuName"] == "Tesla T4"
+
+    # 4. Verify Frontend JS: server capability badges (only when online!) + emoji-free log formatter
+    node = shutil.which("node")
+    if node:
+        colab_js = (REPO_ROOT / "frontend" / "static" / "js" / "colab_transfer.js").read_text(encoding="utf-8")
+        assert 'id="optUpscaleLiveCard"' in colab_js
+        assert 'id="optServerCapsBar"' in colab_js
+        assert 'id="colabTransferServerCapsBar"' in colab_js
+
+        # Check ES module syntax for modified JS files
+        for js_rel in (
+            "frontend/static/js/colab_transfer.js",
+            "frontend/static/js/colab_clipboard.js",
+            "frontend/static/js/features/cloud_tasks/cloud_tasks.js",
+            "frontend/static/js/features/theater/theater_subtitles.js",
+        ):
+            subprocess.run(
+                [node, "--check", "--input-type=module"],
+                input=(REPO_ROOT / js_rel).read_text(encoding="utf-8"),
+                text=True,
+                check=True,
+            )
+
+        cap_start = colab_js.index("function getConnectedServerFeatures(server)")
+        cap_end = colab_js.index("function pickOptimalColabServer(servers, currentServerId)")
+        log_start = colab_js.index("function formatColabLogLineHtml(line)")
+        log_end = colab_js.index("function renderColabJobLogs(")
+
+        node_script = f"""
+import {{ parseColabConnectClipboard }} from {json.dumps((REPO_ROOT / "frontend/static/js/colab_clipboard.js").as_uri())};
+const escapeHtml = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const getEffectiveServerStatus = (s) => s?.status || "offline";
+{colab_js[cap_start:cap_end]}
+{colab_js[log_start:log_end]}
+
+const parsed = parseColabConnectClipboard('VAULTBOX_COLAB_CONNECT: {{"mode":"server","serverUrl":"https://relay.example.com","roomId":"vb-123","serverToken":"tok","features":{{"aiSubtitles":true,"aiUpscale":true,"hasGpu":true,"gpuName":"Tesla T4"}}}}');
+const onlineSrv = {{ id: "s1", name: "Server 2", status: "idle", colabReady: true, features: parsed.features }};
+const offlineSrv = {{ id: "s2", name: "Server 3", status: "offline", colabReady: false, features: parsed.features }};
+
+const onlineBadges = renderServerCapabilityBadgesHtml(onlineSrv);
+const offlineBadges = renderServerCapabilityBadgesHtml(offlineSrv);
+const selectLbl = formatServerSelectLabel(onlineSrv);
+
+const logStartHtml = formatColabLogLineHtml("[1/5] START  01_clip.mp4 (360x360 -> 1080x1080) | 4xNomos8kSC | NVDEC -> h264_nvenc");
+const logWallHtml = formatColabLogLineHtml("============================================================");
+const logLegacyEmojiHtml = formatColabLogLineHtml("🎉 Hoàn tất [1/5]! Đã xử lý 136 frames");
+
+console.log(JSON.stringify({{
+  hasParsedFeatures: Boolean(parsed?.features?.aiSubtitles && parsed?.features?.aiUpscale),
+  onlineHasSub: onlineBadges.includes("AI Subtitles"),
+  onlineHasUpscale: onlineBadges.includes("AI Upscale"),
+  onlineHasGpu: onlineBadges.includes("GPU T4"),
+  offlineEmpty: offlineBadges === "",
+  selectHasCaps: selectLbl.includes("AI Sub") && selectLbl.includes("AI Upscale"),
+  logStartTagged: logStartHtml.includes("tag-start") && logStartHtml.includes("START"),
+  logWallFiltered: logWallHtml === "",
+  legacyEmojiStripped: !logLegacyEmojiHtml.includes("🎉") && logLegacyEmojiHtml.includes("Hoàn tất"),
+}}));
+"""
+        proc = subprocess.run([node, "--input-type=module"], input=node_script, text=True, capture_output=True, check=True)
+        out = json.loads(proc.stdout.strip())
+        assert all(out.values()), f"Frontend JS assertions failed: {out}"
+
+

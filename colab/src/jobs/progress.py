@@ -63,7 +63,17 @@ class JobState:
     failed_items: list[dict[str, Any]] = field(default_factory=list)
     failed_files: list[dict[str, Any]] = field(default_factory=list)
     item_timings: dict[str, dict[str, Any]] = field(default_factory=dict)
+    upscale_progress: dict[str, Any] = field(default_factory=dict)
     _last_item_end_time: float | None = field(default=None, compare=False, hash=False)
+
+    def set_upscale_progress(self, data: dict[str, Any] | None = None, *, merge: bool = True) -> None:
+        if data is None:
+            self.upscale_progress = {}
+        elif merge and isinstance(self.upscale_progress, dict):
+            self.upscale_progress = {**self.upscale_progress, **data}
+        else:
+            self.upscale_progress = dict(data)
+        self.updated_at = time.time()
 
     def start_item(self, key: str, name: str = "") -> None:
         now = time.time()
@@ -467,6 +477,7 @@ class JobState:
                 k: (dict(v) if isinstance(v, dict) else v)
                 for k, v in list(self.item_timings.items())
             },
+            "upscaleProgress": dict(self.upscale_progress) if isinstance(self.upscale_progress, dict) else {},
             "confirmAction": self.confirm_action,
             # Source item list, so the app can rebuild the per-item queue view after a
             # restart or when it reconnects to a job it did not start itself.
