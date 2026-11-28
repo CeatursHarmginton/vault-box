@@ -46,6 +46,8 @@ MODEL_PRESET_OPTIONS: tuple[str, ...] = (
 TARGET_RESOLUTION_OPTIONS: tuple[str, ...] = (
     "720p",
     "1080p",
+    "1440p (2K)",
+    "2160p (4K)",
     "Native Model Scale (2x/4x)",
 )
 
@@ -514,8 +516,8 @@ def compute_scaled_even_dims(in_w: int, in_h: int, target_short: int) -> tuple[i
     long_side = max(1, in_w if is_landscape else in_h)
     t_short = max(2, (int(target_short) // 2) * 2)
     aspect = long_side / short_side
-    if abs(aspect - (16.0 / 9.0)) < 0.025 and t_short in (360, 480, 540, 720, 1080):
-        std_map = {360: 640, 480: 854, 540: 960, 720: 1280, 1080: 1920}
+    if abs(aspect - (16.0 / 9.0)) < 0.025 and t_short in (360, 480, 540, 720, 1080, 1440, 2160):
+        std_map = {360: 640, 480: 854, 540: 960, 720: 1280, 1080: 1920, 1440: 2560, 2160: 3840}
         t_long = std_map[t_short]
     else:
         t_long = max(2, int(round((t_short * aspect) / 2.0) * 2))
@@ -697,7 +699,11 @@ def resolve_pre_downscale_dims(
             descale_ratio < 0.585 or (hf_ratio < 0.80 and descale_ratio < 0.61)
         )
         if is_fake_hd:
-            if in_short >= 900:
+            if in_short >= 1800:
+                est_short = 720 if (descale_ratio < 0.48 or hf_ratio < 0.56) else 1080
+            elif in_short >= 1350:
+                est_short = 480 if (descale_ratio < 0.48 or hf_ratio < 0.56) else 720
+            elif in_short >= 900:
                 est_short = 360 if (descale_ratio < 0.48 or hf_ratio < 0.56) else 480
             else:
                 est_short = 360
@@ -714,24 +720,39 @@ def resolve_pre_downscale_dims(
     return in_w, in_h, False, ""
 
 
+_STD_TIER_LONG: dict[int, int] = {720: 1280, 1080: 1920, 1440: 2560, 2160: 3840}
+
+
 def target_short_pixels(res_choice: str) -> int | None:
-    """Return short-side target pixel threshold for 720p/1080p, or None for Native Model Scale."""
+    """Return short-side target pixel threshold for 720p/1080p/1440p(2K)/2160p(4K), or None for Native Model Scale."""
     clean = str(res_choice or "1080p").strip()
-    if clean.startswith("Native") or clean.lower().startswith("native"):
+    low = clean.lower()
+    if low.startswith("native"):
         return None
-    if "720" in clean:
+    if "2160" in low or "4k" in low:
+        return 2160
+    if "1440" in low or "2k" in low:
+        return 1440
+    if "720" in low:
         return 720
-    if "1080" in clean:
+    if "1080" in low:
         return 1080
     return None
 
 
 def is_already_at_or_above_target(in_w: int, in_h: int, res_choice: str) -> bool:
-    """Return True if input short side already meets or exceeds `target_resolution` (720p/1080p)."""
+    """Return True if input already meets or exceeds `target_resolution` (720p/1080p/1440p/2160p, including ultrawide 21:9)."""
     t_short = target_short_pixels(res_choice)
     if t_short is None or in_w <= 0 or in_h <= 0:
         return False
-    return min(in_w, in_h) >= t_short
+    short_side = min(in_w, in_h)
+    long_side = max(in_w, in_h)
+    if short_side >= t_short:
+        return True
+    std_long = _STD_TIER_LONG.get(t_short)
+    if std_long is not None and (long_side / max(1, short_side)) > 1.80 and long_side >= std_long:
+        return True
+    return False
 
 
 def get_linux_ram_bytes() -> tuple[int, int]:
@@ -1040,12 +1061,8 @@ def choose_auto_model(
     is_restoration: bool = False,
 ) -> tuple[str, float, str]:
     in_short = min(in_w, in_h)
-    if res_choice == "720p":
-        scale_needed = 720.0 / max(1, in_short)
-    elif res_choice == "1080p":
-        scale_needed = 1080.0 / max(1, in_short)
-    else:
-        scale_needed = 2.0
+    t_short = target_short_pixels(res_choice)
+    scale_needed = (float(t_short) / max(1, in_short)) if t_short is not None else 2.0
 
     upper_dev = gpu_name.upper()
     fast_gpu = any(tag in upper_dev for tag in ("A100", "L4", "V100", "H100", "4090", "3090"))
@@ -1053,7 +1070,7 @@ def choose_auto_model(
     frames = est_frames if est_frames else 1800
 
     if scale_needed >= 2.6:
-        if frames <= 1500 or fast_gpu or (is_tpu and frames <= 3000):
+        if (frames <= 1500 and in_short < 720) or fast_gpu or (is_tpu and frames <= 3000 and in_short < 720):
             return (
                 "4xNomos8kSC",
                 default_dn,
@@ -1095,23 +1112,29 @@ def choose_auto_model(
 
 
 def compute_target_dims(in_w: int, in_h: int, model_scale: int, res_choice: str) -> tuple[int, int]:
-    if str(res_choice).startswith("Native") or str(res_choice).lower().startswith("native"):
+    t_short = target_short_pixels(res_choice)
+    if t_short is None:
         out_w = (in_w * model_scale // 2) * 2
         out_h = (in_h * model_scale // 2) * 2
         return max(2, out_w), max(2, out_h)
 
-    target_short = 720 if "720" in str(res_choice) else 1080
+    target_short = (t_short // 2) * 2
     is_landscape = in_w >= in_h
     short_side = max(1, in_h if is_landscape else in_w)
     long_side = max(1, in_w if is_landscape else in_h)
     aspect = long_side / short_side
+    std_long = _STD_TIER_LONG.get(target_short, int(round((target_short * 16.0 / 9.0) / 2.0) * 2))
 
     if abs(aspect - (16.0 / 9.0)) < 0.025:
-        target_long = 1280 if target_short == 720 else 1920
+        target_long = std_long
+    elif aspect > (16.0 / 9.0) + 0.025:
+        # Ultrawide cinema (e.g. 21:9 / 2.39:1): bound long side to standard UHD/QHD/FHD width
+        # (e.g. 3840x1606 for 4K) so output never exceeds h264_nvenc's 4096px hardware ceiling.
+        target_long = std_long
+        target_short = max(2, int(round((target_long / aspect) / 2.0) * 2))
     else:
-        target_long = int(round((target_short * aspect) / 2.0) * 2)
+        target_long = max(2, int(round((target_short * aspect) / 2.0) * 2))
 
-    target_short = (target_short // 2) * 2
     return (target_long, target_short) if is_landscape else (target_short, target_long)
 
 
@@ -1150,7 +1173,12 @@ def resize_sr_gpu(sr: Any, out_h: int, out_w: int) -> Any:
         mode = "bilinear" if (out_h < sr_h or out_w < sr_w) else "bicubic"
         return F.interpolate(sr.float(), size=(out_h, out_w), mode=mode, align_corners=False).to(sr.dtype)
     if out_h < sr_h and (sr_h / out_h) > 1.25:
-        return F.interpolate(sr.float(), size=(out_h, out_w), mode="bicubic", align_corners=False, antialias=True).to(sr.dtype)
+        try:
+            return F.interpolate(sr.float(), size=(out_h, out_w), mode="bicubic", align_corners=False, antialias=True).to(sr.dtype)
+        except RuntimeError:
+            if dev_type == "cuda":
+                return F.interpolate(sr, size=(out_h, out_w), mode="bicubic", align_corners=False)
+            raise
     if dev_type == "cuda":
         # Match Video2X.ipynb native FP16 CUDA bicubic interpolation (avoids 3x full-HD FP32 copies per batch).
         return F.interpolate(sr, size=(out_h, out_w), mode="bicubic", align_corners=False)
@@ -1244,6 +1272,13 @@ def _calibrate_tpu_batch(
         base_overhead = 1.4 * (1024 ** 3)
         per_frame = float(in_px * 46 + sr_px * 16)
         max_cap = 16
+
+    if sr_px >= 5120 * 2880:
+        max_cap = min(max_cap, 1 if selected_model in HEAVY_MODELS else 2)
+    elif sr_px >= 3840 * 2160:
+        max_cap = min(max_cap, 2 if selected_model in HEAVY_MODELS else 4)
+    elif sr_px >= 2560 * 1440:
+        max_cap = min(max_cap, 4 if selected_model in HEAVY_MODELS else 8)
 
     clamped_pct = max(35, min(85, int(target_pct)))
     budget = float(hbm_total_bytes) * (clamped_pct / 100.0)
@@ -1682,6 +1717,9 @@ def process_single_video(
                     _y3 = rgb_to_yuv420p_bt709(resize_sr_gpu(model(_prepare_gpu_batch(_d3)), out_h, out_w))
                     peak_3 = torch.cuda.max_memory_allocated(device)
                     del _d3, _y3
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                return 1
             finally:
                 torch.backends.cudnn.benchmark = prev_bench
 
@@ -1791,7 +1829,7 @@ def process_single_video(
     batch_in_bytes = eff_batch * frame_in_bytes
     batch_out_bytes = eff_batch * frame_out_yuv_bytes
 
-    num_out_slots = 4
+    num_out_slots = 3 if min(out_w, out_h) >= 1800 else 4
     out_pool_bytes = num_out_slots * batch_out_bytes
     rem_in_budget = max(batch_in_bytes * 4, ram_pool_budget - out_pool_bytes)
     total_est_batches = ((est_frames + eff_batch - 1) // eff_batch) if (est_frames and est_frames > 0) else 64
@@ -1840,20 +1878,54 @@ def process_single_video(
 
     use_nvdec = has_cuda and nvdec_available(working_input)
     use_scale_cuda = bool(use_nvdec and did_pre_downscale and nvdec_scale_cuda_available(working_input, in_w, in_h))
-    want_hevc = "hevc_nvenc" in encoder_choice
-    nvenc_codec = "hevc_nvenc" if (has_cuda and want_hevc and nvenc_available("hevc_nvenc")) else "h264_nvenc"
-    use_nvenc = has_cuda and (not encoder_choice.startswith("libx264")) and nvenc_available(nvenc_codec)
+    exceeds_h264_nvenc_max = max(out_w, out_h) > 4096
+    want_hevc = ("hevc_nvenc" in encoder_choice) or exceeds_h264_nvenc_max
+    if has_cuda and want_hevc and nvenc_available("hevc_nvenc"):
+        nvenc_codec = "hevc_nvenc"
+    else:
+        nvenc_codec = "h264_nvenc"
+    use_nvenc = (
+        has_cuda
+        and (not encoder_choice.startswith("libx264"))
+        and (nvenc_codec == "hevc_nvenc" or not exceeds_h264_nvenc_max)
+        and nvenc_available(nvenc_codec)
+    )
 
-    is_1080_plus = min(out_w, out_h) >= 1000
+    short_out = min(out_w, out_h)
+    long_out = max(out_w, out_h)
+    is_4k_tier = short_out >= 1800 or long_out >= 3200
+    is_2k_tier = (not is_4k_tier) and (short_out >= 1300 or long_out >= 2300)
+    is_1080_plus = (not is_4k_tier and not is_2k_tier) and (short_out >= 1000 or long_out >= 1800)
     if size_profile.startswith("Tiết kiệm"):
         nv_cq, cpu_crf = (28, 24)
-        max_br, buf_br = ("5M", "10M") if is_1080_plus else ("2.8M", "5.6M")
+        if is_4k_tier:
+            max_br, buf_br = ("16M", "32M")
+        elif is_2k_tier:
+            max_br, buf_br = ("9M", "18M")
+        elif is_1080_plus:
+            max_br, buf_br = ("5M", "10M")
+        else:
+            max_br, buf_br = ("2.8M", "5.6M")
     elif size_profile.startswith("Chất lượng lưu trữ"):
-        nv_cq, cpu_crf = (21, 18)
-        max_br, buf_br = ("16M", "32M") if is_1080_plus else ("9M", "18M")
+        nv_cq, cpu_crf = (20, 18) if is_4k_tier else (21, 18)
+        if is_4k_tier:
+            max_br, buf_br = ("55M", "110M")
+        elif is_2k_tier:
+            max_br, buf_br = ("32M", "64M")
+        elif is_1080_plus:
+            max_br, buf_br = ("16M", "32M")
+        else:
+            max_br, buf_br = ("9M", "18M")
     else:
         nv_cq, cpu_crf = (24, 20)
-        max_br, buf_br = ("12M", "24M") if is_1080_plus else ("6M", "12M")
+        if is_4k_tier:
+            max_br, buf_br = ("35M", "70M")
+        elif is_2k_tier:
+            max_br, buf_br = ("20M", "40M")
+        elif is_1080_plus:
+            max_br, buf_br = ("12M", "24M")
+        else:
+            max_br, buf_br = ("6M", "12M")
 
     cpu_cores = os.cpu_count() or 2
     dec_threads = min(8, max(2, cpu_cores // 3)) if (not use_nvdec and cpu_cores >= 12) else 0

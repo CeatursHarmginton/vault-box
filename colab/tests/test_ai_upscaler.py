@@ -1322,6 +1322,67 @@ console.log(JSON.stringify({{ hasUpscaleTag: html.includes("tag-upscale") && htm
         assert json.loads(proc.stdout.strip())["hasUpscaleTag"] is True
 
 
+def test_2k_4k_target_resolution_ultrawide_caps_and_auto_model_scaling():
+    # 1. Options & target_short_pixels for 2K (1440p) and 4K (2160p)
+    assert "1440p (2K)" in ai_upscaler.TARGET_RESOLUTION_OPTIONS
+    assert "2160p (4K)" in ai_upscaler.TARGET_RESOLUTION_OPTIONS
+    assert ai_upscaler.target_short_pixels("1440p (2K)") == 1440
+    assert ai_upscaler.target_short_pixels("2160p (4K)") == 2160
+
+    colab_js = (REPO_ROOT / "frontend" / "static" / "js" / "colab_transfer.js").read_text(encoding="utf-8")
+    assert '"1440p (2K)"' in colab_js
+    assert '"2160p (4K)"' in colab_js
+
+    # 2. compute_target_dims across 16:9, 9:16 portrait, 4:3 classic, and 21:9 ultrawide cinema
+    assert ai_upscaler.compute_target_dims(1280, 720, 2, "1440p (2K)") == (2560, 1440)
+    assert ai_upscaler.compute_target_dims(1920, 1080, 2, "2160p (4K)") == (3840, 2160)
+    assert ai_upscaler.compute_target_dims(720, 1280, 2, "1440p (2K)") == (1440, 2560)
+    assert ai_upscaler.compute_target_dims(1080, 1920, 2, "2160p (4K)") == (2160, 3840)
+    assert ai_upscaler.compute_target_dims(640, 480, 4, "2160p (4K)") == (2880, 2160)
+
+    # Ultrawide 2.40:1 cinema (1920x800) must fit inside standard 2560 / 3840 envelopes (<= 4096 h264_nvenc ceiling!)
+    uw_2k = ai_upscaler.compute_target_dims(1920, 800, 2, "1440p (2K)")
+    uw_4k = ai_upscaler.compute_target_dims(1920, 800, 2, "2160p (4K)")
+    assert uw_2k == (2560, 1066)
+    assert uw_4k == (3840, 1600)
+    assert max(uw_4k) <= 4096
+
+    # 3. Skip thresholds for 2K & 4K (including ultrawide 3840x1606 4K cinema)
+    assert ai_upscaler.is_already_at_or_above_target(1920, 1080, "1440p (2K)") is False
+    assert ai_upscaler.is_already_at_or_above_target(1920, 1080, "2160p (4K)") is False
+    assert ai_upscaler.is_already_at_or_above_target(2560, 1440, "1440p (2K)") is True
+    assert ai_upscaler.is_already_at_or_above_target(2560, 1440, "2160p (4K)") is False
+    assert ai_upscaler.is_already_at_or_above_target(3840, 2160, "2160p (4K)") is True
+    assert ai_upscaler.is_already_at_or_above_target(3840, 1606, "2160p (4K)") is True
+    assert ai_upscaler.is_already_at_or_above_target(1920, 800, "2160p (4K)") is False
+
+    # 4. Auto model selection for 2K & 4K
+    m_1080_to_4k, _, _ = ai_upscaler.choose_auto_model(1920, 1080, "2160p (4K)", 1800, 0.10, "Tesla T4", 0.4)
+    assert m_1080_to_4k == "2xLiveActionV1_SPAN"
+
+    m_720_to_2k, _, _ = ai_upscaler.choose_auto_model(1280, 720, "1440p (2K)", 1800, 0.10, "Tesla T4", 0.4)
+    assert m_720_to_2k == "2xLiveActionV1_SPAN"
+
+    # 720p -> 4K (3.0x): picks compact 4x on T4 to avoid 5K heavy-model VRAM pressure, and 4xNomos8kSC on A100
+    m_720_to_4k_t4, _, _ = ai_upscaler.choose_auto_model(1280, 720, "2160p (4K)", 600, 0.10, "Tesla T4", 0.4)
+    m_720_to_4k_a100, _, _ = ai_upscaler.choose_auto_model(1280, 720, "2160p (4K)", 600, 0.10, "NVIDIA A100", 0.4)
+    assert m_720_to_4k_t4 == "realesr-general-x4v3"
+    assert m_720_to_4k_a100 == "4xNomos8kSC"
+
+    # 5. Proportional Fake-2K and Fake-4K pre-downscale
+    assert ai_upscaler.resolve_pre_downscale_dims(2560, 1440, "auto", lambda: (0.65, 0.52, 10.0))[:3] == (1280, 720, True)
+    assert ai_upscaler.resolve_pre_downscale_dims(3840, 2160, "auto", lambda: (0.65, 0.52, 10.0))[:3] == (1920, 1080, True)
+    assert ai_upscaler.resolve_pre_downscale_dims(3840, 2160, "auto", lambda: (0.48, 0.41, 10.0))[:3] == (1280, 720, True)
+
+    # 6. TPU batch calibration caps safely at 4K output sizes
+    hbm_16gb = 16 * (1024 ** 3)
+    b_tpu_4k_span = ai_upscaler._calibrate_tpu_batch(1920, 1080, 2, "2xLiveActionV1_SPAN", 80, 0, hbm_16gb)
+    b_tpu_5k_compact = ai_upscaler._calibrate_tpu_batch(1280, 720, 4, "realesr-general-x4v3", 80, 0, hbm_16gb)
+    assert 1 <= b_tpu_4k_span <= 4
+    assert 1 <= b_tpu_5k_compact <= 2
+
+
+
 
 
 
