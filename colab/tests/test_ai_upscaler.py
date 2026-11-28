@@ -626,6 +626,7 @@ def test_frontend_upscale_options_and_candidate_rules_via_node():
         "upscaleSettingsGroup",
         "optUpscaleModelPreset",
         "optUpscaleTargetRes",
+        "optUpscalePreDownscale",
         "optUpscaleResourcePct",
         "optUpscaleSizeProfile",
         "optUpscaleEncoder",
@@ -1212,6 +1213,114 @@ def test_h2d_pinned_ring_buffer_sync_and_vfr_audio_video_sync_guards(monkeypatch
     assert cuda_h2d_slice.index("in_ev.record(compute_stream)") < cuda_h2d_slice.index("in_free_q.put((t_buf, in_ev))")
     assert "start_time=0" in src
     assert "aresample=async=1:first_pts=0" in src
+
+
+def test_fake_hd_optical_detection_pre_downscale_modes_and_model_key_normalization(tmp_path):
+    import numpy as np
+    from backend.app.colab.client import ColabJob, ColabManager
+
+    # 1. Every UI model preset option maps cleanly to "auto" or an existing MODEL_ZOO key
+    colab_js = (REPO_ROOT / "frontend" / "static" / "js" / "colab_transfer.js").read_text(encoding="utf-8")
+    assert "AI_UPSCALE_PRE_DOWNSCALE_OPTIONS" in colab_js
+    assert "pre_downscale_mode: upPreDownscale" in colab_js
+
+    for ui_label in (
+        "auto (Tự động chọn tối ưu)",
+        "2xLiveActionV1_SPAN (Nhanh - Phim người đóng, tự khử nhiễu)",
+        "2xNomosUni_compact_otf_medium (Siêu tốc - Cứu video dài)",
+        "2xNomosUni_span_multijpg_ldl (Chuyên trị video nén nát/mờ)",
+        "2xNomosUni_esrgan_multijpg (ESRGAN 2x sắc nét cao - Trị video mờ/nén)",
+        "4xNomos8kSC (Siêu nhẹ 4x - Video rất thấp 240p/360p)",
+        "realesr-general-x4v3 (Đa dụng 4x + Chỉnh khử nhiễu)",
+        "RealESRGAN_x2plus (Chuẩn 2x truyền thống - Rất nặng)",
+        "RealESRGAN_x4plus (Chuẩn 4x truyền thống - Rất nặng)",
+    ):
+        norm = ai_upscaler.normalize_model_preset_key(ui_label)
+        assert norm == "auto" or norm in ai_upscaler.MODEL_ZOO, f"Unmapped UI model preset: {ui_label} -> {norm}"
+
+    # 2. Optical sharpness detector distinguishes True 720p, Solid Blank 720p, and Fake 720p / Fake 1080p
+    rng = np.random.default_rng(42)
+    # Crisp 720p frame with genuine 1-pixel edges & high-frequency texture
+    sharp_720 = rng.integers(20, 235, size=(720, 1280), dtype=np.uint8)
+    hf_sharp, dr_sharp, gm_sharp = ai_upscaler.measure_frame_sharpness_metrics(sharp_720)
+    assert gm_sharp >= 10.0 and dr_sharp >= 0.62 and hf_sharp >= 0.85
+
+    ew_s, eh_s, did_s, _ = ai_upscaler.resolve_pre_downscale_dims(
+        1280, 720, "auto (Tự phát hiện HD giả / video mờ)", lambda: (hf_sharp, dr_sharp, gm_sharp)
+    )
+    assert (ew_s, eh_s, did_s) == (1280, 720, False)
+
+    # Solid flat 720p frame -> g_mean == 0 -> NEVER treated as Fake-HD
+    flat_720 = np.full((720, 1280), 64, dtype=np.uint8)
+    hf_flat, dr_flat, gm_flat = ai_upscaler.measure_frame_sharpness_metrics(flat_720)
+    assert gm_flat < 1.5
+    _, _, did_flat, _ = ai_upscaler.resolve_pre_downscale_dims(
+        1280, 720, "auto (Tự phát hiện HD giả / video mờ)", lambda: (hf_flat, dr_flat, gm_flat)
+    )
+    assert did_flat is False
+
+    # Fake 720p created by stretching a 360p image 2x with bilinear interpolation
+    base_360 = Image.fromarray(rng.integers(20, 235, size=(180, 320), dtype=np.uint8)).resize((640, 360), Image.BICUBIC)
+    fake_720 = np.asarray(base_360.resize((1280, 720), Image.BILINEAR), dtype=np.uint8)
+    hf_f720, dr_f720, gm_f720 = ai_upscaler.measure_frame_sharpness_metrics(fake_720)
+    assert gm_f720 >= 2.0 and dr_f720 < 0.585
+
+    ew_f720, eh_f720, did_f720, reason_f720 = ai_upscaler.resolve_pre_downscale_dims(
+        1280, 720, "auto (Tự phát hiện HD giả / video mờ)", lambda: (hf_f720, dr_f720, gm_f720)
+    )
+    assert (ew_f720, eh_f720, did_f720) == (640, 360, True)
+    assert "HD giả" in reason_f720
+
+    # Fake 1080p created by stretching 360p -> 1080p -> pre-downscales to 640x360
+    fake_1080_from_360 = np.asarray(base_360.resize((1920, 1080), Image.BICUBIC), dtype=np.uint8)
+    m_1080 = ai_upscaler.measure_frame_sharpness_metrics(fake_1080_from_360)
+    ew_1080, eh_1080, did_1080, _ = ai_upscaler.resolve_pre_downscale_dims(
+        1920, 1080, "auto (Tự phát hiện HD giả / video mờ)", lambda: m_1080
+    )
+    assert (ew_1080, eh_1080, did_1080) == (640, 360, True)
+
+    # 3. Manual modes ("360p", "480p", "0.5x", "off") & small-input guard
+    assert ai_upscaler.resolve_pre_downscale_dims(1280, 720, "off (Tắt)", lambda: (0.4, 0.3, 15.0))[:3] == (1280, 720, False)
+    assert ai_upscaler.resolve_pre_downscale_dims(1920, 1080, "360p (Ép về 360p)")[:3] == (640, 360, True)
+    assert ai_upscaler.resolve_pre_downscale_dims(1920, 1080, "480p (Ép về 480p)")[:3] == (854, 480, True)
+    assert ai_upscaler.resolve_pre_downscale_dims(1920, 1080, "0.5x (Thu nhỏ 50%)")[:3] == (960, 540, True)
+    # Never upscale a tiny 480x270 clip during pre-downscale
+    assert ai_upscaler.resolve_pre_downscale_dims(480, 270, "360p (Ép về 360p)")[:3] == (480, 270, False)
+
+    # 4. Auto-model restoration selection: picks LDL/4x restoration models instead of gentle 2xLiveActionV1_SPAN
+    mod_720_restore, _, _ = ai_upscaler.choose_auto_model(
+        640, 360, "720p", 3000, 0.10, "Tesla T4", 0.4, is_restoration=True
+    )
+    assert mod_720_restore == "2xNomosUni_span_multijpg_ldl"
+
+    mod_1080_restore, dn_1080_restore, _ = ai_upscaler.choose_auto_model(
+        640, 360, "1080p", 3000, 0.10, "Tesla T4", 0.4, is_restoration=True
+    )
+    assert mod_1080_restore == "realesr-general-x4v3"
+    assert dn_1080_restore >= 0.55
+
+    # 5. Live options alias synchronization (`pre_downscale_mode` <-> `preDownscaleMode`) in JobState & ColabManager
+    parsed_opts = ai_upscaler.parse_upscale_options({"preDownscaleMode": "360p (Ép về 360p)"})
+    assert parsed_opts["pre_downscale_mode"].startswith("360p")
+
+    js_state = JobState("job-pre-ds", {"options": {"upscale": True}})
+    js_state.update_options({"preDownscaleMode": "480p (Ép về 480p)"})
+    assert js_state.payload["options"]["pre_downscale_mode"] == "480p (Ép về 480p)"
+
+    # 6. Verify [RESTORE] log tag formatting in colab_transfer.js
+    node = shutil.which("node")
+    if node:
+        log_start = colab_js.index("function formatColabLogLineHtml(line)")
+        log_end = colab_js.index("function renderColabJobLogs(")
+        node_script = f"""
+const escapeHtml = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+{colab_js[log_start:log_end]}
+const html = formatColabLogLineHtml("[RESTORE] video.mp4 | Phát hiện HD giả (1280x720 -> 640x360)");
+console.log(JSON.stringify({{ hasUpscaleTag: html.includes("tag-upscale") && html.includes("RESTORE") }}));
+"""
+        proc = subprocess.run([node, "--input-type=module"], input=node_script, text=True, capture_output=True, check=True)
+        assert json.loads(proc.stdout.strip())["hasUpscaleTag"] is True
+
 
 
 

@@ -365,6 +365,7 @@ class JobState:
             ("optimize_mode", "optimizeMode"),
             ("model_preset", "modelPreset"),
             ("target_resolution", "targetResolution"),
+            ("pre_downscale_mode", "preDownscaleMode"),
             ("resource_target_pct", "resourceTargetPct"),
             ("size_profile", "sizeProfile"),
             ("encoder_choice", "encoderChoice"),

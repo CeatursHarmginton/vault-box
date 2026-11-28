@@ -40,12 +40,21 @@ MODEL_PRESET_OPTIONS: tuple[str, ...] = (
     "2xNomosUni_esrgan_multijpg",
     "4xNomos8kSC",
     "RealESRGAN_x2plus",
+    "RealESRGAN_x4plus",
 )
 
 TARGET_RESOLUTION_OPTIONS: tuple[str, ...] = (
     "720p",
     "1080p",
     "Native Model Scale (2x/4x)",
+)
+
+PRE_DOWNSCALE_OPTIONS: tuple[str, ...] = (
+    "auto (Tự phát hiện HD giả / video mờ)",
+    "off (Tắt - Giữ nguyên kích thước gốc)",
+    "360p (Ép về 360p rồi AI Upscale - Trị video rất mờ)",
+    "480p (Ép về 480p rồi AI Upscale - Trị video hơi mờ)",
+    "0.5x (Thu nhỏ 50% trước khi AI Upscale)",
 )
 
 SIZE_PROFILE_OPTIONS: tuple[str, ...] = (
@@ -66,7 +75,7 @@ TORCH_COMPILE_OPTIONS: tuple[str, ...] = (
     "off (Tắt)",
 )
 
-HEAVY_MODELS = {"2xNomosUni_esrgan_multijpg", "4xNomos8kSC", "RealESRGAN_x2plus"}
+HEAVY_MODELS = {"2xNomosUni_esrgan_multijpg", "4xNomos8kSC", "RealESRGAN_x2plus", "RealESRGAN_x4plus"}
 
 MODEL_ZOO: dict[str, dict[str, str]] = {
     "2xLiveActionV1_SPAN": {
@@ -99,7 +108,20 @@ MODEL_ZOO: dict[str, dict[str, str]] = {
         "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
         "filename": "RealESRGAN_x2plus.pth",
     },
+    "RealESRGAN_x4plus": {
+        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+        "filename": "RealESRGAN_x4plus.pth",
+    },
 }
+
+
+def normalize_model_preset_key(preset_name: str) -> str:
+    """Strip UI description suffixes like 'realesr-general-x4v3 (Đa dụng...)' into canonical MODEL_ZOO keys."""
+    clean = str(preset_name or "").strip()
+    if not clean or clean.lower().startswith("auto"):
+        return "auto"
+    head = clean.split("(", 1)[0].strip()
+    return head if head in MODEL_ZOO else clean
 
 DEFAULT_WEIGHTS_DIR = BASE_DIR / "upscale_weights"
 _PIP_INSTALL_LOCK = threading.Lock()
@@ -485,6 +507,213 @@ def _get_tpu_hbm_used_gb(tpu_rt: dict[str, Any] | None) -> float:
     return 0.0
 
 
+def compute_scaled_even_dims(in_w: int, in_h: int, target_short: int) -> tuple[int, int]:
+    """Scale `(in_w, in_h)` preserving aspect ratio so the short side equals `target_short` (even >= 2)."""
+    is_landscape = in_w >= in_h
+    short_side = max(1, in_h if is_landscape else in_w)
+    long_side = max(1, in_w if is_landscape else in_h)
+    t_short = max(2, (int(target_short) // 2) * 2)
+    aspect = long_side / short_side
+    if abs(aspect - (16.0 / 9.0)) < 0.025 and t_short in (360, 480, 540, 720, 1080):
+        std_map = {360: 640, 480: 854, 540: 960, 720: 1280, 1080: 1920}
+        t_long = std_map[t_short]
+    else:
+        t_long = max(2, int(round((t_short * aspect) / 2.0) * 2))
+    return (t_long, t_short) if is_landscape else (t_short, t_long)
+
+
+def measure_frame_sharpness_metrics(gray_u8: Any) -> tuple[float, float, float]:
+    """
+    Measure optical Nyquist sharpness on a 2D uint8 luminance array `(H, W)`.
+    Returns `(hf_ratio, descale_ratio, g_mean)` evaluated over the top 15% sharpest active 16x16 blocks:
+    - `hf_ratio`: 2nd-order Laplacian / 1st-order gradient (drops when 360p/480p edges are stretched across 2-4px).
+    - `descale_ratio`: 2x2 self-downscale -> bilinear-reconstruct error / 1st-order gradient (immune to post-unsharp halos;
+      genuine 720p/1080p >= 0.62, whereas pre-upscaled 360p/480p <= 0.58).
+    - `g_mean`: mean active edge strength (< 1.5 indicates blank/solid-color frame -> never treated as Fake-HD).
+    """
+    import numpy as np
+
+    arr = np.asarray(gray_u8)
+    if arr.ndim != 2:
+        return 1.0, 1.0, 0.0
+    h, w = arr.shape
+    bh, bw = (h // 32) * 32, (w // 32) * 32
+    if bh < 64 or bw < 64:
+        return 1.0, 1.0, 0.0
+
+    yc = arr[:bh, :bw].astype(np.float32)
+    gx = np.abs(yc[1:-1, 2:] - yc[1:-1, 1:-1])
+    gy = np.abs(yc[2:, 1:-1] - yc[1:-1, 1:-1])
+    g1 = 0.5 * (gx + gy)
+
+    lx = np.abs(yc[1:-1, :-2] - 2.0 * yc[1:-1, 1:-1] + yc[1:-1, 2:])
+    ly = np.abs(yc[:-2, 1:-1] - 2.0 * yc[1:-1, 1:-1] + yc[2:, 1:-1])
+    lap = 0.5 * (lx + ly)
+
+    yh = 0.25 * (yc[0::2, 0::2] + yc[0::2, 1::2] + yc[1::2, 0::2] + yc[1::2, 1::2])
+    y_up = np.repeat(np.repeat(yh, 2, axis=0), 2, axis=1)
+    y_pad = np.pad(y_up, 1, mode="edge")
+    y_sm_x = 0.25 * y_pad[:, :-2] + 0.5 * y_pad[:, 1:-1] + 0.25 * y_pad[:, 2:]
+    y_rec = 0.25 * y_sm_x[:-2, :] + 0.5 * y_sm_x[1:-1, :] + 0.25 * y_sm_x[2:, :]
+    rec_err = np.abs(yc - y_rec)[1:-1, 1:-1]
+
+    th, tw = (lap.shape[0] // 16) * 16, (lap.shape[1] // 16) * 16
+    if th < 16 or tw < 16:
+        return 1.0, 1.0, 0.0
+    g_tiles = g1[:th, :tw].reshape(th // 16, 16, tw // 16, 16).mean(axis=(1, 3)).ravel()
+    l_tiles = lap[:th, :tw].reshape(th // 16, 16, tw // 16, 16).mean(axis=(1, 3)).ravel()
+    e_tiles = rec_err[:th, :tw].reshape(th // 16, 16, tw // 16, 16).mean(axis=(1, 3)).ravel()
+
+    valid = g_tiles > 2.0
+    if int(valid.sum()) < 4:
+        return 1.0, 1.0, float(g_tiles.max()) if g_tiles.size else 0.0
+
+    gv, lv, ev = g_tiles[valid], l_tiles[valid], e_tiles[valid]
+    top_k = max(1, int(len(gv) * 0.15))
+    idx = np.argsort(gv)[-top_k:]
+    g_mean = float(gv[idx].mean())
+    if g_mean < 1.5:
+        return 1.0, 1.0, g_mean
+    denom = g_mean + 1e-6
+    return float(lv[idx].mean()) / denom, float(ev[idx].mean()) / denom, g_mean
+
+
+def probe_video_sharpness_metrics(
+    video_path: Path,
+    in_w: int,
+    in_h: int,
+    duration: float,
+    start_time: str = "00:00:00",
+    preview_seconds: float = 0.0,
+) -> tuple[float, float, float]:
+    """Sample up to 4 evenly spaced keyframes (~0.15s total) and return median `(hf_ratio, descale_ratio, max_g_mean)`."""
+    import numpy as np
+
+    if not shutil.which("ffmpeg") or in_w < 64 or in_h < 64:
+        return 1.0, 1.0, 0.0
+
+    start_sec = 0.0
+    st_clean = str(start_time or "").strip()
+    if st_clean and st_clean != "00:00:00":
+        try:
+            parts = [float(p) for p in st_clean.split(":")]
+            for p in parts:
+                start_sec = start_sec * 60.0 + p
+        except Exception:
+            start_sec = 0.0
+
+    eff_span = max(0.0, duration - start_sec) if duration > 0 else 0.0
+    if preview_seconds > 0 and eff_span > 0:
+        eff_span = min(eff_span, float(preview_seconds))
+
+    if eff_span >= 2.0:
+        sample_ts = [start_sec + eff_span * frac for frac in (0.20, 0.45, 0.65, 0.85)]
+    else:
+        sample_ts = [start_sec]
+
+    expected_bytes = in_w * in_h
+    hfs: list[float] = []
+    drs: list[float] = []
+    gms: list[float] = []
+    try_cuda_probe = shutil.which("nvidia-smi") is not None
+    if try_cuda_probe:
+        ensure_nvidia_lib_paths()
+
+    def _grab_one(ts: float) -> tuple[float, float, float] | None:
+        seek_args = ["-ss", f"{ts:.3f}"] if ts > 0.05 else []
+        tail_args = ["-i", str(video_path), "-frames:v", "1", "-pix_fmt", "gray", "-f", "rawvideo", "-"]
+        cmds = []
+        if try_cuda_probe:
+            cmds.append(["ffmpeg", "-v", "error", "-hwaccel", "cuda", *seek_args, *tail_args])
+        cmds.append(["ffmpeg", "-v", "error", "-threads", "2", *seek_args, *tail_args])
+        for cmd in cmds:
+            try:
+                res = subprocess.run(cmd, capture_output=True, timeout=8, env=os.environ.copy())
+                if res.returncode == 0 and len(res.stdout) == expected_bytes:
+                    frame_u8 = np.frombuffer(res.stdout, dtype=np.uint8).reshape(in_h, in_w)
+                    return measure_frame_sharpness_metrics(frame_u8)
+            except Exception:
+                continue
+        return None
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=max(1, len(sample_ts))) as pool:
+        probe_results = list(pool.map(_grab_one, sample_ts))
+
+    for item in probe_results:
+        if item is None:
+            continue
+        hf, dr, gm = item
+        gms.append(gm)
+        if gm >= 1.5:
+            hfs.append(hf)
+            drs.append(dr)
+
+    if not hfs:
+        return 1.0, 1.0, (max(gms) if gms else 0.0)
+    return float(np.median(hfs)), float(np.median(drs)), float(max(gms))
+
+
+def resolve_pre_downscale_dims(
+    in_w: int,
+    in_h: int,
+    pre_downscale_mode: str,
+    metrics_probe_fn: Callable[[], tuple[float, float, float]] | None = None,
+) -> tuple[int, int, bool, str]:
+    """
+    Determine whether input `(in_w, in_h)` should be pre-downscaled to its true optical resolution
+    before AI Super-Resolution so stretched/blurry Fake-HD edges condense back to crisp 1px boundaries.
+    Returns `(eff_in_w, eff_in_h, did_pre_downscale, reason_text)`.
+    """
+    mode = str(pre_downscale_mode or "auto").strip().lower()
+    in_short = min(in_w, in_h)
+    if in_w <= 0 or in_h <= 0 or mode.startswith("off") or mode.startswith("none") or mode.startswith("tắt"):
+        return in_w, in_h, False, ""
+
+    if mode.startswith("360"):
+        if in_short > 368:
+            ew, eh = compute_scaled_even_dims(in_w, in_h, 360)
+            return ew, eh, True, f"Ép đầu vào {in_w}x{in_h} -> {ew}x{eh} (360p) để khử mờ / HD giả trước khi AI tái tạo"
+        return in_w, in_h, False, ""
+
+    if mode.startswith("480"):
+        if in_short > 488:
+            ew, eh = compute_scaled_even_dims(in_w, in_h, 480)
+            return ew, eh, True, f"Ép đầu vào {in_w}x{in_h} -> {ew}x{eh} (480p) để khử mờ / HD giả trước khi AI tái tạo"
+        return in_w, in_h, False, ""
+
+    if mode.startswith("0.5") or "50%" in mode:
+        if in_short >= 360:
+            ew = max(2, (in_w // 4) * 2)
+            eh = max(2, (in_h // 4) * 2)
+            return ew, eh, True, f"Thu nhỏ 50% ({in_w}x{in_h} -> {ew}x{eh}) để co gọn viền mờ trước khi AI tái tạo"
+        return in_w, in_h, False, ""
+
+    # Auto mode: inspect optical sharpness only when container short side >= 540p (HD/FHD candidates)
+    if in_short >= 540 and metrics_probe_fn is not None:
+        hf_ratio, descale_ratio, g_mean = metrics_probe_fn()
+        is_fake_hd = g_mean >= 1.5 and (
+            descale_ratio < 0.585 or (hf_ratio < 0.80 and descale_ratio < 0.61)
+        )
+        if is_fake_hd:
+            if in_short >= 900:
+                est_short = 360 if (descale_ratio < 0.48 or hf_ratio < 0.56) else 480
+            else:
+                est_short = 360
+            ew, eh = compute_scaled_even_dims(in_w, in_h, est_short)
+            if min(ew, eh) < in_short:
+                return (
+                    ew,
+                    eh,
+                    True,
+                    f"Phát hiện HD giả / nguồn mờ ({in_w}x{in_h} chỉ đạt độ nét thực ~{est_short}p, "
+                    f"descale={descale_ratio:.2f}, HF={hf_ratio:.2f}) -> Tự thu về {ew}x{eh} rồi AI tái tạo",
+                )
+
+    return in_w, in_h, False, ""
+
+
 def target_short_pixels(res_choice: str) -> int | None:
     """Return short-side target pixel threshold for 720p/1080p, or None for Native Model Scale."""
     clean = str(res_choice or "1080p").strip()
@@ -654,6 +883,7 @@ def load_upscale_model(
     import torch
     from spandrel import ImageModelDescriptor, ModelLoader
 
+    preset_name = normalize_model_preset_key(preset_name)
     if preset_name not in MODEL_ZOO:
         preset_name = "2xLiveActionV1_SPAN"
     cfg = MODEL_ZOO[preset_name]
@@ -806,6 +1036,8 @@ def choose_auto_model(
     bpp: float,
     gpu_name: str,
     default_dn: float,
+    *,
+    is_restoration: bool = False,
 ) -> tuple[str, float, str]:
     in_short = min(in_w, in_h)
     if res_choice == "720p":
@@ -827,11 +1059,11 @@ def choose_auto_model(
                 default_dn,
                 f"Cần phóng lớn {scale_needed:.1f}x ({in_short}p → {res_choice}) & thời lượng vừa phải ({frames} frames) → ưu tiên mạng lớn 4x chất lượng cao",
             )
-        auto_dn = 0.55 if (0 < bpp < 0.075) else 0.35
+        auto_dn = max(default_dn, 0.55) if is_restoration else (0.55 if (0 < bpp < 0.075) else 0.35)
         return (
             "realesr-general-x4v3",
             auto_dn,
-            f"Cần phóng lớn {scale_needed:.1f}x trên video dài ({frames} frames) → dùng Compact 4x tốc độ cao (denoise={auto_dn})",
+            f"Cần phóng lớn {scale_needed:.1f}x trên video dài ({frames} frames) → dùng Compact 4x tốc độ cao (denoise={auto_dn:.2f})",
         )
 
     if frames > 90000 and not fast_gpu:
@@ -839,6 +1071,13 @@ def choose_auto_model(
             "2xNomosUni_compact_otf_medium",
             default_dn,
             f"Video rất dài ({frames} frames) phóng {scale_needed:.1f}x → dùng Compact 2x tốc độ cao để kịp thời gian Colab",
+        )
+
+    if is_restoration:
+        return (
+            "2xNomosUni_span_multijpg_ldl",
+            default_dn,
+            f"Khôi phục nguồn mờ / HD giả (thu về {in_short}p → {res_choice}) → dùng SPAN 2x LDL chuyên khử bệt & tái tạo chi tiết sắc nét",
         )
 
     if 0 < bpp < 0.075:
@@ -940,6 +1179,26 @@ def nvdec_available(video_path: Path) -> bool:
     ]
     res = subprocess.run(test_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=os.environ.copy())
     return res.returncode == 0
+
+
+def nvdec_scale_cuda_available(video_path: Path, target_w: int, target_h: int) -> bool:
+    """Verify full GPU VRAM decode + `scale_cuda` resize on 1 frame of `video_path` (catches rotation/10-bit/missing filter)."""
+    ensure_nvidia_lib_paths()
+    expected = target_w * target_h * 3
+    test_cmd = [
+        "ffmpeg", "-v", "error",
+        "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+        "-i", str(video_path),
+        "-vf", f"scale_cuda={target_w}:{target_h}:format=nv12,hwdownload,format=nv12",
+        "-frames:v", "1",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "pipe:1",
+    ]
+    try:
+        res = subprocess.run(test_cmd, capture_output=True, timeout=8, env=os.environ.copy())
+        return res.returncode == 0 and len(res.stdout) == expected
+    except Exception:
+        return False
 
 
 def nvenc_available(codec_name: str = "h264_nvenc") -> bool:
@@ -1119,6 +1378,12 @@ def parse_upscale_options(options: dict[str, Any] | None) -> dict[str, Any]:
         or opts.get("targetResolution")
         or "1080p"
     ).strip()
+    pre_downscale_mode = str(
+        opts.get("pre_downscale_mode")
+        or opts.get("upscale_pre_downscale_mode")
+        or opts.get("preDownscaleMode")
+        or PRE_DOWNSCALE_OPTIONS[0]
+    ).strip()
     size_profile = str(
         opts.get("size_profile")
         or opts.get("upscale_size_profile")
@@ -1142,6 +1407,7 @@ def parse_upscale_options(options: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "model_preset": model_preset,
         "target_resolution": target_resolution,
+        "pre_downscale_mode": pre_downscale_mode,
         "resource_target_pct": _int("resource_target_pct", "resourceTargetPct", 80, 35, 85),
         "size_profile": size_profile,
         "encoder_choice": encoder_choice,
@@ -1197,13 +1463,34 @@ def process_single_video(
         return None, "Skipped (Already optimized)", "-"
 
     in_w, in_h, fps_str, fps_val, total_dur, exact_nb_frames, bpp_val = get_video_metadata(cur_input)
+    orig_in_w, orig_in_h = in_w, in_h
     target_resolution = cfg["target_resolution"]
+    pre_downscale_mode = cfg["pre_downscale_mode"]
 
-    if is_already_at_or_above_target(in_w, in_h, target_resolution):
+    eff_in_w, eff_in_h, did_pre_downscale, restore_reason = resolve_pre_downscale_dims(
+        orig_in_w,
+        orig_in_h,
+        pre_downscale_mode,
+        metrics_probe_fn=lambda: probe_video_sharpness_metrics(
+            cur_input,
+            orig_in_w,
+            orig_in_h,
+            total_dur,
+            cfg["start_time"],
+            cfg["preview_seconds"],
+        ),
+    )
+
+    if not did_pre_downscale and is_already_at_or_above_target(orig_in_w, orig_in_h, target_resolution):
         log_fn(
-            f"[{idx}/{total_count}] SKIP   {cur_input.name} ({in_w}x{in_h}) | Đã đạt target {target_resolution}"
+            f"[{idx}/{total_count}] SKIP   {cur_input.name} ({orig_in_w}x{orig_in_h}) | Đã đạt target {target_resolution}"
         )
-        return None, f"Skipped (Already >= {target_resolution.split()[0]})", f"{in_w}x{in_h}"
+        return None, f"Skipped (Already >= {target_resolution.split()[0]})", f"{orig_in_w}x{orig_in_h}"
+
+    if did_pre_downscale:
+        log_fn(f"[RESTORE] {cur_input.name} | {restore_reason}")
+        in_w, in_h = eff_in_w, eff_in_h
+    disp_in_res = f"{orig_in_w}x{orig_in_h} -> {in_w}x{in_h}" if did_pre_downscale else f"{in_w}x{in_h}"
 
     ensure_upscale_dependencies(log_fn=log_fn)
     import numpy as np  # noqa: F401
@@ -1268,12 +1555,20 @@ def process_single_video(
 
     eff_denoise = denoise_strength
     auto_reason = None
-    if model_preset.lower().startswith("auto"):
+    norm_preset = normalize_model_preset_key(model_preset)
+    if norm_preset == "auto":
         selected_model, eff_denoise, auto_reason = choose_auto_model(
-            in_w, in_h, target_resolution, est_frames or 0, bpp_val, gpu_name_str, denoise_strength
+            in_w,
+            in_h,
+            target_resolution,
+            est_frames or 0,
+            bpp_val,
+            gpu_name_str,
+            denoise_strength,
+            is_restoration=did_pre_downscale,
         )
     else:
-        selected_model = model_preset
+        selected_model = norm_preset
 
     dest_dir.mkdir(parents=True, exist_ok=True)
     out_filename = build_upscaled_video_name(cur_input.name)
@@ -1289,7 +1584,7 @@ def process_single_video(
     if file_entry is not None:
         file_entry.update({
             "status": "active",
-            "inRes": f"{in_w}x{in_h}",
+            "inRes": disp_in_res,
             "model": selected_model,
             "framesTotal": est_frames or 0,
             "framesDone": 0,
@@ -1303,7 +1598,8 @@ def process_single_video(
         accelerator=accel_kind,
         currentFile=cur_input.name,
         outputFile=out_filename,
-        inRes=f"{in_w}x{in_h}",
+        inRes=disp_in_res,
+        preDownscaled=did_pre_downscale,
         targetResolution=target_resolution,
         model=selected_model,
         gpuName=gpu_name_str,
@@ -1543,6 +1839,7 @@ def process_single_video(
             working_input = cur_input
 
     use_nvdec = has_cuda and nvdec_available(working_input)
+    use_scale_cuda = bool(use_nvdec and did_pre_downscale and nvdec_scale_cuda_available(working_input, in_w, in_h))
     want_hevc = "hevc_nvenc" in encoder_choice
     nvenc_codec = "hevc_nvenc" if (has_cuda and want_hevc and nvenc_available("hevc_nvenc")) else "h264_nvenc"
     use_nvenc = has_cuda and (not encoder_choice.startswith("libx264")) and nvenc_available(nvenc_codec)
@@ -1563,7 +1860,11 @@ def process_single_video(
     enc_threads = min(16, max(2, cpu_cores - 4)) if (not use_nvenc and cpu_cores >= 12) else 0
     cpu_preset = "faster" if cpu_cores >= 16 else "veryfast"
 
-    dec_short = "NVDEC" if use_nvdec else (f"CPU({dec_threads}t)" if dec_threads > 0 else "CPU")
+    dec_short = (
+        "NVDEC+scale_cuda"
+        if use_scale_cuda
+        else ("NVDEC" if use_nvdec else (f"CPU({dec_threads}t)" if dec_threads > 0 else "CPU"))
+    )
     enc_short = nvenc_codec if use_nvenc else (f"libx264({enc_threads}t)" if enc_threads > 0 else "libx264")
     if is_tpu:
         prec_str = "BF16+XLA" if use_bf16 else "FP32+XLA"
@@ -1581,7 +1882,7 @@ def process_single_video(
         file_entry.update({
             "status": "active",
             "outputName": out_filename,
-            "inRes": f"{in_w}x{in_h}",
+            "inRes": disp_in_res,
             "outRes": f"{out_w}x{out_h}",
             "model": selected_model,
             "framesTotal": est_frames or 0,
@@ -1596,8 +1897,9 @@ def process_single_video(
         accelerator=accel_kind,
         currentFile=cur_input.name,
         outputFile=out_filename,
-        inRes=f"{in_w}x{in_h}",
+        inRes=disp_in_res,
         outRes=f"{out_w}x{out_h}",
+        preDownscaled=did_pre_downscale,
         targetResolution=target_resolution,
         model=selected_model,
         precision=prec_str,
@@ -1614,7 +1916,7 @@ def process_single_video(
         **({"files": batch_files} if batch_files is not None else {}),
     )
     log_fn(
-        f"[{idx}/{total_count}] START  {cur_input.name} ({in_w}x{in_h} -> {out_w}x{out_h}) | "
+        f"[{idx}/{total_count}] START  {cur_input.name} ({disp_in_res} -> {out_w}x{out_h}) | "
         f"{selected_model} ({prec_str}, B={eff_batch}) | {dec_short} -> {enc_short}"
     )
 
@@ -1625,15 +1927,20 @@ def process_single_video(
         time_args_in.extend(["-t", str(preview_seconds)])
 
     vf_fps_expr = f"fps={fps_str}" if time_args_in else f"fps={fps_str}:start_time=0"
+    if use_scale_cuda:
+        hwaccel_in = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        vf_in_expr = f"scale_cuda={in_w}:{in_h}:format=nv12,hwdownload,format=nv12,{vf_fps_expr}"
+    else:
+        hwaccel_in = ["-hwaccel", "cuda"] if use_nvdec else ["-threads", str(dec_threads)]
+        vf_in_expr = f"{vf_fps_expr},scale={in_w}:{in_h}:flags=area" if did_pre_downscale else vf_fps_expr
     audio_sync_opts = [] if time_args_in else ["-af", "aresample=async=1:first_pts=0"]
 
-    hwaccel_in = ["-hwaccel", "cuda"] if use_nvdec else ["-threads", str(dec_threads)]
     ffmpeg_in_cmd = [
         "ffmpeg", "-v", "error",
         *hwaccel_in,
         *time_args_in,
         "-i", str(working_input),
-        "-vf", vf_fps_expr,
+        "-vf", vf_in_expr,
         "-f", "rawvideo", "-pix_fmt", "rgb24",
         "pipe:1",
     ]
@@ -2105,12 +2412,35 @@ def process_single_image(
         has_alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
         work_img = img.convert("RGBA") if has_alpha else img.convert("RGB")
 
+    orig_in_w, orig_in_h = in_w, in_h
     target_resolution = cfg["target_resolution"]
-    if is_already_at_or_above_target(in_w, in_h, target_resolution):
+    pre_downscale_mode = cfg["pre_downscale_mode"]
+
+    def _probe_img_metrics() -> tuple[float, float, float]:
+        import numpy as np
+
+        gray_arr = np.asarray(work_img.convert("L"), dtype=np.uint8)
+        return measure_frame_sharpness_metrics(gray_arr)
+
+    eff_in_w, eff_in_h, did_pre_downscale, restore_reason = resolve_pre_downscale_dims(
+        orig_in_w,
+        orig_in_h,
+        pre_downscale_mode,
+        metrics_probe_fn=_probe_img_metrics,
+    )
+
+    if not did_pre_downscale and is_already_at_or_above_target(orig_in_w, orig_in_h, target_resolution):
         log_fn(
-            f"[{idx}/{total_count}] SKIP   {cur_input.name} ({in_w}x{in_h}) | Đã đạt target {target_resolution}"
+            f"[{idx}/{total_count}] SKIP   {cur_input.name} ({orig_in_w}x{orig_in_h}) | Đã đạt target {target_resolution}"
         )
-        return None, f"Skipped (Already >= {target_resolution.split()[0]})", f"{in_w}x{in_h}"
+        return None, f"Skipped (Already >= {target_resolution.split()[0]})", f"{orig_in_w}x{orig_in_h}"
+
+    if did_pre_downscale:
+        log_fn(f"[RESTORE] {cur_input.name} | {restore_reason}")
+        box_resample = getattr(getattr(PILImage, "Resampling", PILImage), "BOX", PILImage.BILINEAR)
+        work_img = work_img.resize((eff_in_w, eff_in_h), resample=box_resample)
+        in_w, in_h = eff_in_w, eff_in_h
+    disp_in_res = f"{orig_in_w}x{orig_in_h} -> {in_w}x{in_h}" if did_pre_downscale else f"{in_w}x{in_h}"
 
     ensure_upscale_dependencies(log_fn=log_fn)
     import numpy as np
@@ -2132,12 +2462,20 @@ def process_single_image(
     file_size = cur_input.stat().st_size
     est_bpp = (file_size * 8.0) / max(1, in_w * in_h * 12)
     eff_denoise = denoise_strength
-    if model_preset.lower().startswith("auto"):
+    norm_preset = normalize_model_preset_key(model_preset)
+    if norm_preset == "auto":
         selected_model, eff_denoise, _ = choose_auto_model(
-            in_w, in_h, target_resolution, 1, est_bpp, gpu_name_str, denoise_strength
+            in_w,
+            in_h,
+            target_resolution,
+            1,
+            est_bpp,
+            gpu_name_str,
+            denoise_strength,
+            is_restoration=did_pre_downscale,
         )
     else:
-        selected_model = model_preset
+        selected_model = norm_preset
 
     if is_tpu and tpu_rt is not None:
         model = _get_cached_tpu_model(
@@ -2305,7 +2643,7 @@ def process_single_image(
     res_tag = _short_res_tag(target_resolution, out_w, out_h)
     out_img_mb = final_output.stat().st_size / (1024 * 1024) if final_output.exists() else 0.0
     log_fn(
-        f"[{idx}/{total_count}] DONE   {cur_input.name} ({in_w}x{in_h} -> {out_w}x{out_h}) | {selected_model} | {out_img_mb:.2f} MB"
+        f"[{idx}/{total_count}] DONE   {cur_input.name} ({disp_in_res} -> {out_w}x{out_h}) | {selected_model} | {out_img_mb:.2f} MB"
     )
     return final_output, f"Upscaled ({res_tag})", f"{res_tag} · {selected_model}"
 
