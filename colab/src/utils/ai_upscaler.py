@@ -1496,6 +1496,16 @@ def parse_upscale_options(options: dict[str, Any] | None) -> dict[str, Any]:
         or "auto (Bật cho video >= 1500 frames)"
     ).strip()
     start_time = str(opts.get("start_time") or opts.get("startTime") or "00:00:00").strip() or "00:00:00"
+    raw_strategy = (
+        opts.get("upscale_strategy")
+        or opts.get("upscaleStrategy")
+        or opts.get("video_upscale_strategy")
+        or "part_resume"
+    )
+    upscale_strategy = normalize_upscale_strategy(raw_strategy)
+    part_minutes = _float("upscale_part_minutes", "upscalePartMinutes", 3.0, 0.25, 120.0)
+    resume_check = _bool("upscale_resume_check", "upscaleResumeCheck", True)
+    auto_clean_parts = _bool("upscale_auto_clean_parts", "upscaleAutoCleanParts", True)
 
     return {
         "model_preset": model_preset,
@@ -1515,7 +1525,249 @@ def parse_upscale_options(options: dict[str, Any] | None) -> dict[str, Any]:
         "overwrite_output": _bool("overwrite_output", "overwriteOutput", True),
         "force_reoptimize": _bool("force_reoptimize", "forceReoptimize", False),
         "allow_cpu_upscale": _bool("allow_cpu_upscale", "allowCpuUpscale", False),
+        "upscale_strategy": upscale_strategy,
+        "upscale_part_minutes": part_minutes,
+        "upscale_resume_check": resume_check,
+        "upscale_auto_clean_parts": auto_clean_parts,
     }
+
+
+UPSCALE_STRATEGY_OPTIONS = ("part_resume", "full_video")
+
+
+def normalize_upscale_strategy(raw: Any) -> str:
+    """Normalize video upscale execution strategy to 'part_resume' or 'full_video'."""
+    low = str(raw or "").strip().lower()
+    if low in ("full", "full_video", "full_file", "file_by_file", "single", "off", "none"):
+        return "full_video"
+    if low in ("part_resume", "parts", "part", "resume", "backup_resume", "chunked"):
+        return "part_resume"
+    if "part" in low or "chia" in low or "resume" in low:
+        return "part_resume"
+    if "full" in low or "toàn bộ" in low or "toan bo" in low or "1 file" in low:
+        return "full_video"
+    return "part_resume"
+
+
+def parse_start_time_seconds(start_time: str) -> float:
+    """Parse 'HH:MM:SS' / 'MM:SS' / 'SS' string into non-negative seconds."""
+    st_clean = str(start_time or "").strip()
+    if not st_clean or st_clean == "00:00:00":
+        return 0.0
+    try:
+        acc = 0.0
+        for part in st_clean.split(":"):
+            acc = acc * 60.0 + float(part)
+        return max(0.0, acc)
+    except Exception:
+        return 0.0
+
+
+def build_upscale_part_plan(
+    total_frames: int,
+    fps_val: float,
+    part_minutes: float,
+    base_start_sec: float = 0.0,
+    total_dur_sec: float = 0.0,
+) -> list[dict[str, Any]]:
+    """
+    Build deterministic frame-exact part slices for resumable AI video upscaling.
+    Coalesces tiny trailing remainders (< 20% of a part) into the final part so
+    videos never end with a tiny 2-second orphan clip.
+    """
+    eff_fps = fps_val if fps_val > 0 else 30.0
+    clamped_min = max(0.25, min(120.0, float(part_minutes or 3.0)))
+    part_sec = clamped_min * 60.0
+    est_tot = total_frames if total_frames > 0 else max(1, int(round(max(0.1, total_dur_sec) * eff_fps)))
+    frames_per_part = max(15, int(round(part_sec * eff_fps)))
+    min_tail_frames = max(15, int(frames_per_part * 0.20))
+
+    if est_tot <= frames_per_part + min_tail_frames:
+        dur_s = total_dur_sec if total_dur_sec > 0 else (est_tot / eff_fps)
+        return [
+            {
+                "part_index": 1,
+                "file_name": "part_0001.mp4",
+                "start_frame": 0,
+                "end_frame": est_tot,
+                "frame_count": est_tot,
+                "start_sec": round(base_start_sec, 6),
+                "duration_sec": round(max(0.05, dur_s), 6),
+                "is_last": True,
+            }
+        ]
+
+    plan: list[dict[str, Any]] = []
+    cur_f = 0
+    p_idx = 1
+    while cur_f < est_tot:
+        next_f = min(est_tot, cur_f + frames_per_part)
+        if (est_tot - next_f) < min_tail_frames:
+            next_f = est_tot
+        is_last = next_f >= est_tot
+        f_cnt = max(1, next_f - cur_f)
+        plan.append(
+            {
+                "part_index": p_idx,
+                "file_name": f"part_{p_idx:04d}.mp4",
+                "start_frame": cur_f,
+                "end_frame": next_f,
+                "frame_count": f_cnt,
+                "start_sec": round(base_start_sec + (cur_f / eff_fps), 6),
+                "duration_sec": round(f_cnt / eff_fps, 6),
+                "is_last": is_last,
+            }
+        )
+        cur_f = next_f
+        p_idx += 1
+    return plan
+
+
+def concat_upscaled_video_parts(
+    part_paths: list[Path],
+    final_output: Path,
+    *,
+    audio_source: Path | None = None,
+    base_start_sec: float = 0.0,
+    preview_seconds: float = 0.0,
+    work_dir: Path | None = None,
+) -> None:
+    """
+    Losslessly concatenate upscaled MP4 parts into `final_output` (`-c:v copy` with zero re-encoding):
+    - When `audio_source` is available, strips per-part AAC padding via lossless video-only remux first,
+      concatenates pure video frames with microsecond PTS continuity, and muxes continuous audio from `audio_source`.
+    - Falls back to lossless Annex-B MPEG-TS remux if parts came from mixed encoders (e.g. NVENC + libx264 across sessions).
+    """
+    if not part_paths:
+        raise RuntimeError("Không có part video nào để ghép nối.")
+    ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
+    ffprobe_bin = shutil.which("ffprobe") or "ffprobe"
+    proc_env = os.environ.copy()
+    stage_dir = (work_dir or final_output.parent) / f"_concat_stage_{os.getpid()}_{int(time.time() * 1000) % 100000}"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    tmp_merged = stage_dir / f"_merged_{final_output.name}"
+
+    has_audio_src = bool(audio_source is not None and audio_source.is_file() and audio_source.stat().st_size > 0)
+    audio_time_args: list[str] = []
+    if base_start_sec > 0.005:
+        audio_time_args.extend(["-ss", f"{base_start_sec:.6f}"])
+    if preview_seconds > 0:
+        audio_time_args.extend(["-t", f"{preview_seconds:.6f}"])
+    audio_af = [] if audio_time_args else ["-af", "aresample=async=1:first_pts=0"]
+
+    try:
+        if len(part_paths) == 1 and not has_audio_src:
+            final_output.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(str(part_paths[0]), str(final_output))
+            return
+
+        if has_audio_src:
+            vonly_paths: list[Path] = []
+            for idx_p, p_file in enumerate(part_paths, 1):
+                v_out = stage_dir / f"vonly_{idx_p:04d}.mp4"
+                res_v = subprocess.run(
+                    [ffmpeg_bin, "-y", "-v", "error", "-i", str(p_file), "-map", "0:v:0", "-c", "copy", str(v_out)],
+                    capture_output=True,
+                    text=True,
+                    env=proc_env,
+                )
+                if res_v.returncode != 0 or not v_out.is_file():
+                    raise RuntimeError(f"Lỗi tách luồng video từ {p_file.name}: {res_v.stderr[-300:]}")
+                vonly_paths.append(v_out)
+            concat_txt = stage_dir / "concat_vonly.txt"
+            concat_txt.write_text(
+                "".join(f"file '{vp.resolve().as_posix()}'\n" for vp in vonly_paths),
+                encoding="utf-8",
+            )
+            cmd_direct = [
+                ffmpeg_bin, "-y", "-v", "error",
+                "-f", "concat", "-safe", "0", "-i", str(concat_txt),
+                *audio_time_args, "-i", str(audio_source),
+                "-map", "0:v:0", "-map", "1:a?",
+                "-c:v", "copy",
+                *audio_af,
+                "-c:a", "aac", "-b:a", "192k",
+                *embed_video_optimization_metadata_args(),
+                "-movflags", "+faststart+use_metadata_tags",
+                str(tmp_merged),
+            ]
+        else:
+            concat_txt = stage_dir / "concat_parts.txt"
+            concat_txt.write_text(
+                "".join(f"file '{pp.resolve().as_posix()}'\n" for pp in part_paths),
+                encoding="utf-8",
+            )
+            cmd_direct = [
+                ffmpeg_bin, "-y", "-v", "error",
+                "-f", "concat", "-safe", "0", "-i", str(concat_txt),
+                "-c", "copy",
+                *embed_video_optimization_metadata_args(),
+                "-movflags", "+faststart+use_metadata_tags",
+                str(tmp_merged),
+            ]
+
+        res_merge = subprocess.run(cmd_direct, capture_output=True, text=True, env=proc_env)
+        if res_merge.returncode != 0 or not tmp_merged.is_file() or tmp_merged.stat().st_size < 1024:
+            # Fallback for mixed SPS/PPS extradata across sessions (e.g. NVENC part + libx264 part): remux via Annex-B MPEG-TS
+            codec_name = "h264"
+            try:
+                pr = subprocess.run(
+                    [ffprobe_bin, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", str(part_paths[0])],
+                    capture_output=True, text=True, timeout=8, env=proc_env,
+                )
+                if pr.returncode == 0 and pr.stdout.strip():
+                    codec_name = pr.stdout.strip().lower()
+            except Exception:
+                pass
+            v_bsf = "hevc_mp4toannexb" if ("hevc" in codec_name or "265" in codec_name) else "h264_mp4toannexb"
+            ts_paths: list[Path] = []
+            for idx_p, p_file in enumerate(part_paths, 1):
+                ts_out = stage_dir / f"annexb_{idx_p:04d}.ts"
+                map_args = ["-map", "0:v:0"] if has_audio_src else ["-map", "0:v:0", "-map", "0:a?"]
+                res_ts = subprocess.run(
+                    [ffmpeg_bin, "-y", "-v", "error", "-i", str(p_file), *map_args, "-c", "copy", "-bsf:v", v_bsf, "-f", "mpegts", str(ts_out)],
+                    capture_output=True, text=True, env=proc_env,
+                )
+                if res_ts.returncode != 0 or not ts_out.is_file():
+                    raise RuntimeError(f"Lỗi ghép video (concat & TS fallback): {res_merge.stderr[-250:]} | {res_ts.stderr[-250:]}")
+                ts_paths.append(ts_out)
+            ts_concat = stage_dir / "concat_ts.txt"
+            ts_concat.write_text("".join(f"file '{tp.resolve().as_posix()}'\n" for tp in ts_paths), encoding="utf-8")
+            tmp_merged.unlink(missing_ok=True)
+            if has_audio_src:
+                cmd_ts = [
+                    ffmpeg_bin, "-y", "-v", "error",
+                    "-f", "concat", "-safe", "0", "-i", str(ts_concat),
+                    *audio_time_args, "-i", str(audio_source),
+                    "-map", "0:v:0", "-map", "1:a?",
+                    "-c:v", "copy",
+                    *audio_af,
+                    "-c:a", "aac", "-b:a", "192k",
+                    *embed_video_optimization_metadata_args(),
+                    "-movflags", "+faststart+use_metadata_tags",
+                    str(tmp_merged),
+                ]
+            else:
+                cmd_ts = [
+                    ffmpeg_bin, "-y", "-v", "error",
+                    "-f", "concat", "-safe", "0", "-i", str(ts_concat),
+                    "-c", "copy", "-bsf:a", "aac_adtstoasc",
+                    *embed_video_optimization_metadata_args(),
+                    "-movflags", "+faststart+use_metadata_tags",
+                    str(tmp_merged),
+                ]
+            res_ts_merge = subprocess.run(cmd_ts, capture_output=True, text=True, env=proc_env)
+            if res_ts_merge.returncode != 0 or not tmp_merged.is_file() or tmp_merged.stat().st_size < 1024:
+                raise RuntimeError(f"Lỗi ghép nối FFmpeg: {res_ts_merge.stderr[-350:]}")
+
+        final_output.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.replace(str(tmp_merged), str(final_output))
+        except OSError:
+            shutil.copyfile(str(tmp_merged), str(final_output))
+            tmp_merged.unlink(missing_ok=True)
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
 
 
 def _short_res_tag(res_choice: str, out_w: int, out_h: int) -> str:
@@ -1538,6 +1790,7 @@ def process_single_video(
     on_frame_progress: Callable[[float], None] | None = None,
     file_entry: dict[str, Any] | None = None,
     batch_files: list[dict[str, Any]] | None = None,
+    part_resume_hooks: Any = None,
 ) -> tuple[Path | None, str, str]:
     """
     Upscale a single video using the full Video2X pipeline:
@@ -1639,11 +1892,13 @@ def process_single_video(
     encoder_choice = cfg["encoder_choice"]
     overwrite_output = cfg["overwrite_output"]
 
-    eff_dur = min(float(preview_seconds), total_dur) if (preview_seconds > 0 and total_dur > 0) else total_dur
+    base_start_sec = parse_start_time_seconds(start_time)
+    rem_dur = max(0.0, total_dur - base_start_sec) if total_dur > 0 else 0.0
+    eff_dur = min(float(preview_seconds), rem_dur) if (preview_seconds > 0 and rem_dur > 0) else rem_dur
     dur_est_frames = int(round(eff_dur * fps_val)) if eff_dur > 0 else None
     if (
         preview_seconds <= 0
-        and start_time.strip() in ("", "00:00:00")
+        and base_start_sec <= 0.005
         and exact_nb_frames > 0
         and (
             dur_est_frames is None
@@ -1685,6 +1940,106 @@ def process_single_video(
 
     if cancel_check:
         cancel_check()
+
+    resume_plan: dict[str, Any] | None = None
+    if part_resume_hooks is not None and cfg.get("upscale_strategy") == "part_resume":
+        resume_plan = part_resume_hooks.prepare_plan(
+            cur_input=cur_input,
+            out_filename=out_filename,
+            orig_in_w=orig_in_w,
+            orig_in_h=orig_in_h,
+            in_w=in_w,
+            in_h=in_h,
+            did_pre_downscale=did_pre_downscale,
+            selected_model=selected_model,
+            eff_denoise=eff_denoise,
+            target_resolution=target_resolution,
+            fps_str=fps_str,
+            fps_val=fps_val,
+            base_start_sec=base_start_sec,
+            eff_dur=eff_dur,
+            est_frames=est_frames or 0,
+            cfg=cfg,
+        )
+        if resume_plan and resume_plan.get("enabled"):
+            if resume_plan.get("locked_in_w") and resume_plan.get("locked_in_h"):
+                in_w = int(resume_plan["locked_in_w"])
+                in_h = int(resume_plan["locked_in_h"])
+                did_pre_downscale = bool(resume_plan.get("locked_pre_downscale", (in_w != orig_in_w or in_h != orig_in_h)))
+                disp_in_res = f"{orig_in_w}x{orig_in_h} -> {in_w}x{in_h}" if did_pre_downscale else f"{in_w}x{in_h}"
+            if resume_plan.get("locked_model"):
+                selected_model = str(resume_plan["locked_model"])
+            if resume_plan.get("locked_denoise") is not None:
+                eff_denoise = float(resume_plan["locked_denoise"])
+            if resume_plan.get("total_frames"):
+                est_frames = int(resume_plan["total_frames"])
+
+            rem_parts_init = resume_plan.get("remaining_parts") or []
+            if len(rem_parts_init) == 0:
+                # All parts were already upscaled and backed up to Cloud in a previous session!
+                model_scale_hint = 4 if ("4x" in selected_model.lower() or "x4" in selected_model.lower()) else 2
+                fast_out_w, fast_out_h = compute_target_dims(in_w, in_h, model_scale_hint, target_resolution)
+                res_tag_fast = _short_res_tag(target_resolution, fast_out_w, fast_out_h)
+                _emit_upscale_progress(
+                    job_state,
+                    active=True,
+                    phase="merging_parts",
+                    mediaType="video",
+                    accelerator=accel_kind,
+                    currentFile=cur_input.name,
+                    outputFile=out_filename,
+                    inRes=disp_in_res,
+                    outRes=f"{fast_out_w}x{fast_out_h}",
+                    targetResolution=target_resolution,
+                    model=selected_model,
+                    upscaleStrategy="part_resume",
+                    partIndex=len(resume_plan.get("parts_plan") or []),
+                    partsTotal=len(resume_plan.get("parts_plan") or []),
+                    partMinutes=cfg.get("upscale_part_minutes", 3.0),
+                    framesDone=est_frames or 0,
+                    framesTotal=est_frames or 0,
+                    filePercent=99.0,
+                    **({"files": batch_files} if batch_files is not None else {}),
+                )
+                final_part_paths, space_saved = part_resume_hooks.finalize_parts()
+                if space_saved:
+                    if on_frame_progress:
+                        on_frame_progress(1.0)
+                    return None, f"Backed up parts ({res_tag_fast})", f"{res_tag_fast} · {selected_model}"
+                concat_upscaled_video_parts(
+                    final_part_paths,
+                    final_output,
+                    audio_source=cur_input,
+                    base_start_sec=base_start_sec,
+                    preview_seconds=preview_seconds,
+                    work_dir=work_dir or dest_dir,
+                )
+                part_resume_hooks.cleanup_local_workspace()
+                if (
+                    cfg["delete_uploaded_source_in_colab"]
+                    and cur_input.exists()
+                    and not str(cur_input.resolve()).startswith("/content/drive/")
+                    and final_output.exists()
+                    and final_output.resolve() != cur_input.resolve()
+                ):
+                    cur_input.unlink(missing_ok=True)
+                out_b = final_output.stat().st_size
+                if file_entry is not None:
+                    file_entry.update({
+                        "status": "done",
+                        "outputName": final_output.name,
+                        "percent": 100,
+                        "framesDone": est_frames or 0,
+                        "framesTotal": est_frames or 0,
+                        "outputSizeBytes": out_b,
+                        "etaSeconds": 0,
+                    })
+                log_fn(
+                    f"[{idx}/{total_count}] DONE   {final_output.name} | Khôi phục & ghép 100% từ Cloud Resume ({out_b / (1024 * 1024):.2f} MB)"
+                )
+                if on_frame_progress:
+                    on_frame_progress(1.0)
+                return final_output, f"Upscaled ({res_tag_fast})", f"{res_tag_fast} · {selected_model}"
 
     if file_entry is not None:
         file_entry.update({
@@ -1908,10 +2263,8 @@ def process_single_video(
     num_in_slots = max(4, min(total_est_batches + 2, int(rem_in_budget // max(1, batch_in_bytes)), 96))
     max_pinned_in = max(3, min(num_in_slots, int((1.5 * (1024 ** 3)) // max(1, batch_in_bytes)))) if has_cuda else 0
 
-    in_free_q: queue.Queue[Any] = queue.Queue()
-    in_ready_q: queue.Queue[Any] = queue.Queue(maxsize=max(4, num_in_slots - 2))
-    out_free_q: queue.Queue[Any] = queue.Queue()
-    out_ready_q: queue.Queue[Any] = queue.Queue()
+    in_slots_pool: list[tuple[Any, Any]] = []
+    out_slots_pool: list[tuple[Any, Any]] = []
 
     for s_idx in range(num_in_slots):
         is_pinned_in = bool(has_cuda and s_idx < max_pinned_in)
@@ -1921,14 +2274,14 @@ def process_single_video(
             else torch.empty((eff_batch, in_h, in_w, 3), dtype=torch.uint8, pin_memory=is_pinned_in)
         )
         in_ev = torch.cuda.Event() if is_pinned_in else None
-        in_free_q.put((t_buf, in_ev))
+        in_slots_pool.append((t_buf, in_ev))
 
     for _ in range(num_out_slots):
         t_out = torch.zeros((eff_batch, frame_out_yuv_bytes), dtype=torch.uint8, pin_memory=has_cuda)
         ev = torch.cuda.Event() if has_cuda else None
-        out_free_q.put((t_out, ev))
+        out_slots_pool.append((t_out, ev))
 
-    alloc_ram_gb = (num_in_slots * batch_in_bytes + out_pool_bytes) / (1024 ** 3)
+    alloc_ram_gb = (num_in_slots * batch_in_bytes + out_pool_bytes) / (1024 ** 3)  # noqa: F841
 
     tmp_root = work_dir or dest_dir
     tmp_root.mkdir(parents=True, exist_ok=True)
@@ -2022,6 +2375,15 @@ def process_single_video(
         pipe_str = f"{dec_short} -> Tensor Cores -> {enc_short}" if has_cuda else f"{dec_short} -> PyTorch -> {enc_short}"
         vram_reserved_gb = (torch.cuda.memory_reserved(device) / (1024 ** 3)) if has_cuda else 0.0
 
+    is_part_resume_active = bool(resume_plan and resume_plan.get("enabled"))
+    parts_plan_list: list[dict[str, Any]] = (resume_plan.get("parts_plan") or []) if is_part_resume_active else []
+    remaining_parts_list: list[dict[str, Any]] = (resume_plan.get("remaining_parts") or []) if is_part_resume_active else []
+    pre_synced_frames = int(resume_plan.get("pre_synced_frames") or 0) if is_part_resume_active else 0
+    strategy_mode_str = "part_resume" if is_part_resume_active else "full_video"
+    parts_total_disp = len(parts_plan_list) if is_part_resume_active else 1
+    init_part_idx = int(remaining_parts_list[0]["part_index"]) if (is_part_resume_active and remaining_parts_list) else 1
+    init_pct = round((pre_synced_frames / max(1, est_frames)) * 100.0, 1) if (pre_synced_frames > 0 and est_frames) else 0.0
+
     if file_entry is not None:
         file_entry.update({
             "status": "active",
@@ -2030,8 +2392,8 @@ def process_single_video(
             "outRes": f"{out_w}x{out_h}",
             "model": selected_model,
             "framesTotal": est_frames or 0,
-            "framesDone": 0,
-            "percent": 0,
+            "framesDone": pre_synced_frames,
+            "percent": int(round(init_pct)),
         })
     _emit_upscale_progress(
         job_state,
@@ -2049,45 +2411,30 @@ def process_single_video(
         precision=prec_str,
         batchSize=eff_batch,
         pipeline=pipe_str,
+        upscaleStrategy=strategy_mode_str,
+        partIndex=init_part_idx,
+        partsTotal=parts_total_disp,
+        partsSynced=max(0, parts_total_disp - len(remaining_parts_list)) if is_part_resume_active else 0,
+        partMinutes=cfg.get("upscale_part_minutes", 3.0),
         vramUsedGb=round(vram_reserved_gb, 2),
         vramTotalGb=round(vram_total_gb, 1),
         gpuName=gpu_name_str,
-        framesDone=0,
+        framesDone=pre_synced_frames,
         framesTotal=est_frames or 0,
-        filePercent=0.0,
+        filePercent=init_pct,
         fps=0.0,
         etaSeconds=None,
         **({"files": batch_files} if batch_files is not None else {}),
     )
+    strat_log = (
+        f" | Part-Resume ({len(remaining_parts_list)}/{parts_total_disp} parts cần chạy, {cfg.get('upscale_part_minutes', 3.0):g}p/part)"
+        if is_part_resume_active
+        else ""
+    )
     log_fn(
         f"[{idx}/{total_count}] START  {cur_input.name} ({disp_in_res} -> {out_w}x{out_h}) | "
-        f"{selected_model} ({prec_str}, B={eff_batch}) | {dec_short} -> {enc_short}"
+        f"{selected_model} ({prec_str}, B={eff_batch}) | {dec_short} -> {enc_short}{strat_log}"
     )
-
-    time_args_in: list[str] = []
-    if start_time.strip() and start_time.strip() != "00:00:00":
-        time_args_in.extend(["-ss", start_time.strip()])
-    if preview_seconds > 0:
-        time_args_in.extend(["-t", str(preview_seconds)])
-
-    vf_fps_expr = f"fps={fps_str}" if time_args_in else f"fps={fps_str}:start_time=0"
-    if use_scale_cuda:
-        hwaccel_in = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-        vf_in_expr = f"scale_cuda={in_w}:{in_h}:format=nv12,hwdownload,format=nv12,{vf_fps_expr}"
-    else:
-        hwaccel_in = ["-hwaccel", "cuda"] if use_nvdec else ["-threads", str(dec_threads)]
-        vf_in_expr = f"{vf_fps_expr},scale={in_w}:{in_h}:flags=area" if did_pre_downscale else vf_fps_expr
-    audio_sync_opts = [] if time_args_in else ["-af", "aresample=async=1:first_pts=0"]
-
-    ffmpeg_in_cmd = [
-        "ffmpeg", "-v", "error",
-        *hwaccel_in,
-        *time_args_in,
-        "-i", str(working_input),
-        "-vf", vf_in_expr,
-        "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "pipe:1",
-    ]
 
     if use_nvenc:
         video_enc_opts = [
@@ -2113,28 +2460,20 @@ def process_single_video(
             "-pix_fmt", "yuv420p",
         ]
 
-    ffmpeg_out_cmd = [
-        "ffmpeg", "-y", "-v", "error",
-        "-f", "rawvideo", "-pix_fmt", "yuv420p",
-        "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-        "-s", f"{out_w}x{out_h}",
-        "-r", fps_str,
-        "-i", "pipe:0",
-        *time_args_in,
-        "-i", str(working_input),
-        "-map", "0:v:0", "-map", "1:a?",
-        *video_enc_opts,
-        "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
-        *audio_sync_opts,
-        "-c:a", "aac", "-b:a", "192k",
-        *embed_video_optimization_metadata_args(),
-        "-movflags", "+faststart+use_metadata_tags",
-        str(local_tmp_out),
-    ]
-
-    in_errs: list[str] = []
-    out_errs: list[str] = []
-    proc_env = os.environ.copy()
+    session_t0 = time.time()
+    fps_t0 = session_t0
+    fps_base_frames = 0
+    session_processed_frames = 0
+    peak_tpu_hbm_gb = vram_reserved_gb if is_tpu else 0.0
+    if has_cuda:
+        torch.cuda.reset_peak_memory_stats(device)
+        compute_stream = torch.cuda.current_stream(device)
+        d2h_stream = torch.cuda.Stream(device=device)
+        compute_done_ev = torch.cuda.Event()
+    else:
+        compute_stream = None
+        d2h_stream = None
+        compute_done_ev = None
 
     def _drain_stderr(pipe: Any, sink: list[str]) -> None:
         try:
@@ -2146,326 +2485,490 @@ def process_single_video(
             except Exception:
                 pass
 
-    p_in = subprocess.Popen(ffmpeg_in_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=32 * 1024 * 1024, env=proc_env)
-    p_out = subprocess.Popen(ffmpeg_out_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=32 * 1024 * 1024, env=proc_env)
+    def _run_video_sr_segment(
+        seg_out_file: Path,
+        *,
+        seg_time_args_in: list[str],
+        seg_audio_args_in: list[str],
+        seg_frames_cap: int | None,
+        is_part_mode: bool,
+        cur_part_idx: int,
+        tot_parts_cnt: int,
+        synced_parts_cnt: int,
+        base_global_frames: int,
+    ) -> int:
+        nonlocal compiled_callable, fps_t0, fps_base_frames, peak_tpu_hbm_gb, session_processed_frames
 
-    try:
-        import fcntl  # type: ignore[import-not-found]
-        F_SETPIPE_SZ = 1031
-        if p_in.stdout:
-            fcntl.fcntl(p_in.stdout.fileno(), F_SETPIPE_SZ, 1048576)
-        if p_out.stdin:
-            fcntl.fcntl(p_out.stdin.fileno(), F_SETPIPE_SZ, 1048576)
-    except Exception:
-        pass
+        if has_cuda:
+            torch.cuda.synchronize(device)
 
-    t_err_in = threading.Thread(target=_drain_stderr, args=(p_in.stderr, in_errs), daemon=True)
-    t_err_out = threading.Thread(target=_drain_stderr, args=(p_out.stderr, out_errs), daemon=True)
-    t_err_in.start()
-    t_err_out.start()
+        in_free_q: queue.Queue[Any] = queue.Queue()
+        in_ready_q: queue.Queue[Any] = queue.Queue(maxsize=max(4, num_in_slots - 2))
+        out_free_q: queue.Queue[Any] = queue.Queue()
+        out_ready_q: queue.Queue[Any] = queue.Queue()
+        for slot_in in in_slots_pool:
+            in_free_q.put(slot_in)
+        for slot_out in out_slots_pool:
+            out_free_q.put(slot_out)
 
-    stop_event = threading.Event()
-    worker_errors: list[BaseException] = []
+        vf_fps_expr = f"fps={fps_str}" if seg_time_args_in else f"fps={fps_str}:start_time=0"
+        if use_scale_cuda:
+            hwaccel_in = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+            vf_in_expr = f"scale_cuda={in_w}:{in_h}:format=nv12,hwdownload,format=nv12,{vf_fps_expr}"
+        else:
+            hwaccel_in = ["-hwaccel", "cuda"] if use_nvdec else ["-threads", str(dec_threads)]
+            vf_in_expr = f"{vf_fps_expr},scale={in_w}:{in_h}:flags=area" if did_pre_downscale else vf_fps_expr
 
-    def _q_put(q_obj: queue.Queue[Any], item: Any) -> bool:
-        while not stop_event.is_set():
-            try:
-                q_obj.put(item, timeout=0.5)
-                return True
-            except queue.Full:
-                continue
-        return False
+        frames_cap_args = ["-frames:v", str(seg_frames_cap)] if (seg_frames_cap is not None and seg_frames_cap > 0) else []
+        audio_sync_opts = [] if seg_audio_args_in else ["-af", "aresample=async=1:first_pts=0"]
+        extra_part_mux_opts = ["-video_track_timescale", "90000", "-shortest"] if is_part_mode else []
 
-    def _q_get(q_obj: queue.Queue[Any]) -> tuple[bool, Any]:
-        while not stop_event.is_set():
-            try:
-                return True, q_obj.get(timeout=0.5)
-            except queue.Empty:
-                continue
-        return False, None
+        ffmpeg_in_cmd = [
+            "ffmpeg", "-v", "error",
+            *hwaccel_in,
+            *seg_time_args_in,
+            "-i", str(working_input),
+            "-vf", vf_in_expr,
+            *frames_cap_args,
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "pipe:1",
+        ]
+        ffmpeg_out_cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "rawvideo", "-pix_fmt", "yuv420p",
+            "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+            "-s", f"{out_w}x{out_h}",
+            "-r", fps_str,
+            "-i", "pipe:0",
+            *seg_audio_args_in,
+            "-i", str(working_input),
+            "-map", "0:v:0", "-map", "1:a?",
+            *video_enc_opts,
+            "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
+            *audio_sync_opts,
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+            *extra_part_mux_opts,
+            *embed_video_optimization_metadata_args(),
+            "-movflags", "+faststart+use_metadata_tags",
+            str(seg_out_file),
+        ]
 
-    def _reader_worker() -> None:
+        in_errs: list[str] = []
+        out_errs: list[str] = []
+        proc_env = os.environ.copy()
+        p_in = subprocess.Popen(ffmpeg_in_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=32 * 1024 * 1024, env=proc_env)
+        p_out = subprocess.Popen(ffmpeg_out_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=32 * 1024 * 1024, env=proc_env)
+
         try:
-            while not stop_event.is_set():
-                ok, slot = _q_get(in_free_q)
-                if not ok or slot is None:
-                    break
-                t_buf, in_ev = slot
-                if in_ev is not None:
-                    # Wait until compute_stream finishes async H2D DMA copy from this pinned buffer before overwriting!
-                    in_ev.synchronize()
-                flat_mv = memoryview(t_buf.numpy()).cast("B")
-                got_bytes = _read_exact_into(p_in.stdout, flat_mv)
-                cur_b = got_bytes // frame_in_bytes
-                if cur_b == 0:
-                    in_free_q.put((t_buf, in_ev))
-                    break
-                if not _q_put(in_ready_q, (cur_b, t_buf, in_ev)):
-                    break
-                if cur_b < eff_batch:
-                    break
-        except Exception as e:
-            worker_errors.append(e)
-            stop_event.set()
-        finally:
-            _q_put(in_ready_q, None)
-
-    def _writer_worker() -> None:
-        try:
-            while not stop_event.is_set():
-                ok, item = _q_get(out_ready_q)
-                if not ok or item is None:
-                    break
-                cur_b, t_out, ev = item
-                if ev is not None:
-                    ev.synchronize()
-                mv_out = memoryview(t_out[:cur_b].numpy()).cast("B")
-                if p_out.stdin:
-                    p_out.stdin.write(mv_out)
-                out_free_q.put((t_out, ev))
-        except BrokenPipeError:
-            stop_event.set()
-        except Exception as e:
-            worker_errors.append(e)
-            stop_event.set()
-        finally:
+            import fcntl  # type: ignore[import-not-found]
+            F_SETPIPE_SZ = 1031
+            if p_in.stdout:
+                fcntl.fcntl(p_in.stdout.fileno(), F_SETPIPE_SZ, 1048576)
             if p_out.stdin:
-                try:
-                    p_out.stdin.close()
-                except Exception:
-                    pass
+                fcntl.fcntl(p_out.stdin.fileno(), F_SETPIPE_SZ, 1048576)
+        except Exception:
+            pass
 
-    processed_frames = 0
-    t0 = time.time()
-    fps_t0 = t0
-    fps_base_frames = 0
-    peak_tpu_hbm_gb = vram_reserved_gb if is_tpu else 0.0
-    last_ui_tick = t0
-    if has_cuda:
-        torch.cuda.reset_peak_memory_stats(device)
-        compute_stream = torch.cuda.current_stream(device)
-        d2h_stream = torch.cuda.Stream(device=device)
-        compute_done_ev = torch.cuda.Event()
-    else:
-        compute_stream = None
-        d2h_stream = None
-        compute_done_ev = None
+        t_err_in = threading.Thread(target=_drain_stderr, args=(p_in.stderr, in_errs), daemon=True)
+        t_err_out = threading.Thread(target=_drain_stderr, args=(p_out.stderr, out_errs), daemon=True)
+        t_err_in.start()
+        t_err_out.start()
 
-    t_reader = threading.Thread(target=_reader_worker, daemon=True)
-    t_writer = threading.Thread(target=_writer_worker, daemon=True)
-    t_reader.start()
-    t_writer.start()
+        stop_event = threading.Event()
+        worker_errors: list[BaseException] = []
 
-    cancelled_exc: BaseException | None = None
-    try:
-        with torch.inference_mode():
+        def _q_put(q_obj: queue.Queue[Any], item: Any) -> bool:
             while not stop_event.is_set():
-                if cancel_check:
-                    cancel_check()
-
-                ok, item = _q_get(in_ready_q)
-                if not ok or item is None:
-                    break
-                cur_b, t_buf, in_ev = item
-
-                if is_tpu:
-                    shape_key = (selected_model, str(model_dtype), eff_batch, in_h, in_w, out_h, out_w)
-                    need_xla_compile_notice = shape_key not in _TPU_COMPILED_SHAPES
-                    compile_t0 = 0.0
-                    if need_xla_compile_notice:
-                        compile_t0 = time.time()
-                        _emit_upscale_progress(
-                            job_state,
-                            active=True,
-                            phase="compiling_tpu",
-                            accelerator="tpu",
-                            **({"files": batch_files} if batch_files is not None else {}),
-                        )
-                        log_fn(
-                            f"[XLA] Biên dịch đồ thị TPU ({prec_str}) cho khung {eff_batch}x{in_w}x{in_h} -> {out_w}x{out_h}..."
-                        )
-
-                    # Send full fixed `eff_batch` buffer so tail batches (`cur_b < eff_batch`) reuse the exact compiled XLA graph.
-                    u8_dev = t_buf.to(device=device)
-                    in_free_q.put((t_buf, in_ev))
-                    inp = _prepare_gpu_batch(u8_dev)
-                    del u8_dev
-                    sr = _run_tpu_static_sr(inp)
-                    del inp
-                    sr_resized = resize_sr_gpu(sr, out_h, out_w)
-                    del sr
-                    yuv_dev = rgb_to_yuv420p_bt709(sr_resized)
-                    del sr_resized
-                    yuv_cpu = yuv_dev.cpu()
-                    del yuv_dev
-                    if tpu_rt is not None:
-                        tpu_rt["sync"]()
-
-                    if need_xla_compile_notice:
-                        _TPU_COMPILED_SHAPES.add(shape_key)
-                        comp_sec = max(0.1, time.time() - compile_t0)
-                        log_fn(f"[XLA] Biên dịch hoàn tất trong {comp_sec:.1f}s | Bắt đầu suy luận tốc độ cao")
-                        fps_t0 = time.time()
-                        fps_base_frames = processed_frames + cur_b
-
-                    ok_out, out_slot = _q_get(out_free_q)
-                    if not ok_out or out_slot is None:
-                        break
-                    t_out, ev = out_slot
-                    t_out[:cur_b].copy_(yuv_cpu[:cur_b])
-                    del yuv_cpu
-                else:
-                    u8_gpu = t_buf[:cur_b].to(device=device, non_blocking=bool(in_ev is not None))
-                    if in_ev is not None and compute_stream is not None:
-                        in_ev.record(compute_stream)
-                    in_free_q.put((t_buf, in_ev))
-
-                    inp = _prepare_gpu_batch(u8_gpu)
-                    del u8_gpu
-
-                    try:
-                        if compiled_callable is not None and cur_b == eff_batch:
-                            try:
-                                sr = _run_compiled_sr(compiled_callable, inp)
-                            except Exception as comp_exc:
-                                if has_cuda and "out of memory" in str(comp_exc).lower():
-                                    raise
-                                compiled_callable = None
-                                try:
-                                    torch._dynamo.reset()
-                                except Exception:
-                                    pass
-                                log_fn(f"[COMPILE] Tự động chuyển sang chế độ Eager ({comp_exc})")
-                                sr = model(inp)
-                        else:
-                            sr = model(inp)
-                    except RuntimeError as oom_exc:
-                        if has_cuda and "out of memory" in str(oom_exc).lower():
-                            torch.cuda.empty_cache()
-                            sr_list = [infer_tiled_single(model, inp[i : i + 1]) for i in range(cur_b)]
-                            sr = torch.cat(sr_list, dim=0)
-                        else:
-                            raise
-
-                    del inp
-                    sr_resized = resize_sr_gpu(sr, out_h, out_w)
-                    del sr
-                    yuv_gpu = rgb_to_yuv420p_bt709(sr_resized)
-                    del sr_resized
-
-                    ok_out, out_slot = _q_get(out_free_q)
-                    if not ok_out or out_slot is None:
-                        break
-                    t_out, ev = out_slot
-
-                    if has_cuda and compute_done_ev is not None and d2h_stream is not None and ev is not None:
-                        compute_done_ev.record(compute_stream)
-                        with torch.cuda.stream(d2h_stream):
-                            d2h_stream.wait_event(compute_done_ev)
-                            t_out[:cur_b].copy_(yuv_gpu, non_blocking=True)
-                            ev.record(d2h_stream)
-                        yuv_gpu.record_stream(d2h_stream)
-                    else:
-                        t_out[:cur_b].copy_(yuv_gpu)
-                    del yuv_gpu
-
-                if not _q_put(out_ready_q, (cur_b, t_out, ev)):
-                    break
-
-                processed_frames += cur_b
-                now = time.time()
-                if now - last_ui_tick >= 0.8 or (est_frames and processed_frames >= est_frames):
-                    last_ui_tick = now
-                    elapsed_so_far = max(now - t0, 1e-3)
-                    if is_tpu and fps_base_frames > 0 and processed_frames > fps_base_frames:
-                        cur_fps = (processed_frames - fps_base_frames) / max(now - fps_t0, 1e-3)
-                    else:
-                        cur_fps = processed_frames / elapsed_so_far
-                    frame_ratio = min(0.99, processed_frames / est_frames) if (est_frames and est_frames > 0) else 0.5
-                    if on_frame_progress:
-                        on_frame_progress(frame_ratio)
-                    pct_disp = int(round(frame_ratio * 100))
-                    eta_sec = (
-                        max(0, int(round((est_frames - processed_frames) / max(cur_fps, 1e-3))))
-                        if (est_frames and est_frames > processed_frames and cur_fps > 0)
-                        else 0
-                    )
-                    if has_cuda:
-                        cur_vram_gb = (
-                            max(torch.cuda.memory_allocated(device), torch.cuda.memory_reserved(device)) / (1024 ** 3)
-                        )
-                    elif is_tpu:
-                        cur_vram_gb = _get_tpu_hbm_used_gb(tpu_rt)
-                        peak_tpu_hbm_gb = max(peak_tpu_hbm_gb, cur_vram_gb)
-                    else:
-                        cur_vram_gb = 0.0
-                    if file_entry is not None:
-                        file_entry.update({
-                            "status": "active",
-                            "framesDone": processed_frames,
-                            "framesTotal": est_frames or 0,
-                            "percent": pct_disp,
-                            "fps": round(cur_fps, 2),
-                            "etaSeconds": eta_sec,
-                        })
-                    if job_state is not None:
-                        job_state.set(current_file=f"{cur_input.name} ({pct_disp}% - {cur_fps:.1f} FPS)")
-                        _emit_upscale_progress(
-                            job_state,
-                            active=True,
-                            phase="upscaling_video",
-                            accelerator=accel_kind,
-                            framesDone=processed_frames,
-                            framesTotal=est_frames or 0,
-                            filePercent=round(frame_ratio * 100.0, 1),
-                            fps=round(cur_fps, 2),
-                            etaSeconds=eta_sec,
-                            elapsedSeconds=round(elapsed_so_far, 1),
-                            vramUsedGb=round(cur_vram_gb, 2),
-                            **({"files": batch_files} if batch_files is not None else {}),
-                        )
-
-        _q_put(out_ready_q, None)
-        t_writer.join()
-    except BaseException as exc:
-        cancelled_exc = exc
-        stop_event.set()
-        for proc in (p_in, p_out):
-            if proc.poll() is None:
                 try:
-                    proc.kill()
-                except Exception:
-                    pass
-        raise
-    finally:
-        stop_event.set()
-        t_reader.join(timeout=3)
-        t_writer.join(timeout=5)
-        if p_in.stdout:
+                    q_obj.put(item, timeout=0.5)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def _q_get(q_obj: queue.Queue[Any]) -> tuple[bool, Any]:
+            while not stop_event.is_set():
+                try:
+                    return True, q_obj.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+            return False, None
+
+        def _reader_worker() -> None:
             try:
-                p_in.stdout.close()
-            except Exception:
-                pass
-        if cancelled_exc is not None:
+                while not stop_event.is_set():
+                    ok, slot = _q_get(in_free_q)
+                    if not ok or slot is None:
+                        break
+                    t_buf, in_ev = slot
+                    if in_ev is not None:
+                        in_ev.synchronize()
+                    flat_mv = memoryview(t_buf.numpy()).cast("B")
+                    got_bytes = _read_exact_into(p_in.stdout, flat_mv)
+                    cur_b = got_bytes // frame_in_bytes
+                    if cur_b == 0:
+                        in_free_q.put((t_buf, in_ev))
+                        break
+                    if not _q_put(in_ready_q, (cur_b, t_buf, in_ev)):
+                        break
+                    if cur_b < eff_batch:
+                        break
+            except Exception as e:
+                worker_errors.append(e)
+                stop_event.set()
+            finally:
+                _q_put(in_ready_q, None)
+
+        def _writer_worker() -> None:
+            try:
+                while not stop_event.is_set():
+                    ok, item = _q_get(out_ready_q)
+                    if not ok or item is None:
+                        break
+                    cur_b, t_out, ev = item
+                    if ev is not None:
+                        ev.synchronize()
+                    mv_out = memoryview(t_out[:cur_b].numpy()).cast("B")
+                    if p_out.stdin:
+                        p_out.stdin.write(mv_out)
+                    out_free_q.put((t_out, ev))
+            except BrokenPipeError:
+                stop_event.set()
+            except Exception as e:
+                worker_errors.append(e)
+                stop_event.set()
+            finally:
+                if p_out.stdin:
+                    try:
+                        p_out.stdin.close()
+                    except Exception:
+                        pass
+
+        seg_frames_done = 0
+        last_ui_tick = time.time()
+        t_reader = threading.Thread(target=_reader_worker, daemon=True)
+        t_writer = threading.Thread(target=_writer_worker, daemon=True)
+        t_reader.start()
+        t_writer.start()
+
+        cancelled_exc: BaseException | None = None
+        try:
+            with torch.inference_mode():
+                while not stop_event.is_set():
+                    if cancel_check:
+                        cancel_check()
+
+                    ok, item = _q_get(in_ready_q)
+                    if not ok or item is None:
+                        break
+                    cur_b, t_buf, in_ev = item
+
+                    if is_tpu:
+                        shape_key = (selected_model, str(model_dtype), eff_batch, in_h, in_w, out_h, out_w)
+                        need_xla_compile_notice = shape_key not in _TPU_COMPILED_SHAPES
+                        compile_t0 = 0.0
+                        if need_xla_compile_notice:
+                            compile_t0 = time.time()
+                            _emit_upscale_progress(
+                                job_state,
+                                active=True,
+                                phase="compiling_tpu",
+                                accelerator="tpu",
+                                **({"files": batch_files} if batch_files is not None else {}),
+                            )
+                            log_fn(
+                                f"[XLA] Biên dịch đồ thị TPU ({prec_str}) cho khung {eff_batch}x{in_w}x{in_h} -> {out_w}x{out_h}..."
+                            )
+
+                        u8_dev = t_buf.to(device=device)
+                        in_free_q.put((t_buf, in_ev))
+                        inp = _prepare_gpu_batch(u8_dev)
+                        del u8_dev
+                        sr = _run_tpu_static_sr(inp)
+                        del inp
+                        sr_resized = resize_sr_gpu(sr, out_h, out_w)
+                        del sr
+                        yuv_dev = rgb_to_yuv420p_bt709(sr_resized)
+                        del sr_resized
+                        yuv_cpu = yuv_dev.cpu()
+                        del yuv_dev
+                        if tpu_rt is not None:
+                            tpu_rt["sync"]()
+
+                        if need_xla_compile_notice:
+                            _TPU_COMPILED_SHAPES.add(shape_key)
+                            comp_sec = max(0.1, time.time() - compile_t0)
+                            log_fn(f"[XLA] Biên dịch hoàn tất trong {comp_sec:.1f}s | Bắt đầu suy luận tốc độ cao")
+                            fps_t0 = time.time()
+                            fps_base_frames = session_processed_frames + cur_b
+
+                        ok_out, out_slot = _q_get(out_free_q)
+                        if not ok_out or out_slot is None:
+                            break
+                        t_out, ev = out_slot
+                        t_out[:cur_b].copy_(yuv_cpu[:cur_b])
+                        del yuv_cpu
+                    else:
+                        u8_gpu = t_buf[:cur_b].to(device=device, non_blocking=bool(in_ev is not None))
+                        if in_ev is not None and compute_stream is not None:
+                            in_ev.record(compute_stream)
+                        in_free_q.put((t_buf, in_ev))
+
+                        inp = _prepare_gpu_batch(u8_gpu)
+                        del u8_gpu
+
+                        try:
+                            if compiled_callable is not None and cur_b == eff_batch:
+                                try:
+                                    sr = _run_compiled_sr(compiled_callable, inp)
+                                except Exception as comp_exc:
+                                    if has_cuda and "out of memory" in str(comp_exc).lower():
+                                        raise
+                                    compiled_callable = None
+                                    try:
+                                        torch._dynamo.reset()
+                                    except Exception:
+                                        pass
+                                    log_fn(f"[COMPILE] Tự động chuyển sang chế độ Eager ({comp_exc})")
+                                    sr = model(inp)
+                            else:
+                                sr = model(inp)
+                        except RuntimeError as oom_exc:
+                            if has_cuda and "out of memory" in str(oom_exc).lower():
+                                torch.cuda.empty_cache()
+                                sr_list = [infer_tiled_single(model, inp[i : i + 1]) for i in range(cur_b)]
+                                sr = torch.cat(sr_list, dim=0)
+                            else:
+                                raise
+
+                        del inp
+                        sr_resized = resize_sr_gpu(sr, out_h, out_w)
+                        del sr
+                        yuv_gpu = rgb_to_yuv420p_bt709(sr_resized)
+                        del sr_resized
+
+                        ok_out, out_slot = _q_get(out_free_q)
+                        if not ok_out or out_slot is None:
+                            break
+                        t_out, ev = out_slot
+
+                        if has_cuda and compute_done_ev is not None and d2h_stream is not None and ev is not None:
+                            compute_done_ev.record(compute_stream)
+                            with torch.cuda.stream(d2h_stream):
+                                d2h_stream.wait_event(compute_done_ev)
+                                t_out[:cur_b].copy_(yuv_gpu, non_blocking=True)
+                                ev.record(d2h_stream)
+                            yuv_gpu.record_stream(d2h_stream)
+                        else:
+                            t_out[:cur_b].copy_(yuv_gpu)
+                        del yuv_gpu
+
+                    if not _q_put(out_ready_q, (cur_b, t_out, ev)):
+                        break
+
+                    seg_frames_done += cur_b
+                    session_processed_frames += cur_b
+                    global_frames_now = base_global_frames + seg_frames_done
+                    now = time.time()
+                    if now - last_ui_tick >= 0.8 or (est_frames and global_frames_now >= est_frames):
+                        last_ui_tick = now
+                        elapsed_so_far = max(now - session_t0, 1e-3)
+                        if is_tpu and fps_base_frames > 0 and session_processed_frames > fps_base_frames:
+                            cur_fps = (session_processed_frames - fps_base_frames) / max(now - fps_t0, 1e-3)
+                        else:
+                            cur_fps = session_processed_frames / elapsed_so_far
+                        frame_ratio = min(0.99, global_frames_now / est_frames) if (est_frames and est_frames > 0) else 0.5
+                        if on_frame_progress:
+                            on_frame_progress(frame_ratio)
+                        pct_disp = int(round(frame_ratio * 100))
+                        eta_sec = (
+                            max(0, int(round((est_frames - global_frames_now) / max(cur_fps, 1e-3))))
+                            if (est_frames and est_frames > global_frames_now and cur_fps > 0)
+                            else 0
+                        )
+                        if has_cuda:
+                            cur_vram_gb = (
+                                max(torch.cuda.memory_allocated(device), torch.cuda.memory_reserved(device)) / (1024 ** 3)
+                            )
+                        elif is_tpu:
+                            cur_vram_gb = _get_tpu_hbm_used_gb(tpu_rt)
+                            peak_tpu_hbm_gb = max(peak_tpu_hbm_gb, cur_vram_gb)
+                        else:
+                            cur_vram_gb = 0.0
+                        if file_entry is not None:
+                            file_entry.update({
+                                "status": "active",
+                                "framesDone": global_frames_now,
+                                "framesTotal": est_frames or 0,
+                                "percent": pct_disp,
+                                "fps": round(cur_fps, 2),
+                                "etaSeconds": eta_sec,
+                            })
+                        if job_state is not None:
+                            part_suffix = f" [Part {cur_part_idx}/{tot_parts_cnt}]" if is_part_mode else ""
+                            job_state.set(current_file=f"{cur_input.name}{part_suffix} ({pct_disp}% - {cur_fps:.1f} FPS)")
+                            _emit_upscale_progress(
+                                job_state,
+                                active=True,
+                                phase="upscaling_video",
+                                accelerator=accel_kind,
+                                upscaleStrategy="part_resume" if is_part_mode else "full_video",
+                                partIndex=cur_part_idx,
+                                partsTotal=tot_parts_cnt,
+                                partsSynced=synced_parts_cnt,
+                                partMinutes=cfg.get("upscale_part_minutes", 3.0),
+                                framesDone=global_frames_now,
+                                framesTotal=est_frames or 0,
+                                filePercent=round(frame_ratio * 100.0, 1),
+                                fps=round(cur_fps, 2),
+                                etaSeconds=eta_sec,
+                                elapsedSeconds=round(elapsed_so_far, 1),
+                                vramUsedGb=round(cur_vram_gb, 2),
+                                **({"files": batch_files} if batch_files is not None else {}),
+                            )
+
+            _q_put(out_ready_q, None)
+            t_writer.join()
+        except BaseException as exc:
+            cancelled_exc = exc
+            stop_event.set()
             for proc in (p_in, p_out):
                 if proc.poll() is None:
                     try:
                         proc.kill()
                     except Exception:
                         pass
-            local_tmp_out.unlink(missing_ok=True)
-        rc_in = p_in.wait(timeout=10) if p_in.poll() is not None or cancelled_exc is None else -1
-        rc_out = p_out.wait(timeout=15) if p_out.poll() is not None or cancelled_exc is None else -1
-        t_err_in.join(timeout=2)
-        t_err_out.join(timeout=2)
+            raise
+        finally:
+            stop_event.set()
+            t_reader.join(timeout=3)
+            t_writer.join(timeout=5)
+            if p_in.stdout:
+                try:
+                    p_in.stdout.close()
+                except Exception:
+                    pass
+            if cancelled_exc is not None:
+                for proc in (p_in, p_out):
+                    if proc.poll() is None:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                seg_out_file.unlink(missing_ok=True)
+            rc_in = p_in.wait(timeout=10) if p_in.poll() is not None or cancelled_exc is None else -1
+            rc_out = p_out.wait(timeout=15) if p_out.poll() is not None or cancelled_exc is None else -1
+            t_err_in.join(timeout=2)
+            t_err_out.join(timeout=2)
+
+        if worker_errors:
+            seg_out_file.unlink(missing_ok=True)
+            raise RuntimeError(f"Lỗi luồng xử lý AI Upscale: {worker_errors[0]}")
+        if rc_out != 0 or not seg_out_file.exists() or seg_out_file.stat().st_size < 1024:
+            seg_out_file.unlink(missing_ok=True)
+            err_msg = "\n".join(in_errs + out_errs)
+            raise RuntimeError(f"Quá trình FFmpeg gặp lỗi (rc_in={rc_in}, rc_out={rc_out}):\n{err_msg}")
+        return seg_frames_done
+
+    try:
+        if is_part_resume_active:
+            parts_local_dir: Path = resume_plan["parts_local_dir"]  # type: ignore[index]
+            parts_local_dir.mkdir(parents=True, exist_ok=True)
+            running_global_frames = pre_synced_frames
+            synced_so_far = max(0, parts_total_disp - len(remaining_parts_list))
+            for p_spec in remaining_parts_list:
+                if cancel_check:
+                    cancel_check()
+                p_idx_cur = int(p_spec["part_index"])
+                p_fname = str(p_spec["file_name"])
+                p_start_sec = float(p_spec["start_sec"])
+                p_dur_sec = float(p_spec["duration_sec"])
+                p_is_last = bool(p_spec.get("is_last"))
+                p_f_cap = None if (p_is_last and preview_seconds <= 0) else int(p_spec["frame_count"])
+
+                p_ss_args = ["-ss", f"{p_start_sec:.6f}"] if p_start_sec > 0.005 else []
+                p_in_args = [*p_ss_args, *(["-t", f"{preview_seconds:.6f}"] if (p_is_last and preview_seconds > 0 and p_f_cap is None) else [])]
+                p_aud_args = [*p_ss_args, "-t", f"{max(0.1, p_dur_sec + 0.25):.6f}"]
+
+                tmp_part_file = parts_local_dir / f"._tmp_{p_fname}"
+                final_part_file = parts_local_dir / p_fname
+                tmp_part_file.unlink(missing_ok=True)
+
+                part_frames_actual = _run_video_sr_segment(
+                    tmp_part_file,
+                    seg_time_args_in=p_in_args,
+                    seg_audio_args_in=p_aud_args,
+                    seg_frames_cap=p_f_cap,
+                    is_part_mode=True,
+                    cur_part_idx=p_idx_cur,
+                    tot_parts_cnt=parts_total_disp,
+                    synced_parts_cnt=synced_so_far,
+                    base_global_frames=running_global_frames,
+                )
+                os.replace(str(tmp_part_file), str(final_part_file))
+                running_global_frames += part_frames_actual
+                synced_so_far += 1
+                part_resume_hooks.on_part_completed(final_part_file, p_spec, part_frames_actual)
+
+            _emit_upscale_progress(
+                job_state,
+                active=True,
+                phase="merging_parts",
+                accelerator=accel_kind,
+                upscaleStrategy="part_resume",
+                partIndex=parts_total_disp,
+                partsTotal=parts_total_disp,
+                partsSynced=parts_total_disp,
+                filePercent=99.5,
+                **({"files": batch_files} if batch_files is not None else {}),
+            )
+            final_part_paths, space_saved = part_resume_hooks.finalize_parts()
+            if space_saved:
+                res_tag_sp = _short_res_tag(target_resolution, out_w, out_h)
+                if on_frame_progress:
+                    on_frame_progress(1.0)
+                return None, f"Backed up parts ({res_tag_sp})", f"{res_tag_sp} · {selected_model}"
+
+            concat_upscaled_video_parts(
+                final_part_paths,
+                final_output,
+                audio_source=working_input,
+                base_start_sec=base_start_sec,
+                preview_seconds=preview_seconds,
+                work_dir=tmp_root,
+            )
+            part_resume_hooks.cleanup_local_workspace()
+            processed_frames = running_global_frames
+        else:
+            time_args_in: list[str] = []
+            if start_time.strip() and start_time.strip() != "00:00:00":
+                time_args_in.extend(["-ss", start_time.strip()])
+            if preview_seconds > 0:
+                time_args_in.extend(["-t", str(preview_seconds)])
+
+            processed_frames = _run_video_sr_segment(
+                local_tmp_out,
+                seg_time_args_in=time_args_in,
+                seg_audio_args_in=time_args_in,
+                seg_frames_cap=None,
+                is_part_mode=False,
+                cur_part_idx=1,
+                tot_parts_cnt=1,
+                synced_parts_cnt=0,
+                base_global_frames=0,
+            )
+            final_output.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.replace(str(local_tmp_out), str(final_output))
+            except OSError:
+                shutil.copyfile(str(local_tmp_out), str(final_output))
+                local_tmp_out.unlink(missing_ok=True)
+    finally:
+        local_tmp_out.unlink(missing_ok=True)
         if staged_local_input is not None and staged_local_input.exists():
             staged_local_input.unlink(missing_ok=True)
 
-    if worker_errors:
-        local_tmp_out.unlink(missing_ok=True)
-        raise RuntimeError(f"Lỗi luồng xử lý AI Upscale: {worker_errors[0]}")
-
-    elapsed = max(time.time() - t0, 1e-6)
+    elapsed = max(time.time() - session_t0, 1e-6)
     if has_cuda:
         peak_vram_gb = (
             max(torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)) / (1024 ** 3)
@@ -2474,18 +2977,6 @@ def process_single_video(
         peak_vram_gb = max(peak_tpu_hbm_gb, _get_tpu_hbm_used_gb(tpu_rt))
     else:
         peak_vram_gb = 0.0
-
-    if rc_out != 0 or not local_tmp_out.exists() or local_tmp_out.stat().st_size < 1024:
-        local_tmp_out.unlink(missing_ok=True)
-        err_msg = "\n".join(in_errs + out_errs)
-        raise RuntimeError(f"Quá trình FFmpeg gặp lỗi (rc_in={rc_in}, rc_out={rc_out}):\n{err_msg}")
-
-    final_output.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.replace(str(local_tmp_out), str(final_output))
-    except OSError:
-        shutil.copyfile(str(local_tmp_out), str(final_output))
-        local_tmp_out.unlink(missing_ok=True)
 
     # Xóa ngay bản tải tạm trên SSD Colab (không bao giờ xóa file trên Google Drive mount!)
     if (
@@ -2499,7 +2990,7 @@ def process_single_video(
 
     out_bytes = final_output.stat().st_size
     size_mb = out_bytes / (1024 * 1024)
-    avg_fps = processed_frames / elapsed
+    avg_fps = max(1, session_processed_frames) / elapsed
     res_tag = _short_res_tag(target_resolution, out_w, out_h)
     if file_entry is not None:
         file_entry.update({
@@ -2811,6 +3302,8 @@ def upscale_directory(
     options: dict[str, Any],
     job_state: Any,
     cancel_check: Callable[[], None] | None = None,
+    *,
+    part_resume_factory: Callable[[Path, Path], Any] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Scan `input_dir`, upscale all eligible Videos and Images into `output_dir` using Video2X's Spandrel engine:
@@ -3022,6 +3515,7 @@ def upscale_directory(
             )
 
             try:
+                v_hooks = part_resume_factory(v_path, rel_path) if (part_resume_factory is not None and cfg.get("upscale_strategy") == "part_resume") else None
                 out_p, status_msg, badge = process_single_video(
                     v_path,
                     output_dir / rel_path.parent,
@@ -3034,8 +3528,22 @@ def upscale_directory(
                     on_frame_progress=lambda frac, b=base_done: _update_overall_progress(b + frac),
                     file_entry=cur_entry,
                     batch_files=batch_files,
+                    part_resume_hooks=v_hooks,
                 )
-                if out_p is None or status_msg.lower().startswith("skipped"):
+                if out_p is None and status_msg.startswith("Backed up parts"):
+                    done_ok_count += 1
+                    cur_entry.update({"status": "done", "percent": 100, "outputName": f"{v_path.stem}__upscale_resume"})
+                    results.append({
+                        "name": rel_str,
+                        "source_name": rel_str,
+                        "original_size": orig_size,
+                        "optimized_size": orig_size,
+                        "status": status_msg,
+                        "quality": badge,
+                        "mode": "upscale",
+                        "parts_only": True,
+                    })
+                elif out_p is None or status_msg.lower().startswith("skipped"):
                     skipped_media_count += 1
                     cur_entry.update({"status": "skipped", "percent": 100, "skipReason": status_msg})
                     results.append({

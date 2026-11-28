@@ -418,6 +418,8 @@ def optimize_directory(
     options: dict[str, Any],
     job_state: Any,
     cancel_check: Callable[[], None] | None = None,
+    *,
+    part_resume_factory: Callable[[Path, Path], Any] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Scans the input directory, processes all files, and outputs to the output directory.
@@ -426,13 +428,18 @@ def optimize_directory(
     are grouped by folder with per-folder adaptive quality.
     """
     if options.get("upscale") and not options.get("_use_legacy_ncnn"):
+        import inspect
         from .ai_upscaler import upscale_directory
+        extra_kw: dict[str, Any] = {}
+        if part_resume_factory is not None and "part_resume_factory" in inspect.signature(upscale_directory).parameters:
+            extra_kw["part_resume_factory"] = part_resume_factory
         return upscale_directory(
             input_dir=input_dir,
             output_dir=output_dir,
             options=options,
             job_state=job_state,
             cancel_check=cancel_check,
+            **extra_kw,
         )
 
     all_files = [p for p in input_dir.rglob("*") if p.is_file() and not _is_inside(p, output_dir)]

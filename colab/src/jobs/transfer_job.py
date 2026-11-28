@@ -206,7 +206,7 @@ class _TargetFileChecker:
                             continue
                         is_dir = bool(it.get("type") == "folder" or it.get("is_folder") or it.get("isdir"))
                         if is_dir:
-                            if base_name.lower().endswith("__backup_resume"):
+                            if base_name.lower().endswith(("__backup_resume", "__upscale_resume")):
                                 continue
                             sub_id = str(it.get("id") or it.get("path") or "").strip()
                             if sub_id:
@@ -214,7 +214,7 @@ class _TargetFileChecker:
                                 self._add_sub_id(subfolders_map, _norm_check_name(safe_name(base_name, is_dir=True)), sub_id)
                                 self._add_sub_id(subfolders_map, _norm_check_name(safe_name(base_name)), sub_id)
                         else:
-                            if base_name.lower().endswith("__backup_resume") or base_name.lower().startswith("_resume_manifest"):
+                            if base_name.lower().endswith(("__backup_resume", "__upscale_resume")) or base_name.lower().startswith("_resume_manifest"):
                                 continue
                             files_set.add(_norm_check_name(base_name))
                             files_set.add(_norm_check_name(safe_name(base_name)))
@@ -622,7 +622,7 @@ async def run_transfer(job: JobState) -> None:
             job.save_state()
         has_folder_batch = any((item.get("type") == "folder" or item.get("is_folder")) for item in items)
         has_mixed_source_scope = len({_item_scope(source, item) for item in items}) > 1
-        if options.get("optimize_image") and len(items) > 1:
+        if options.get("optimize_image") and (len(items) > 1 or options.get("upscale")):
             await _run_optimized_batches(job, dirs, source, target, options, src, dst)
             job.log(f"Done: Downloaded {job.files_downloaded}/{job.files_to_download} file(s), Uploaded {job.files_uploaded}/{job.files_to_upload} file(s) (skipped {job.files_skipped} file(s))")
             _log_skip_summary(job)
@@ -1077,15 +1077,73 @@ def _upload_target(folder: dict[str, Any], relative_path: str, options: dict[str
     return {**folder, "relative_path": f"{prefix}/{relative_path}".rstrip("/")}
 
 async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: dict[str, Any], target: dict[str, Any], options: dict[str, Any], src: Any, dst: Any) -> None:
+    import inspect
     from ..utils.image_optimizer import optimize_directory
+    from .upscale_resume_pipeline import (
+        UpscalePartResumeController,
+        assemble_completed_upscale_resume_folder,
+        inspect_upscale_resume_folder_input,
+        is_upscale_resume_folder_name,
+    )
 
+    running_loop = asyncio.get_running_loop()
     action: str | None = None
     candidates: list[dict[str, Any]] = []
+    expanded_parent_folders: list[dict[str, Any]] = []
+
     for item in source.get("items") or []:
         item_ref = _queue_item_ref(source, item)
         item_k = _queue_item_key(source, item)
         item_name_str = _item_name(item)
         item_type = item.get("type") or ("folder" if item.get("is_folder") else "file")
+
+        if _is_item_already_completed(job, source, item):
+            job.log(f"[Resume] Mục đã hoàn tất ở phiên trước, bỏ qua: {item_name_str}")
+            continue
+
+        live_opts = _live_options(job, options)
+        has_explicit_ff = isinstance(live_opts.get("file_filter") or live_opts.get("fileFilter"), dict)
+
+        # In AI Upscale mode, expand regular source folders into individual file candidates so each video
+        # is downloaded, upscaled (with part-resume), uploaded, and cleaned up one by one instead of all at once.
+        if (
+            live_opts.get("upscale")
+            and item_type == "folder"
+            and not is_upscale_resume_folder_name(item_name_str)
+        ):
+            f_prov = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
+            f_src = PROVIDERS.get(f_prov, src)
+            f_creds = item.get("credentials") or source.get("credentials") or {}
+            if hasattr(f_src, "list_files"):
+                raw_fname = str(item.get("name") or item.get("path") or item.get("id") or "folder").replace("\\", "/")
+                f_clean_name = safe_name(PurePosixPath(raw_fname).name or raw_fname, is_dir=True)
+                expanded_children = await _expand_folder_files(f_src, f_creds, item, f_clean_name, job)
+                if expanded_children:
+                    kept_children = 0
+                    force_reopt_f = bool(live_opts.get("force_reoptimize"))
+                    for ch in expanded_children:
+                        ch_name = _item_name(ch)
+                        if is_file_filter_enabled(live_opts) and not should_download_file_item(ch, live_opts):
+                            job.files_skipped += 1
+                            continue
+                        if _is_video_item(ch) and is_upscaled_filename(ch_name) and not force_reopt_f:
+                            job.files_skipped += 1
+                            _record_optimized_skip(job, ch, "Skipped (Already upscaled)")
+                            continue
+                        if not has_explicit_ff and not live_opts.get("extract") and _is_archive_item(ch):
+                            job.files_skipped += 1
+                            continue
+                        ch_enriched = dict(ch)
+                        ch_enriched.setdefault("provider", f_prov)
+                        ch_enriched.setdefault("credentials", f_creds)
+                        ch_enriched["_upscale_expanded_folder_name"] = f_clean_name
+                        candidates.append(ch_enriched)
+                        kept_children += 1
+                    expanded_parent_folders.append(item)
+                    if kept_children == 0:
+                        _finish_items(job, source, [item])
+                    continue
+
         if item_type != "folder" and is_file_filter_enabled(options) and not should_download_file_item(item, options):
             job.files_skipped += 1
             _record_optimized_skip(job, item, "Skipped")
@@ -1100,8 +1158,6 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
             })
             continue
 
-        live_opts = _live_options(job, options)
-        has_explicit_ff = isinstance(live_opts.get("file_filter") or live_opts.get("fileFilter"), dict)
         if item_type != "folder" and _is_video_item(item):
             is_upscale_mode = bool(live_opts.get("upscale"))
             force_reopt = bool(live_opts.get("force_reoptimize"))
@@ -1171,83 +1227,222 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         job.set(status="completed", step="completed")
         return
 
-    groupable = not any((_item_type(item) == "folder") for item in candidates) and len({_item_scope(source, item) for item in candidates}) <= 1
-    groups = _download_batches(candidates, dirs["input"], options, job) if groupable else [[item] for item in candidates]
+    if options.get("upscale"):
+        # Videos, archives, and folders ALWAYS execute 1 item per batch (file-by-file) so completed videos
+        # are uploaded immediately. Images NEVER split into parts; they run full-file (1-by-1 up to 10 images,
+        # or micro-batches of 8 images when >10 to keep Spandrel VRAM weights warm while uploading continuously).
+        total_img_cands = sum(
+            1
+            for c in candidates
+            if _item_type(c) != "folder" and not _is_video_item(c) and not _is_archive_item(c)
+        )
+        img_chunk_cap = 1 if total_img_cands <= 10 else 8
+        groups: list[list[dict[str, Any]]] = []
+        cur_img_group: list[dict[str, Any]] = []
+        cur_img_scope: tuple[str, str] | None = None
+        for cand in candidates:
+            is_solo = (
+                _item_type(cand) == "folder"
+                or _is_video_item(cand)
+                or _is_archive_item(cand)
+                or is_upscale_resume_folder_name(_item_name(cand))
+            )
+            if is_solo:
+                if cur_img_group:
+                    groups.append(cur_img_group)
+                    cur_img_group = []
+                    cur_img_scope = None
+                groups.append([cand])
+            else:
+                sc = _item_scope(source, cand)
+                if cur_img_group and (sc != cur_img_scope or len(cur_img_group) >= img_chunk_cap):
+                    groups.append(cur_img_group)
+                    cur_img_group = []
+                cur_img_group.append(cand)
+                cur_img_scope = sc
+        if cur_img_group:
+            groups.append(cur_img_group)
+    else:
+        groupable = not any((_item_type(item) == "folder") for item in candidates) and len({_item_scope(source, item) for item in candidates}) <= 1
+        groups = _download_batches(candidates, dirs["input"], options, job) if groupable else [[item] for item in candidates]
+
     for index, batch_items in enumerate(groups):
         job.check_cancelled()
         for item in batch_items:
             job.start_item(_queue_item_key(source, item), name=_item_name(item))
         item = batch_items[0]
+        orig_queue_items = list(batch_items)
         item_type = _item_type(item) if len(batch_items) == 1 else "batch"
         batch_input = dirs["input"] / f"batch-{index}"
         batch_output = dirs["output"] / f"batch-{index}" / "optimized"
         batch_input.mkdir(parents=True, exist_ok=True)
         batch_output.mkdir(parents=True, exist_ok=True)
-        job.set(status="running", step="downloading")
-        failed_before = job.files_failed
-        concurrency = int(options.get("download_concurrency") or FOLDER_DOWNLOAD_CONCURRENCY)
-        sem = asyncio.Semaphore(max(1, concurrency))
 
-        async def _download_one_opt(batch_item: dict[str, Any]) -> list[Path]:
-            async with sem:
-                try:
-                    return await _download_batch_item(job, source, src, batch_item, batch_input)
-                except ProviderFailure as exc:
-                    # Retries are already exhausted inside the download; move to the next queue item
-                    # and leave this one in the queue so it can be picked up again later.
-                    if not is_skippable_download_failure(exc):
-                        raise
-                    _mark_item_skipped(job, source, batch_item, exc.message)
-                    return []
+        src_resume_prov: Any = None
+        src_resume_creds: dict[str, Any] = {}
+        src_resume_fid: str | None = None
+        direct_assembled_from_resume = False
+        batch_results: list[dict[str, Any]] = []
 
-        downloaded = []
-        for batch in await asyncio.gather(*(_download_one_opt(batch_item) for batch_item in batch_items)):
-            downloaded.extend(batch)
-        item_failed = job.files_failed > failed_before
-        if item_failed:
-            for batch_item in batch_items:
-                _mark_item_skipped(job, source, batch_item, f"{job.files_failed - failed_before} file(s) unavailable after retries")
-        if not downloaded:
-            job.log(f"No image files found for optimization: {_batch_name(batch_items)}")
-            shutil.rmtree(batch_input, ignore_errors=True)
-            shutil.rmtree(batch_output.parent, ignore_errors=True)
-            if not item_failed:
-                _finish_items(job, source, batch_items)
-            continue
-        _validate_downloads(downloaded, batch_input)
-        job.log(f"Downloaded files: {len(downloaded)}")
-
-        optimize_input = batch_input
-        if options.get("extract"):
-            job.log("Extract enabled: scanning downloaded files for archives...")
-            batch_extract = dirs["output"] / f"batch-{index}" / "extracted"
-            outputs = await extract_archives(batch_input, batch_extract, job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
-            optimize_input = batch_extract
-            job.log(f"Extract stage output files: {len(outputs)}")
-
-        if is_file_filter_enabled(options) and optimize_input.exists():
-            ff_cfg = parse_file_filter(options)
-            if not (options.get("extract") and ff_cfg.categories == ["archive"] and not ff_cfg.formats):
-                for p in list(optimize_input.rglob("*")):
-                    if p.is_file() and not should_download_file_item(p.name, options):
-                        p.unlink(missing_ok=True)
-
-        if is_auto_convert_enabled(_live_options(job, options)):
-            conv_outputs = [p for p in optimize_input.rglob("*") if p.is_file()]
-            conv_root, conv_outputs = await _run_auto_convert_stage(
-                job, optimize_input, dirs["output"] / f"batch-{index}", conv_outputs, options, source, fallback_items=batch_items,
+        # Direct handling when user selects a `*__upscale_resume` folder from Cloud Explorer
+        if options.get("upscale") and len(batch_items) == 1 and is_upscale_resume_folder_name(_item_name(item)):
+            r_prov_name = str(item.get("provider") or (item.get("meta") or {}).get("provider") or source.get("provider") or "").lower()
+            r_src = PROVIDERS.get(r_prov_name, src)
+            r_creds = item.get("credentials") or source.get("credentials") or {}
+            r_fid = str(item.get("id") or item.get("path") or "").strip()
+            if r_fid.startswith("id:"):
+                r_fid = r_fid[3:].strip()
+            inspect_dir = dirs["work"] / f"up_inspect_{index}"
+            manifest_in, orig_src_item, rem_items = await inspect_upscale_resume_folder_input(
+                job, inspect_dir, source, r_src, item
             )
-            if conv_outputs:
-                optimize_input = conv_root
+            shutil.rmtree(inspect_dir, ignore_errors=True)
+            if manifest_in and manifest_in.get("is_complete") and rem_items:
+                job.set(status="running", step="optimizing")
+                job.log(f"[UPSCALE-RESUME] Folder '{_item_name(item)}' đã đủ 100% parts -> Ghép trực tiếp MP4 hoàn chỉnh...")
+                assembled_out = await assemble_completed_upscale_resume_folder(
+                    job, dirs["work"] / f"up_assemble_{index}", batch_output, r_src, r_creds, manifest_in, rem_items, options
+                )
+                shutil.rmtree(dirs["work"] / f"up_assemble_{index}", ignore_errors=True)
+                out_sz = assembled_out.stat().st_size
+                batch_results = [{
+                    "name": assembled_out.name,
+                    "source_name": str(manifest_in.get("source_filename") or assembled_out.name),
+                    "original_size": out_sz,
+                    "optimized_size": out_sz,
+                    "status": f"Upscaled ({manifest_in.get('target_resolution', '1080p')})",
+                    "quality": str(manifest_in.get("selected_model") or "AI"),
+                    "mode": "upscale",
+                }]
+                job.optimized_files.extend(batch_results)
+                direct_assembled_from_resume = True
+                src_resume_prov = r_src
+                src_resume_creds = r_creds
+                src_resume_fid = r_fid
+                item_type = "file"
+            elif manifest_in and isinstance(orig_src_item, dict) and (orig_src_item.get("id") or orig_src_item.get("path")):
+                job.log(
+                    f"[UPSCALE-RESUME] Đọc manifest từ '{_item_name(item)}' -> Tải file gốc '{orig_src_item.get('name')}' để chạy tiếp các part còn thiếu..."
+                )
+                src_resume_prov = r_src
+                src_resume_creds = r_creds
+                src_resume_fid = r_fid
+                restored_src = {**orig_src_item, "credentials": r_creds}
+                batch_items = [restored_src]
+                item = restored_src
+                item_type = "file"
 
-        job.set(step="optimizing")
-        opt_label = "AI upscale" if options.get("upscale") else "image optimization"
-        job.log(f"Starting {opt_label}: {_batch_name(batch_items)}")
-        batch_results = await asyncio.to_thread(
-            optimize_directory, optimize_input, batch_output, options, job,
-            cancel_check=job.check_cancelled,
-        )
-        job.optimized_files.extend(batch_results)
+        item_failed = False
+        optimize_input = batch_input
+        active_resume_controllers: list[UpscalePartResumeController] = []
+
+        if not direct_assembled_from_resume:
+            job.set(status="running", step="downloading")
+            failed_before = job.files_failed
+            concurrency = int(options.get("download_concurrency") or FOLDER_DOWNLOAD_CONCURRENCY)
+            sem = asyncio.Semaphore(max(1, concurrency))
+
+            async def _download_one_opt(batch_item: dict[str, Any]) -> list[Path]:
+                async with sem:
+                    try:
+                        return await _download_batch_item(job, source, src, batch_item, batch_input)
+                    except ProviderFailure as exc:
+                        # Retries are already exhausted inside the download; move to the next queue item
+                        # and leave this one in the queue so it can be picked up again later.
+                        if not is_skippable_download_failure(exc):
+                            raise
+                        _mark_item_skipped(job, source, batch_item, exc.message)
+                        return []
+
+            downloaded = []
+            for batch in await asyncio.gather(*(_download_one_opt(batch_item) for batch_item in batch_items)):
+                downloaded.extend(batch)
+            item_failed = job.files_failed > failed_before
+            if item_failed:
+                for batch_item in orig_queue_items:
+                    _mark_item_skipped(job, source, batch_item, f"{job.files_failed - failed_before} file(s) unavailable after retries")
+            if not downloaded:
+                job.log(f"No media files found for optimization: {_batch_name(orig_queue_items)}")
+                shutil.rmtree(batch_input, ignore_errors=True)
+                shutil.rmtree(batch_output.parent, ignore_errors=True)
+                if not item_failed:
+                    _finish_items(job, source, orig_queue_items)
+                continue
+            _validate_downloads(downloaded, batch_input)
+            job.log(f"Downloaded files: {len(downloaded)}")
+
+            optimize_input = batch_input
+            if options.get("extract"):
+                job.log("Extract enabled: scanning downloaded files for archives...")
+                batch_extract = dirs["output"] / f"batch-{index}" / "extracted"
+                outputs = await extract_archives(batch_input, batch_extract, job, _archive_passwords(options), bool(options.get("deleteArchiveAfterExtract")))
+                optimize_input = batch_extract
+                job.log(f"Extract stage output files: {len(outputs)}")
+
+            if is_file_filter_enabled(options) and optimize_input.exists():
+                ff_cfg = parse_file_filter(options)
+                if not (options.get("extract") and ff_cfg.categories == ["archive"] and not ff_cfg.formats):
+                    for p in list(optimize_input.rglob("*")):
+                        if p.is_file() and not should_download_file_item(p.name, options):
+                            p.unlink(missing_ok=True)
+
+            if is_auto_convert_enabled(_live_options(job, options)):
+                conv_outputs = [p for p in optimize_input.rglob("*") if p.is_file()]
+                conv_root, conv_outputs = await _run_auto_convert_stage(
+                    job, optimize_input, dirs["output"] / f"batch-{index}", conv_outputs, options, source, fallback_items=orig_queue_items,
+                )
+                if conv_outputs:
+                    optimize_input = conv_root
+
+            job.set(step="optimizing")
+            opt_label = "AI upscale" if options.get("upscale") else "image optimization"
+            job.log(f"Starting {opt_label}: {_batch_name(orig_queue_items)}")
+
+            opt_extra_kw: dict[str, Any] = {}
+            if options.get("upscale") and "part_resume_factory" in inspect.signature(optimize_directory).parameters:
+                item_target_pre, item_dst_pre = _item_upload_target(source, target, dst, item)
+
+                def _make_part_resume_hooks(
+                    v_path: Path,
+                    rel_path: Path,
+                    _it_target: dict[str, Any] = item_target_pre,
+                    _it_dst: Any = item_dst_pre,
+                    _item: dict[str, Any] = item,
+                    _idx: int = index,
+                    _s_prov: Any = src_resume_prov,
+                    _s_creds: dict[str, Any] = src_resume_creds,
+                    _s_fid: str | None = src_resume_fid,
+                ) -> UpscalePartResumeController:
+                    src_ref = (getattr(job, "_source_refs", None) or {}).get(str(v_path.resolve())) or _item
+                    rel_parent = rel_path.parent.as_posix()
+                    if rel_parent == ".":
+                        rel_parent = ""
+                    ctrl = UpscalePartResumeController(
+                        loop=running_loop,
+                        job=job,
+                        source=source,
+                        target=_it_target,
+                        options=_live_options(job, options),
+                        dst_provider=_it_dst,
+                        work_root=dirs["work"] / f"up_ctrl_{_idx}_{len(active_resume_controllers)}",
+                        rel_dir_posix=rel_parent,
+                        source_item=src_ref,
+                        src_resume_provider=_s_prov,
+                        src_resume_creds=_s_creds,
+                        src_resume_folder_id=_s_fid,
+                    )
+                    active_resume_controllers.append(ctrl)
+                    return ctrl
+
+                opt_extra_kw["part_resume_factory"] = _make_part_resume_hooks
+
+            batch_results = await asyncio.to_thread(
+                optimize_directory, optimize_input, batch_output, _live_options(job, options), job,
+                cancel_check=job.check_cancelled,
+                **opt_extra_kw,
+            )
+            job.optimized_files.extend(batch_results)
+
         skipped_in_batch = sum(
             1
             for f in (batch_results or [])
@@ -1256,14 +1451,19 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         )
         if skipped_in_batch:
             job.files_skipped += skipped_in_batch
+        parts_only_in_batch = any(bool(f.get("parts_only")) for f in (batch_results or []))
         batch_files = [p for p in batch_output.rglob("*") if p.is_file()]
         has_converted_batch = bool(getattr(job, "converted_files", None))
         if not batch_files:
-            job.log(f"No output files staged after {opt_label}: {_batch_name(batch_items)}")
+            if parts_only_in_batch:
+                job.log(f"[UPSCALE-RESUME] Đã sao lưu đủ 100% parts lên Cloud (Space-Saver): {_batch_name(orig_queue_items)}")
+            else:
+                opt_label_empty = "AI upscale" if options.get("upscale") else "image optimization"
+                job.log(f"No output files staged after {opt_label_empty}: {_batch_name(orig_queue_items)}")
             shutil.rmtree(batch_input, ignore_errors=True)
             shutil.rmtree(batch_output.parent, ignore_errors=True)
             if not item_failed:
-                _finish_items(job, source, batch_items)
+                _finish_items(job, source, orig_queue_items)
             continue
 
         actual_batch_processed = [
@@ -1271,7 +1471,6 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
             if not str(f.get("status") or "").lower().startswith("skip")
         ]
         if (actual_batch_processed or has_converted_batch or batch_files) and action is None:
-            is_opt_page = bool(options.get("is_optimize_page") or (job.payload or {}).get("is_optimize_page") or (job.payload or {}).get("mode") == "optimize" or (job.payload or {}).get("job_type") == "optimize")
             conf_mode = options.get("confirm_action") or options.get("confirmation_mode")
             if conf_mode == "replace":
                 action = "replace"
@@ -1285,11 +1484,17 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         action = action or ("replace" if options.get("replace") else "upload_new")
         options["replace"] = action == "replace"
         options.pop("upload_prefix", None)
+        exp_folder_name = str(item.get("_upscale_expanded_folder_name") or "").strip()
         if action == "upload_new":
-            options["upload_prefix"] = "results" if item_type != "folder" else f"results/{_item_name(item)} (optimized)"
+            if item_type == "folder":
+                options["upload_prefix"] = f"results/{_item_name(item)} (optimized)"
+            elif exp_folder_name:
+                options["upload_prefix"] = f"results/{exp_folder_name} (optimized)"
+            else:
+                options["upload_prefix"] = "results"
 
         upload_root = batch_output
-        if item_type == "folder":
+        if item_type == "folder" or exp_folder_name:
             folder_root = _only_child_dir(batch_output)
             if folder_root:
                 upload_root = folder_root
@@ -1297,10 +1502,33 @@ async def _run_optimized_batches(job: JobState, dirs: dict[str, Path], source: d
         item_target, item_dst = _item_upload_target(source, target, dst, item)
         upload_item = {**item, "_replace_refs": _optimized_replace_refs(job, batch_results, batch_output, upload_root, optimize_input)}
         await _upload_outputs_with_retry(job, item_target, options, item_dst, upload_root, upload_item)
+
+        # Only delete `<stem>__upscale_resume` temporary folders AFTER the final `-upscaled.mp4` is safely uploaded!
+        for ctrl in active_resume_controllers:
+            await ctrl.cleanup_remote_resume_folder()
+        if direct_assembled_from_resume and src_resume_fid and src_resume_prov and bool(options.get("upscale_auto_clean_parts", True)):
+            try:
+                del_src_ref = {
+                    "id": src_resume_fid,
+                    "path": str(orig_queue_items[0].get("path") or _item_name(orig_queue_items[0])),
+                    "name": _item_name(orig_queue_items[0]),
+                    "type": "folder",
+                }
+                if hasattr(src_resume_prov, "delete_item"):
+                    await src_resume_prov.delete_item(src_resume_creds, del_src_ref)
+                elif hasattr(src_resume_prov, "delete_file"):
+                    await src_resume_prov.delete_file(src_resume_creds, del_src_ref)
+                job.log(f"[CLEANUP] Đã dọn folder resume nguồn '{_item_name(orig_queue_items[0])}' sau khi ghép & upload thành công.")
+            except Exception:
+                pass
+
         shutil.rmtree(batch_input, ignore_errors=True)
         shutil.rmtree(batch_output.parent, ignore_errors=True)
         if not item_failed:
-            _finish_items(job, source, [item for item in batch_items if not _item_is_failed(job, source, item)])
+            _finish_items(job, source, [q_it for q_it in orig_queue_items if not _item_is_failed(job, source, q_it)])
+
+    if expanded_parent_folders and not job.failed_items:
+        _finish_items(job, source, expanded_parent_folders)
 
     if not job.optimized_files and not getattr(job, "converted_files", None) and job.files_skipped:
         job.log("No files found for optimization or conversion.")
@@ -2134,11 +2362,18 @@ async def _download_batch_item(job: JobState, source: dict[str, Any], src: Any, 
     item_name = _item_name(item)
     item_size = _item_size(item)
     item_k = _queue_item_key(source, item)
+    dl_dest = batch_input
+    rel_sub = str(item.get("_relative_path") or "").replace("\\", "/").strip("/")
+    if rel_sub and "/" in rel_sub:
+        rel_parts = [p for p in rel_sub.split("/")[:-1] if p and p not in (".", "..")]
+        if rel_parts:
+            dl_dest = batch_input.joinpath(*(safe_name(p, is_dir=True) for p in rel_parts))
+            dl_dest.mkdir(parents=True, exist_ok=True)
     job.start_file(item_name, phase="download", size=item_size, key=item_k)
     job.start_item(item_k, name=item_name)
     try:
         path = await download_with_retry(
-            lambda: item_src.download_file(item_creds, item, batch_input, job),
+            lambda: item_src.download_file(item_creds, item, dl_dest, job),
             progress=job, label=item_name,
         )
         actual_size = path.stat().st_size if (path and path.exists()) else item_size

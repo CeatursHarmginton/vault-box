@@ -66,6 +66,15 @@ class JobState:
     upscale_progress: dict[str, Any] = field(default_factory=dict)
     _last_item_end_time: float | None = field(default=None, compare=False, hash=False)
 
+    def __post_init__(self) -> None:
+        if isinstance(self.payload, dict):
+            pre_comp = self.payload.get("pre_completed_items")
+            if isinstance(pre_comp, list) and pre_comp and not self.completed_items:
+                self.completed_items = [dict(x) for x in pre_comp if isinstance(x, dict)]
+            pre_opt = self.payload.get("pre_optimized_files")
+            if isinstance(pre_opt, list) and pre_opt and not self.optimized_files:
+                self.optimized_files = [dict(x) for x in pre_opt if isinstance(x, dict)]
+
     def set_upscale_progress(self, data: dict[str, Any] | None = None, *, merge: bool = True) -> None:
         if data is None:
             self.upscale_progress = {}
@@ -378,6 +387,10 @@ class JobState:
             ("denoise_strength", "denoiseStrength"),
             ("use_fp16", "useFp16"),
             ("overwrite_output", "overwriteOutput"),
+            ("upscale_strategy", "upscaleStrategy"),
+            ("upscale_part_minutes", "upscalePartMinutes"),
+            ("upscale_resume_check", "upscaleResumeCheck"),
+            ("upscale_auto_clean_parts", "upscaleAutoCleanParts"),
         )
         normalized = dict(new_options)
         for k1, k2 in alias_pairs:

@@ -1415,6 +1415,505 @@ def test_2k_4k_target_resolution_ultrawide_caps_and_auto_model_scaling():
     assert ai_upscaler.resolve_pre_downscale_dims(854, 480, "auto", lambda: (1.10, 0.72, 12.0))[:3] == (854, 480, False)
 
 
+# ============================================================================
+# 5. Resumable Video Part Strategy, Cloud Manifest & Image Full-File Tests
+# ============================================================================
+
+def test_video_upscale_part_plan_and_options_parsing():
+    import re
+    from backend.app.colab.client import ColabJob, ColabManager
+
+    # 1. Verify upscale_resume_pipeline.py is strictly emoji-free
+    resume_src = (COLAB_ROOT / "src" / "jobs" / "upscale_resume_pipeline.py").read_text(encoding="utf-8")
+    emoji_re = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]")
+    assert emoji_re.search(resume_src) is None, "upscale_resume_pipeline.py must not contain any emojis"
+
+    # 2. Options parsing & strategy normalization
+    def_cfg = ai_upscaler.parse_upscale_options({})
+    assert def_cfg["upscale_strategy"] == "part_resume"
+    assert def_cfg["upscale_part_minutes"] == 3.0
+    assert def_cfg["upscale_resume_check"] is True
+    assert def_cfg["upscale_auto_clean_parts"] is True
+
+    custom_cfg = ai_upscaler.parse_upscale_options({
+        "upscaleStrategy": "full_video",
+        "upscalePartMinutes": 4.5,
+        "upscaleResumeCheck": False,
+        "upscaleAutoCleanParts": False,
+    })
+    assert custom_cfg["upscale_strategy"] == "full_video"
+    assert custom_cfg["upscale_part_minutes"] == 4.5
+    assert custom_cfg["upscale_resume_check"] is False
+    assert custom_cfg["upscale_auto_clean_parts"] is False
+
+    assert ai_upscaler.normalize_upscale_strategy("Chia Part để Resume") == "part_resume"
+    assert ai_upscaler.normalize_upscale_strategy("Toàn bộ Video (Full 1 File)") == "full_video"
+    assert ai_upscaler.parse_start_time_seconds("00:02:30") == 150.0
+
+    # 3. JobState pre_completed_items hydration & live option alias sync
+    seeded_job = JobState(
+        "job-seed-1",
+        {
+            "pre_completed_items": [{"id": "done-1", "name": "ep1.mp4"}],
+            "pre_optimized_files": [{"name": "ep1-upscaled.mp4", "status": "Success (Upscaled)"}],
+            "options": {"upscale": True},
+        },
+    )
+    assert len(seeded_job.completed_items) == 1
+    assert seeded_job.completed_items[0]["id"] == "done-1"
+    assert len(seeded_job.optimized_files) == 1
+    seeded_job.update_options({"upscaleStrategy": "full_video", "upscalePartMinutes": 5})
+    assert seeded_job.payload["options"]["upscale_strategy"] == "full_video"
+    assert seeded_job.payload["options"]["upscale_part_minutes"] == 5
+
+    mgr = ColabManager()
+    monkeypatch_save = lambda: None
+    mgr._save_jobs = monkeypatch_save
+    cjob = ColabJob(
+        id="cj-1",
+        mode="optimize",
+        file_id="f1",
+        name="opt",
+        status="running",
+        progress=0.1,
+        downloaded=0,
+        total=0,
+        speed=0,
+        message="running",
+        output_path=None,
+        remote_job_id="server:cj-1",
+        relative_dir=None,
+        drive_output_dir=None,
+        account_id=None,
+        created_at=1000.0,
+        updated_at=1000.0,
+        payload={"options": {"upscale": True}},
+    )
+    mgr.jobs["cj-1"] = cjob
+    asyncio.run(mgr.update_job_options("cj-1", {"upscaleStrategy": "part_resume", "upscalePartMinutes": 2.5}))
+    assert cjob.options["upscale_strategy"] == "part_resume"
+    assert cjob.options["upscale_part_minutes"] == 2.5
+
+    # 4. Frame-exact part plan & <20% tail coalescing
+    # 602 seconds @ 30fps (18060 frames), 3.0-min (180s) parts:
+    # 602s = 180 + 180 + 180 + 62s (62/180 = 34.4% >= 20% -> 4 parts)
+    plan_4 = ai_upscaler.build_upscale_part_plan(18060, 30.0, 3.0, total_dur_sec=602.0)
+    assert len(plan_4) == 4
+    assert [p["part_index"] for p in plan_4] == [1, 2, 3, 4]
+    assert plan_4[0]["start_frame"] == 0 and plan_4[0]["end_frame"] == 5400
+    assert plan_4[1]["start_frame"] == 5400 and plan_4[1]["end_frame"] == 10800
+    assert plan_4[2]["start_frame"] == 10800 and plan_4[2]["end_frame"] == 16200
+    assert plan_4[3]["start_frame"] == 16200 and plan_4[3]["end_frame"] == 18060
+    assert sum(p["frame_count"] for p in plan_4) == 18060
+
+    # 370 seconds @ 30fps (11100 frames), 3.0-min (180s) parts:
+    # 370s = 180 + 180 + 10s (10/180 = 5.5% < 20% -> coalesced into 2 parts!)
+    plan_coalesced = ai_upscaler.build_upscale_part_plan(11100, 30.0, 3.0, total_dur_sec=370.0)
+    assert len(plan_coalesced) == 2
+    assert plan_coalesced[0]["frame_count"] == 5400
+    assert plan_coalesced[1]["start_frame"] == 5400 and plan_coalesced[1]["end_frame"] == 11100
+
+    # 5. Frontend DOM & __upscale_resume candidate checks
+    js = (REPO_ROOT / "frontend" / "static" / "js" / "colab_transfer.js").read_text(encoding="utf-8")
+    for dom_id in (
+        "upscaleStrategyCardWrap",
+        "optUpscalePartConfigBar",
+        "optUpscalePartMinutes",
+        "optUpscalePartPresets",
+        "optUpscaleResumeCheck",
+        "optUpscaleAutoCleanParts",
+        "optResumeJobBtn",
+    ):
+        assert f'id="{dom_id}"' in js, f"Missing UI element {dom_id} in colab_transfer.js"
+
+
+@pytest.mark.skipif(
+    not (shutil.which("ffmpeg") and shutil.which("ffprobe")),
+    reason="ffmpeg and ffprobe required for lossless part concat verification",
+)
+def test_lossless_concat_upscaled_video_parts_exact_frames_and_audio(tmp_path):
+    src_video = tmp_path / "source_3s_audio.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc=size=320x180:rate=30:duration=3",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=3",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "30",
+            "-c:a", "aac", "-b:a", "128k",
+            str(src_video),
+        ],
+        check=True,
+    )
+
+    # Encode 3 standalone 1.0s (30-frame) parts WITH per-part AAC audio (which pads 1024-sample AAC frames)
+    part_paths = []
+    for idx in range(3):
+        p_out = tmp_path / f"part_{idx + 1:04d}.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", f"{idx:.3f}", "-i", str(src_video),
+                "-frames:v", "30",
+                "-vf", "scale=640:360",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-video_track_timescale", "90000",
+                "-c:a", "aac", "-b:a", "128k", "-shortest",
+                str(p_out),
+            ],
+            check=True,
+        )
+        part_paths.append(p_out)
+
+    merged_out = tmp_path / "merged-upscaled.mp4"
+    ai_upscaler.concat_upscaled_video_parts(part_paths, merged_out, audio_source=src_video)
+    assert merged_out.is_file()
+    assert ai_upscaler.is_video_already_optimized(merged_out) is True
+
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-count_frames",
+            "-show_entries", "stream=codec_type,width,height,nb_read_frames:format=duration",
+            "-of", "json", str(merged_out),
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    info = json.loads(probe.stdout)
+    streams = info.get("streams") or []
+    v_stream = next(s for s in streams if s.get("codec_type") == "video")
+    a_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    assert a_stream is not None, "Merged video must retain original continuous audio track"
+    assert (int(v_stream["width"]), int(v_stream["height"])) == (640, 360)
+    assert int(v_stream["nb_read_frames"]) == 90
+    assert abs(float(info["format"]["duration"]) - 3.0) < 0.08
+
+
+@pytest.mark.skipif(
+    not (shutil.which("ffmpeg") and shutil.which("ffprobe")),
+    reason="ffmpeg and ffprobe required for end-to-end resumable upscale test",
+)
+def test_end_to_end_resumable_part_upscale_cloud_manifest_and_image_full_file(tmp_path, monkeypatch):
+    from PIL import Image
+    from src.jobs.transfer_job import PROVIDERS, run_transfer
+    from src.providers.base import BaseProvider
+    import src.jobs.upscale_resume_pipeline as urp_mod
+
+    monkeypatch.setenv("TEMP_DIR", str(tmp_path / "colab_jobs"))
+    cloud_root = tmp_path / "cloud_drive"
+    (cloud_root / "media").mkdir(parents=True, exist_ok=True)
+
+    # Create real 36s @ 5fps (180 frames) 160x90 video with audio + 1 PNG image on Cloud
+    ep1_cloud = cloud_root / "media" / "episode01.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc=size=160x90:rate=5:duration=36",
+            "-f", "lavfi", "-i", "sine=frequency=330:sample_rate=44100:duration=36",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "5",
+            "-c:a", "aac", "-b:a", "96k",
+            str(ep1_cloud),
+        ],
+        check=True,
+    )
+    ep3_cloud = cloud_root / "media" / "episode03.mp4"
+    shutil.copy2(ep1_cloud, ep3_cloud)
+
+    img_cloud = cloud_root / "media" / "poster.png"
+    Image.new("RGB", (120, 120), color=(40, 90, 180)).save(img_cloud)
+
+    class StatefulCloudProvider(BaseProvider):
+        name = "statefulcloud"
+
+        def _resolve(self, ref_or_id) -> Path:
+            if isinstance(ref_or_id, dict):
+                raw = str(ref_or_id.get("path") or ref_or_id.get("id") or "/")
+            else:
+                raw = str(ref_or_id or "/")
+            rel = raw.strip().lstrip("/\\")
+            return (cloud_root / rel) if rel else cloud_root
+
+        async def validate_credentials(self, credentials):
+            return {"ok": True}
+
+        async def list_files(self, credentials, path_or_id):
+            d = self._resolve(path_or_id)
+            if not d.exists() or not d.is_dir():
+                return {"items": []}
+            out = []
+            for child in sorted(d.iterdir()):
+                rel_p = "/" + child.relative_to(cloud_root).as_posix()
+                out.append({
+                    "id": rel_p,
+                    "path": rel_p,
+                    "name": child.name,
+                    "type": "folder" if child.is_dir() else "file",
+                    "is_folder": child.is_dir(),
+                    "size": child.stat().st_size if child.is_file() else 0,
+                })
+            return {"items": out}
+
+        async def download_file(self, credentials, file_ref, local_path, progress):
+            src_p = self._resolve(file_ref)
+            if not src_p.is_file():
+                raise FileNotFoundError(f"Cloud file missing: {src_p}")
+            dest = (local_path / (file_ref.get("name") or src_p.name)) if (local_path.is_dir() or not local_path.suffix) else local_path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_p, dest)
+            progress.add_bytes(dest.stat().st_size, dest.stat().st_size, "download", dest.name)
+            return dest
+
+        async def upload_file(self, credentials, local_path, target_folder, progress):
+            base_d = self._resolve(target_folder)
+            rel = str(target_folder.get("relative_path") or local_path.name).replace("\\", "/").lstrip("/")
+            dest = base_d / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(local_path, dest)
+            progress.add_bytes(dest.stat().st_size, dest.stat().st_size, "upload", dest.name)
+            rel_id = "/" + dest.relative_to(cloud_root).as_posix()
+            return {"id": rel_id, "path": rel_id, "name": dest.name, "size": dest.stat().st_size}
+
+        async def replace_file(self, credentials, local_path, source_ref, progress):
+            old_p = self._resolve(source_ref)
+            new_name = str(source_ref.get("name") or local_path.name)
+            dest = old_p.parent / new_name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if old_p.exists() and old_p != dest:
+                old_p.unlink()
+            shutil.copy2(local_path, dest)
+            progress.add_bytes(dest.stat().st_size, dest.stat().st_size, "upload", dest.name)
+            rel_id = "/" + dest.relative_to(cloud_root).as_posix()
+            return {"id": rel_id, "path": rel_id, "name": dest.name}
+
+        async def delete_item(self, credentials, item_ref):
+            p = self._resolve(item_ref)
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            elif p.exists():
+                p.unlink()
+            return {"ok": True}
+
+        delete_file = delete_item
+
+    cloud_prov = StatefulCloudProvider()
+    monkeypatch.setitem(PROVIDERS, "statefulcloud", cloud_prov)
+    monkeypatch.setitem(urp_mod.PROVIDERS, "statefulcloud", cloud_prov)
+
+    rendered_video_parts: list[tuple[str, int]] = []
+    rendered_full_videos: list[str] = []
+    rendered_images: list[str] = []
+    interrupt_on_part2 = {"active": True}
+
+    # Lightweight CPU stand-in for GPU neural loop that exercises the exact UpscalePartResumeController hooks + FFmpeg slicing & lossless concat
+    def cpu_test_process_single_video(
+        in_path,
+        dest_dir,
+        cfg,
+        v_idx=1,
+        total_videos=1,
+        *,
+        job_state=None,
+        work_dir=None,
+        cancel_check=None,
+        on_frame_progress=None,
+        file_entry=None,
+        batch_files=None,
+        part_resume_hooks=None,
+    ):
+        w, h, fps_str, fps_val, dur, est_frames, _ = ai_upscaler.get_video_metadata(in_path)
+        out_w, out_h = 320, 180
+        dest_dir = Path(dest_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out_filename = ai_upscaler.build_upscaled_video_name(in_path.name)
+        final_output = dest_dir / out_filename
+        use_parts = bool(part_resume_hooks is not None and cfg.get("upscale_strategy") == "part_resume")
+        if not use_parts:
+            rendered_full_videos.append(in_path.name)
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", str(in_path), "-vf", f"scale={out_w}:{out_h}",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                    "-c:a", "copy",
+                    *ai_upscaler.embed_video_optimization_metadata_args(),
+                    str(final_output),
+                ],
+                check=True,
+            )
+            return final_output, "Success (Upscaled)", "1080p · 2xLiveActionV1_SPAN"
+
+        plan_state = part_resume_hooks.prepare_plan(
+            cur_input=in_path,
+            out_filename=out_filename,
+            orig_in_w=w,
+            orig_in_h=h,
+            in_w=w,
+            in_h=h,
+            did_pre_downscale=False,
+            selected_model="2xLiveActionV1_SPAN",
+            eff_denoise=0.4,
+            target_resolution=cfg["target_resolution"],
+            fps_str=fps_str,
+            fps_val=fps_val,
+            base_start_sec=0.0,
+            eff_dur=dur,
+            est_frames=est_frames or 0,
+            cfg=cfg,
+        )
+        parts_plan = plan_state["parts_plan"]
+        remaining = plan_state["remaining_parts"]
+        parts_dir = Path(plan_state["parts_local_dir"])
+        parts_dir.mkdir(parents=True, exist_ok=True)
+
+        for p_spec in remaining:
+            p_idx = int(p_spec["part_index"])
+            if interrupt_on_part2["active"] and p_idx == 2:
+                # Wait for Part 1 async Cloud upload + manifest write to finish before simulating disconnect
+                for fut in list(part_resume_hooks._upload_futures):
+                    fut.result()
+                raise RuntimeError("Simulated Colab runtime disconnect during Part 2")
+            rendered_video_parts.append((in_path.name, p_idx))
+            p_file = parts_dir / f"part_{p_idx:04d}.mp4"
+            cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", f"{p_spec['start_sec']:.6f}",
+                "-i", str(in_path),
+            ]
+            if not p_spec.get("is_last"):
+                cmd += ["-frames:v", str(p_spec["frame_count"])]
+            cmd += [
+                "-vf", f"scale={out_w}:{out_h}",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                "-video_track_timescale", "90000",
+                "-c:a", "aac", "-b:a", "96k", "-shortest",
+                str(p_file),
+            ]
+            subprocess.run(cmd, check=True)
+            part_resume_hooks.on_part_completed(p_file, p_spec, int(p_spec["frame_count"]))
+
+        final_parts, _ = part_resume_hooks.finalize_parts()
+        ai_upscaler.concat_upscaled_video_parts(final_parts, final_output, audio_source=in_path, work_dir=work_dir or dest_dir)
+        part_resume_hooks.cleanup_local_workspace()
+        return final_output, "Success (Upscaled)", f"1080p · 2xLiveActionV1_SPAN · {len(parts_plan)} parts"
+
+    def cpu_test_process_single_image(in_path, dest_dir, cfg, i_idx=1, total_images=1, *, model_cache=None, job_state=None, cancel_check=None):
+        rendered_images.append(in_path.name)
+        dest_dir = Path(dest_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out_p = dest_dir / in_path.name
+        with Image.open(in_path) as im:
+            im.resize((240, 240)).save(out_p)
+        return out_p, "Success (Upscaled)", "1080p · 2xLiveActionV1_SPAN"
+
+    monkeypatch.setattr(ai_upscaler, "process_single_video", cpu_test_process_single_video)
+    monkeypatch.setattr(ai_upscaler, "process_single_image", cpu_test_process_single_image)
+
+    base_items = [
+        {"id": "/media/poster.png", "path": "/media/poster.png", "name": "poster.png", "type": "file", "size": img_cloud.stat().st_size},
+        {"id": "/media/episode01.mp4", "path": "/media/episode01.mp4", "name": "episode01.mp4", "type": "file", "size": ep1_cloud.stat().st_size},
+    ]
+    base_options = {
+        "is_optimize_page": True,
+        "optimize_image": True,
+        "upscale": True,
+        "target_resolution": "1080p",
+        "upscale_strategy": "part_resume",
+        "upscale_part_minutes": 0.25,  # 15s per part -> 3 parts for 36s video (75f + 75f + 30f)
+        "upscale_resume_check": True,
+        "upscale_auto_clean_parts": True,
+        "confirm_action": "upload_new",
+        "_auto_confirm_upload_new": True,
+        "file_filter": {"enabled": True, "mode": "include", "categories": ["video", "image"], "formats": []},
+        "cleanupAfterFinish": False,
+    }
+
+    # --- RUN 1: poster.png finishes full-file & uploads immediately; episode01.mp4 finishes Part 1 -> disconnects on Part 2 ---
+    job_run1 = JobState(
+        "job-part-resume-1",
+        {
+            "mode": "optimize",
+            "is_optimize_page": True,
+            "source": {"provider": "statefulcloud", "credentials": {"ok": True}, "items": list(base_items)},
+            "target": {"provider": "statefulcloud", "credentials": {"ok": True}, "folder": {"id": "/media", "path": "/media"}},
+            "options": dict(base_options),
+        },
+    )
+    asyncio.run(run_transfer(job_run1))
+    assert job_run1.status == "failed"
+    assert rendered_images == ["poster.png"]
+    assert (cloud_root / "media" / "results" / "poster.png").is_file(), "Completed image must be uploaded file-by-file before video fails"
+    assert not (cloud_root / "media" / "poster__upscale_resume").exists(), "Images must NEVER create __upscale_resume folders"
+
+    resume_dir = cloud_root / "media" / "episode01__upscale_resume"
+    assert resume_dir.is_dir(), "Video part_resume must create <stem>__upscale_resume on Cloud"
+    assert (resume_dir / "part_0001.mp4").is_file()
+    assert (resume_dir / "_resume_manifest.json").is_file()
+    manifest_run1 = json.loads((resume_dir / "_resume_manifest.json").read_text(encoding="utf-8"))
+    assert manifest_run1["total_parts"] == 3
+    assert [cp["part_index"] for cp in manifest_run1["completed_parts"]] == [1]
+    assert rendered_video_parts == [("episode01.mp4", 1)]
+
+    # --- RUN 2 (RESUME): Skips poster.png (pre_completed_items) AND skips Part 1 (from Cloud manifest), renders ONLY Parts 2 & 3 ---
+    interrupt_on_part2["active"] = False
+    rendered_video_parts.clear()
+    rendered_images.clear()
+
+    job_run2 = JobState(
+        "job-part-resume-2",
+        {
+            "mode": "optimize",
+            "is_optimize_page": True,
+            "pre_completed_items": list(job_run1.completed_items),
+            "pre_optimized_files": list(job_run1.optimized_files),
+            "source": {"provider": "statefulcloud", "credentials": {"ok": True}, "items": list(base_items)},
+            "target": {"provider": "statefulcloud", "credentials": {"ok": True}, "folder": {"id": "/media", "path": "/media"}},
+            "options": dict(base_options),
+        },
+    )
+    asyncio.run(run_transfer(job_run2))
+    assert job_run2.status == "completed"
+    assert rendered_images == [], "Already-completed poster.png must not be re-processed on job resume"
+    assert rendered_video_parts == [("episode01.mp4", 2), ("episode01.mp4", 3)], "Part 1 must be reused from Cloud without re-upscaling!"
+
+    final_ep1 = cloud_root / "media" / "results" / "episode01-upscaled.mp4"
+    assert final_ep1.is_file()
+    assert not resume_dir.exists(), "Temporary episode01__upscale_resume folder must be auto-cleaned after final upload"
+
+    # Verify assembled episode01-upscaled.mp4 has exact 180 frames + audio + VaultBox_Optimized tag
+    probe_ep1 = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-count_frames",
+            "-show_entries", "stream=codec_type,nb_read_frames",
+            "-of", "json", str(final_ep1),
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    ep1_streams = json.loads(probe_ep1.stdout)["streams"]
+    v_ep1 = next(s for s in ep1_streams if s["codec_type"] == "video")
+    assert int(v_ep1["nb_read_frames"]) == 180
+    assert any(s["codec_type"] == "audio" for s in ep1_streams)
+    assert ai_upscaler.is_video_already_optimized(final_ep1) is True
+
+    # --- RUN 3: Strategy "full_video" processes video in 1 full pass with zero __upscale_resume folder ---
+    job_full = JobState(
+        "job-full-video-3",
+        {
+            "mode": "optimize",
+            "is_optimize_page": True,
+            "source": {
+                "provider": "statefulcloud",
+                "credentials": {"ok": True},
+                "items": [{"id": "/media/episode03.mp4", "path": "/media/episode03.mp4", "name": "episode03.mp4", "type": "file", "size": ep3_cloud.stat().st_size}],
+            },
+            "target": {"provider": "statefulcloud", "credentials": {"ok": True}, "folder": {"id": "/media", "path": "/media"}},
+            "options": {**base_options, "upscale_strategy": "full_video"},
+        },
+    )
+    asyncio.run(run_transfer(job_full))
+    assert job_full.status == "completed"
+    assert rendered_full_videos == ["episode03.mp4"]
+    assert (cloud_root / "media" / "results" / "episode03-upscaled.mp4").is_file()
+    assert not (cloud_root / "media" / "episode03__upscale_resume").exists()
+
+
+
 
 
 
