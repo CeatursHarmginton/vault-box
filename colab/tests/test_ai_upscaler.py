@@ -1428,24 +1428,25 @@ def test_video_upscale_part_plan_and_options_parsing():
     emoji_re = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]")
     assert emoji_re.search(resume_src) is None, "upscale_resume_pipeline.py must not contain any emojis"
 
-    # 2. Options parsing & strategy normalization
+    # 2. Options parsing & strategy normalization (default is full_video / file-by-file)
     def_cfg = ai_upscaler.parse_upscale_options({})
-    assert def_cfg["upscale_strategy"] == "part_resume"
+    assert def_cfg["upscale_strategy"] == "full_video"
     assert def_cfg["upscale_part_minutes"] == 3.0
     assert def_cfg["upscale_resume_check"] is True
     assert def_cfg["upscale_auto_clean_parts"] is True
 
     custom_cfg = ai_upscaler.parse_upscale_options({
-        "upscaleStrategy": "full_video",
+        "upscaleStrategy": "part_resume",
         "upscalePartMinutes": 4.5,
         "upscaleResumeCheck": False,
         "upscaleAutoCleanParts": False,
     })
-    assert custom_cfg["upscale_strategy"] == "full_video"
+    assert custom_cfg["upscale_strategy"] == "part_resume"
     assert custom_cfg["upscale_part_minutes"] == 4.5
     assert custom_cfg["upscale_resume_check"] is False
     assert custom_cfg["upscale_auto_clean_parts"] is False
 
+    assert ai_upscaler.normalize_upscale_strategy("") == "full_video"
     assert ai_upscaler.normalize_upscale_strategy("Chia Part để Resume") == "part_resume"
     assert ai_upscaler.normalize_upscale_strategy("Toàn bộ Video (Full 1 File)") == "full_video"
     assert ai_upscaler.parse_start_time_seconds("00:02:30") == 150.0

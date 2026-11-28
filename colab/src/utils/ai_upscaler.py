@@ -1500,7 +1500,7 @@ def parse_upscale_options(options: dict[str, Any] | None) -> dict[str, Any]:
         opts.get("upscale_strategy")
         or opts.get("upscaleStrategy")
         or opts.get("video_upscale_strategy")
-        or "part_resume"
+        or "full_video"
     )
     upscale_strategy = normalize_upscale_strategy(raw_strategy)
     part_minutes = _float("upscale_part_minutes", "upscalePartMinutes", 3.0, 0.25, 120.0)
@@ -1532,11 +1532,11 @@ def parse_upscale_options(options: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-UPSCALE_STRATEGY_OPTIONS = ("part_resume", "full_video")
+UPSCALE_STRATEGY_OPTIONS = ("full_video", "part_resume")
 
 
 def normalize_upscale_strategy(raw: Any) -> str:
-    """Normalize video upscale execution strategy to 'part_resume' or 'full_video'."""
+    """Normalize video upscale execution strategy to 'full_video' (default) or 'part_resume'."""
     low = str(raw or "").strip().lower()
     if low in ("full", "full_video", "full_file", "file_by_file", "single", "off", "none"):
         return "full_video"
@@ -1544,9 +1544,9 @@ def normalize_upscale_strategy(raw: Any) -> str:
         return "part_resume"
     if "part" in low or "chia" in low or "resume" in low:
         return "part_resume"
-    if "full" in low or "toàn bộ" in low or "toan bo" in low or "1 file" in low:
+    if "full" in low or "toàn bộ" in low or "toan bo" in low or "1 file" in low or "file-by-file" in low:
         return "full_video"
-    return "part_resume"
+    return "full_video"
 
 
 def parse_start_time_seconds(start_time: str) -> float:
