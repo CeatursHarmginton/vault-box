@@ -71,9 +71,17 @@ def test_choose_auto_model_heuristics():
     assert dn == 0.35
     assert "4x" in reason
 
-    # 2. Very low-res 360p -> 1080p on A100 (or short <= 1500 frames) -> 4xNomos8kSC
-    key_big, _, _ = ai_upscaler.choose_auto_model(640, 360, "1080p", 3000, 0.08, "NVIDIA A100", 0.4)
-    assert key_big == "4xNomos8kSC"
+    # 2. Still image (est_frames=1) at >=2.6x -> 4xNomos8kSC; ALL videos (even short 436-frame clips on T4 or A100)
+    #    MUST pick temporally stable & fast realesr-general-x4v3 instead of ~1 FPS Swin-UNet 4xNomos8kSC!
+    key_img, _, _ = ai_upscaler.choose_auto_model(640, 360, "1080p", 1, 0.08, "Tesla T4", 0.4)
+    assert key_img == "4xNomos8kSC"
+    key_a100_vid, _, _ = ai_upscaler.choose_auto_model(640, 360, "1080p", 500, 0.08, "NVIDIA A100", 0.4)
+    assert key_a100_vid == "realesr-general-x4v3"
+    key_t4_short, dn_t4_short, _ = ai_upscaler.choose_auto_model(
+        640, 360, "1080p", 436, 0.08, "Tesla T4", 0.4, is_restoration=True
+    )
+    assert key_t4_short == "realesr-general-x4v3"
+    assert dn_t4_short >= 0.55
 
     # 3. Very long video (>90000 frames on T4) -> 2xNomosUni_compact_otf_medium
     key_long, _, _ = ai_upscaler.choose_auto_model(1280, 720, "1080p", 95000, 0.09, "Tesla T4", 0.4)
@@ -1064,7 +1072,7 @@ def test_tpu_v5e_detection_analytical_batch_notebook_syntax_and_ui_badges(monkey
     assert b_manual == 12
 
     chosen_tpu, _, _ = ai_upscaler.choose_auto_model(640, 360, "1080p", 2400, 0.05, "TPU v5e-1", 0.4)
-    assert chosen_tpu == "4xNomos8kSC"
+    assert chosen_tpu == "realesr-general-x4v3"
 
     # 4. Verify Frontend TPU server badges & live XLA telemetry rendering
     colab_js = (REPO_ROOT / "frontend" / "static" / "js" / "colab_transfer.js").read_text(encoding="utf-8")
@@ -1363,11 +1371,11 @@ def test_2k_4k_target_resolution_ultrawide_caps_and_auto_model_scaling():
     m_720_to_2k, _, _ = ai_upscaler.choose_auto_model(1280, 720, "1440p (2K)", 1800, 0.10, "Tesla T4", 0.4)
     assert m_720_to_2k == "2xLiveActionV1_SPAN"
 
-    # 720p -> 4K (3.0x): picks compact 4x on T4 to avoid 5K heavy-model VRAM pressure, and 4xNomos8kSC on A100
+    # 720p -> 4K (3.0x): picks fast compact 4x on video for both T4 and A100, and 4xNomos8kSC on single photo (est_frames=1)
     m_720_to_4k_t4, _, _ = ai_upscaler.choose_auto_model(1280, 720, "2160p (4K)", 600, 0.10, "Tesla T4", 0.4)
-    m_720_to_4k_a100, _, _ = ai_upscaler.choose_auto_model(1280, 720, "2160p (4K)", 600, 0.10, "NVIDIA A100", 0.4)
+    m_720_to_4k_photo, _, _ = ai_upscaler.choose_auto_model(1280, 720, "2160p (4K)", 1, 0.10, "Tesla T4", 0.4)
     assert m_720_to_4k_t4 == "realesr-general-x4v3"
-    assert m_720_to_4k_a100 == "4xNomos8kSC"
+    assert m_720_to_4k_photo == "4xNomos8kSC"
 
     # 5. Proportional Fake-2K and Fake-4K pre-downscale
     assert ai_upscaler.resolve_pre_downscale_dims(2560, 1440, "auto", lambda: (0.65, 0.52, 10.0))[:3] == (1280, 720, True)
@@ -1380,6 +1388,32 @@ def test_2k_4k_target_resolution_ultrawide_caps_and_auto_model_scaling():
     b_tpu_5k_compact = ai_upscaler._calibrate_tpu_batch(1280, 720, 4, "realesr-general-x4v3", 80, 0, hbm_16gb)
     assert 1 <= b_tpu_4k_span <= 4
     assert 1 <= b_tpu_5k_compact <= 2
+
+    # 7. Ultrawide 21:9 1920x800 -> 2160p (4K = 3840x1600, true scale 2.0x) MUST pick 2x SPAN, NOT 4x!
+    m_uw_4k, _, _ = ai_upscaler.choose_auto_model(1920, 800, "2160p (4K)", 2000, 0.10, "Tesla T4", 0.4)
+    assert m_uw_4k == "2xLiveActionV1_SPAN"
+
+    # 8. Long Full-HD 1080p -> 4K (>18000 frames on slow T4) picks fast Compact 2x to prevent Colab timeout
+    m_fhd_long, _, _ = ai_upscaler.choose_auto_model(1920, 1080, "2160p (4K)", 25000, 0.10, "Tesla T4", 0.4)
+    assert m_fhd_long == "2xNomosUni_compact_otf_medium"
+
+    # 9. Codec efficiency factor & optical softness model selection + Fake-480p pre-downscale
+    assert ai_upscaler.codec_bpp_efficiency_factor("av1") > 1.5
+    assert ai_upscaler.codec_bpp_efficiency_factor("hevc") > 1.3
+    assert ai_upscaler.codec_bpp_efficiency_factor("mpeg4") < 0.75
+    assert ai_upscaler.codec_bpp_efficiency_factor("h264") == 1.0
+
+    # Optically soft 720p (HF=0.81 < 0.86, even with high BPP=0.12) selects 2xNomosUni_span_multijpg_ldl
+    m_soft_2x, _, _ = ai_upscaler.choose_auto_model(
+        1280, 720, "1080p", 2000, 0.12, "Tesla T4", 0.4, sharpness_metrics=(0.81, 0.62, 10.0)
+    )
+    assert m_soft_2x == "2xNomosUni_span_multijpg_ldl"
+
+    # Fake-480p (240p stretched to 854x480: descale=0.50 < 0.55, HF=0.68 < 0.76) shrinks to 480x270
+    assert ai_upscaler.resolve_pre_downscale_dims(854, 480, "auto", lambda: (0.68, 0.50, 10.0))[:3] == (480, 270, True)
+    # True 480p (descale=0.72, HF=1.10) stays 854x480
+    assert ai_upscaler.resolve_pre_downscale_dims(854, 480, "auto", lambda: (1.10, 0.72, 12.0))[:3] == (854, 480, False)
+
 
 
 

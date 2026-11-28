@@ -516,8 +516,8 @@ def compute_scaled_even_dims(in_w: int, in_h: int, target_short: int) -> tuple[i
     long_side = max(1, in_w if is_landscape else in_h)
     t_short = max(2, (int(target_short) // 2) * 2)
     aspect = long_side / short_side
-    if abs(aspect - (16.0 / 9.0)) < 0.025 and t_short in (360, 480, 540, 720, 1080, 1440, 2160):
-        std_map = {360: 640, 480: 854, 540: 960, 720: 1280, 1080: 1920, 1440: 2560, 2160: 3840}
+    if abs(aspect - (16.0 / 9.0)) < 0.025 and t_short in (270, 360, 480, 540, 720, 1080, 1440, 2160):
+        std_map = {270: 480, 360: 640, 480: 854, 540: 960, 720: 1280, 1080: 1920, 1440: 2560, 2160: 3840}
         t_long = std_map[t_short]
     else:
         t_long = max(2, int(round((t_short * aspect) / 2.0) * 2))
@@ -692,12 +692,15 @@ def resolve_pre_downscale_dims(
             return ew, eh, True, f"Thu nhỏ 50% ({in_w}x{in_h} -> {ew}x{eh}) để co gọn viền mờ trước khi AI tái tạo"
         return in_w, in_h, False, ""
 
-    # Auto mode: inspect optical sharpness only when container short side >= 540p (HD/FHD candidates)
-    if in_short >= 540 and metrics_probe_fn is not None:
+    # Auto mode: inspect optical sharpness when container short side >= 460p (catches Fake-480p as well as Fake-720p/1080p/2K/4K)
+    if in_short >= 460 and metrics_probe_fn is not None:
         hf_ratio, descale_ratio, g_mean = metrics_probe_fn()
-        is_fake_hd = g_mean >= 1.5 and (
-            descale_ratio < 0.585 or (hf_ratio < 0.80 and descale_ratio < 0.61)
-        )
+        if in_short < 540:
+            is_fake_hd = g_mean >= 1.5 and descale_ratio < 0.55 and hf_ratio < 0.76
+        else:
+            is_fake_hd = g_mean >= 1.5 and (
+                descale_ratio < 0.585 or (hf_ratio < 0.80 and descale_ratio < 0.61)
+            )
         if is_fake_hd:
             if in_short >= 1800:
                 est_short = 720 if (descale_ratio < 0.48 or hf_ratio < 0.56) else 1080
@@ -705,8 +708,10 @@ def resolve_pre_downscale_dims(
                 est_short = 480 if (descale_ratio < 0.48 or hf_ratio < 0.56) else 720
             elif in_short >= 900:
                 est_short = 360 if (descale_ratio < 0.48 or hf_ratio < 0.56) else 480
-            else:
+            elif in_short >= 540:
                 est_short = 360
+            else:
+                est_short = 270
             ew, eh = compute_scaled_even_dims(in_w, in_h, est_short)
             if min(ew, eh) < in_short:
                 return (
@@ -982,11 +987,30 @@ def _get_cached_tpu_model(
     return descriptor
 
 
+_LEGACY_INEFFICIENT_CODECS = {
+    "mpeg4", "msmpeg4v3", "msmpeg4v2", "msmpeg4v1",
+    "wmv3", "wmv2", "wmv1", "flv1", "vp6f", "vp6", "vp8",
+    "mpeg2video", "mpeg1video", "h263", "h263p", "theora", "Cinepak",
+}
+
+
+def codec_bpp_efficiency_factor(codec_name: str) -> float:
+    """Normalize raw container BPP into H.264-equivalent quality units across modern (AV1/HEVC/VP9) and legacy codecs."""
+    c = str(codec_name or "").strip().lower()
+    if c == "av1":
+        return 1.85
+    if c in ("hevc", "h265", "vp9"):
+        return 1.45
+    if c in _LEGACY_INEFFICIENT_CODECS:
+        return 0.65
+    return 1.0
+
+
 def get_video_metadata(video_path: Path) -> tuple[int, int, str, float, float, int, float]:
     probe_cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate,nb_frames,duration,bit_rate,tags:stream_side_data=rotation:format=duration,bit_rate",
+        "-show_entries", "stream=codec_name,width,height,avg_frame_rate,r_frame_rate,nb_frames,duration,bit_rate,tags:stream_side_data=rotation:format=duration,bit_rate",
         "-of", "json",
         str(video_path),
     ]
@@ -1044,7 +1068,15 @@ def get_video_metadata(video_path: Path) -> tuple[int, int, str, float, float, i
     if v_bitrate <= 0:
         fmt_br = int(info.get("format", {}).get("bit_rate") or 0)
         v_bitrate = max(0, fmt_br - 128_000) if fmt_br > 160_000 else fmt_br
-    bpp = (v_bitrate / (w * h * fps_val)) if (v_bitrate > 0 and w * h * fps_val > 0) else 0.1
+    if v_bitrate <= 0 and duration > 0 and video_path.is_file():
+        try:
+            file_br = int((video_path.stat().st_size * 8.0) / duration)
+            v_bitrate = max(0, file_br - 128_000) if file_br > 160_000 else file_br
+        except OSError:
+            pass
+    codec_factor = codec_bpp_efficiency_factor(str(st.get("codec_name") or ""))
+    raw_bpp = (v_bitrate / (w * h * fps_val)) if (v_bitrate > 0 and w * h * fps_val > 0) else 0.1
+    bpp = raw_bpp * codec_factor
 
     return w, h, fps_str, fps_val, duration, nb_frames, bpp
 
@@ -1059,35 +1091,54 @@ def choose_auto_model(
     default_dn: float,
     *,
     is_restoration: bool = False,
+    sharpness_metrics: tuple[float, float, float] | None = None,
 ) -> tuple[str, float, str]:
     in_short = min(in_w, in_h)
     t_short = target_short_pixels(res_choice)
-    scale_needed = (float(t_short) / max(1, in_short)) if t_short is not None else 2.0
+    if t_short is not None:
+        est_out_w, est_out_h = compute_target_dims(in_w, in_h, 2, res_choice)
+        scale_needed = max(est_out_w / max(1, in_w), est_out_h / max(1, in_h))
+    else:
+        scale_needed = 2.0
 
     upper_dev = gpu_name.upper()
     fast_gpu = any(tag in upper_dev for tag in ("A100", "L4", "V100", "H100", "4090", "3090"))
-    is_tpu = "TPU" in upper_dev
     frames = est_frames if est_frames else 1800
+    is_optically_soft = bool(
+        sharpness_metrics is not None
+        and sharpness_metrics[2] >= 1.5
+        and sharpness_metrics[0] < 0.86
+    )
 
     if scale_needed >= 2.6:
-        if (frames <= 1500 and in_short < 720) or fast_gpu or (is_tpu and frames <= 3000 and in_short < 720):
+        # `4xNomos8kSC` (18.5M Swin-Conv-UNet) is ideal for single still photos (`est_frames == 1`),
+        # whereas for video (`est_frames != 1`) `realesr-general-x4v3` (pure shift-equivariant CNN)
+        # avoids window-attention temporal shimmer and runs 35-50x faster (~40 FPS on T4).
+        if est_frames == 1:
             return (
                 "4xNomos8kSC",
                 default_dn,
-                f"Cần phóng lớn {scale_needed:.1f}x ({in_short}p → {res_choice}) & thời lượng vừa phải ({frames} frames) → ưu tiên mạng lớn 4x chất lượng cao",
+                f"Ảnh tĩnh cần phóng lớn {scale_needed:.1f}x ({in_short}p → {res_choice}) → dùng mạng 4x Swin-UNet chi tiết cao",
             )
-        auto_dn = max(default_dn, 0.55) if is_restoration else (0.55 if (0 < bpp < 0.075) else 0.35)
+        if is_restoration or (0 < bpp < 0.045):
+            auto_dn = max(default_dn, 0.60 if (0 < bpp < 0.045) else 0.55)
+        elif 0 < bpp < 0.075:
+            auto_dn = 0.55
+        elif is_optically_soft:
+            auto_dn = 0.50
+        else:
+            auto_dn = 0.35
         return (
             "realesr-general-x4v3",
             auto_dn,
-            f"Cần phóng lớn {scale_needed:.1f}x trên video dài ({frames} frames) → dùng Compact 4x tốc độ cao (denoise={auto_dn:.2f})",
+            f"Cần phóng lớn {scale_needed:.1f}x ({in_short}p → {res_choice}) → dùng Compact 4x tốc độ cao + khử nhiễu thích ứng (denoise={auto_dn:.2f})",
         )
 
-    if frames > 90000 and not fast_gpu:
+    if not fast_gpu and (frames > 90000 or (in_w * in_h >= 1920 * 1000 and frames > 18000)):
         return (
             "2xNomosUni_compact_otf_medium",
             default_dn,
-            f"Video rất dài ({frames} frames) phóng {scale_needed:.1f}x → dùng Compact 2x tốc độ cao để kịp thời gian Colab",
+            f"Video tải nặng ({in_w}x{in_h}, {frames} frames) phóng {scale_needed:.1f}x → dùng Compact 2x siêu tốc để kịp thời gian Colab",
         )
 
     if is_restoration:
@@ -1101,13 +1152,20 @@ def choose_auto_model(
         return (
             "2xNomosUni_span_multijpg_ldl",
             default_dn,
-            f"Phát hiện bitrate thấp / nén mạnh (BPP={bpp:.3f}) phóng {scale_needed:.1f}x → dùng SPAN 2x chuyên khử hạt nén & giữ xóa phông",
+            f"Phát hiện bitrate thấp / nén mạnh (BPP hiệu dụng={bpp:.3f}) phóng {scale_needed:.1f}x → dùng SPAN 2x LDL chuyên khử hạt nén",
+        )
+
+    if is_optically_soft:
+        return (
+            "2xNomosUni_span_multijpg_ldl",
+            default_dn,
+            f"Phát hiện viền hình mềm / hơi mờ (HF={sharpness_metrics[0]:.2f}) phóng {scale_needed:.1f}x → dùng SPAN 2x LDL tái tạo nét",
         )
 
     return (
         "2xLiveActionV1_SPAN",
         default_dn,
-        f"Phóng {scale_needed:.1f}x ({in_short}p → {res_choice}, BPP={bpp:.3f}) → dùng SPAN 2x chuyên người thật cân bằng nhất giữa tốc độ & vân da tự nhiên",
+        f"Nguồn sạch & nét (BPP={bpp:.3f}) phóng {scale_needed:.1f}x ({in_short}p → {res_choice}) → dùng SPAN 2x giữ vân da & hạt phim tự nhiên",
     )
 
 
@@ -1502,18 +1560,26 @@ def process_single_video(
     target_resolution = cfg["target_resolution"]
     pre_downscale_mode = cfg["pre_downscale_mode"]
 
+    cached_sharpness: tuple[float, float, float] | None = None
+
+    def _get_sharpness_once() -> tuple[float, float, float]:
+        nonlocal cached_sharpness
+        if cached_sharpness is None:
+            cached_sharpness = probe_video_sharpness_metrics(
+                cur_input,
+                orig_in_w,
+                orig_in_h,
+                total_dur,
+                cfg["start_time"],
+                cfg["preview_seconds"],
+            )
+        return cached_sharpness
+
     eff_in_w, eff_in_h, did_pre_downscale, restore_reason = resolve_pre_downscale_dims(
         orig_in_w,
         orig_in_h,
         pre_downscale_mode,
-        metrics_probe_fn=lambda: probe_video_sharpness_metrics(
-            cur_input,
-            orig_in_w,
-            orig_in_h,
-            total_dur,
-            cfg["start_time"],
-            cfg["preview_seconds"],
-        ),
+        metrics_probe_fn=_get_sharpness_once,
     )
 
     if not did_pre_downscale and is_already_at_or_above_target(orig_in_w, orig_in_h, target_resolution):
@@ -1592,6 +1658,7 @@ def process_single_video(
     auto_reason = None
     norm_preset = normalize_model_preset_key(model_preset)
     if norm_preset == "auto":
+        src_sharpness = None if did_pre_downscale else _get_sharpness_once()
         selected_model, eff_denoise, auto_reason = choose_auto_model(
             in_w,
             in_h,
@@ -1601,7 +1668,10 @@ def process_single_video(
             gpu_name_str,
             denoise_strength,
             is_restoration=did_pre_downscale,
+            sharpness_metrics=src_sharpness,
         )
+        if auto_reason:
+            log_fn(f"[MODEL] Auto chọn {selected_model} | {auto_reason}")
     else:
         selected_model = norm_preset
 
@@ -1671,7 +1741,9 @@ def process_single_video(
     out_w, out_h = compute_target_dims(in_w, in_h, model.scale, target_resolution)
 
     use_channels_last = False
-    if has_cuda and model_dtype == torch.float16:
+    # Skip NHWC `channels_last` on Swin-Conv-UNet (`4xNomos8kSC`), whose internal `einops.rearrange`
+    # window-attention blocks force repeated NHWC <-> NCHW contiguous copies on every layer.
+    if has_cuda and model_dtype == torch.float16 and "Nomos8kSC" not in selected_model:
         try:
             model.model.to(memory_format=torch.channels_last)
             with torch.inference_mode():
@@ -2488,11 +2560,16 @@ def process_single_image(
     target_resolution = cfg["target_resolution"]
     pre_downscale_mode = cfg["pre_downscale_mode"]
 
-    def _probe_img_metrics() -> tuple[float, float, float]:
-        import numpy as np
+    cached_img_sharpness: tuple[float, float, float] | None = None
 
-        gray_arr = np.asarray(work_img.convert("L"), dtype=np.uint8)
-        return measure_frame_sharpness_metrics(gray_arr)
+    def _probe_img_metrics() -> tuple[float, float, float]:
+        nonlocal cached_img_sharpness
+        if cached_img_sharpness is None:
+            import numpy as np
+
+            gray_arr = np.asarray(work_img.convert("L"), dtype=np.uint8)
+            cached_img_sharpness = measure_frame_sharpness_metrics(gray_arr)
+        return cached_img_sharpness
 
     eff_in_w, eff_in_h, did_pre_downscale, restore_reason = resolve_pre_downscale_dims(
         orig_in_w,
@@ -2545,6 +2622,7 @@ def process_single_image(
             gpu_name_str,
             denoise_strength,
             is_restoration=did_pre_downscale,
+            sharpness_metrics=None if did_pre_downscale else _probe_img_metrics(),
         )
     else:
         selected_model = norm_preset
